@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import re
 
-
 def get_p2i(data):
     """
     Get the patient to index mapping.
@@ -21,6 +20,12 @@ def get_p2i(data):
             # add last participant
             p2i.append([j, i - j + 1])
     return np.array(p2i)
+
+
+# def get_p2i(data):
+#     patient_ids = data[:, 0].astype(int)
+#     _, idx_start, counts = np.unique(patient_ids, return_index=True, return_counts=True)
+#     return np.stack([idx_start, counts], axis=1)
 
 
 def get_batch(ix, data, p2i, select='center', index='patient', padding='regular',
@@ -50,7 +55,8 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         b: target ages
     """
 
-    mask_time = -10000.
+    MASKING_TOKEN, MASKING_AGE = -1, -10000
+    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
 
     x = torch.tensor(np.array([p2i[int(i)] for i in ix]))
     ix = torch.tensor(np.array(ix))
@@ -80,16 +86,17 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     mask = mask == torch.tensor(data[p2i[ix.numpy()][:, 0], 0][:, None].astype(np.int64)).to(mask.dtype)
 
     tokens = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
-    ages = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
+    ages   = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
 
     # augment lifestyle tokens to avoid immortality bias
     if lifestyle_augmentations:
-        lifestyle_idx = (tokens >= 3) * (tokens <= 11)
-        if lifestyle_idx.sum():
-            ages[lifestyle_idx] += torch.randint(-20*365, 365*40, (lifestyle_idx.sum(),), generator=gen).float()
+        lifestyle_idx = (tokens >= LIFESTYLE_MIN_INDEX) * (tokens <= LIFESTYLE_MAX_INDEX)
+        n_lifestyles_tokens = lifestyle_idx.sum()
+        if n_lifestyles_tokens:
+            ages[lifestyle_idx] += torch.randint(-20*365, 365*40, (n_lifestyles_tokens,), generator=gen).float()
 
-    tokens = tokens.masked_fill(~mask, -1)
-    ages = ages.masked_fill(~mask, mask_time)
+    tokens = tokens.masked_fill(~mask, MASKING_TOKEN)
+    ages   = ages.masked_fill(~mask, MASKING_AGE)
 
     # insert a "no event" token every 5 years on average
     if (padding.lower() == 'none' or
@@ -111,13 +118,31 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     ages = torch.hstack([ages, pad])
 
     # mask out "no event" tokens that are too far in the future (i.e. after the last real token)
-    tokens = tokens.masked_fill(ages > m, -1)
-    ages = ages.masked_fill(ages > m, mask_time)
+    tokens = tokens.masked_fill(ages > m, MASKING_TOKEN)
+    ages = ages.masked_fill(ages > m, MASKING_AGE)
 
     # sort everything so that things are correctly ordered about stacking
     s = torch.argsort(ages, 1)
     tokens = torch.gather(tokens, 1, s)
     ages = torch.gather(ages, 1, s)
+
+    # invalid_high = (tokens >= vocab_size)
+    # invalid_low = (tokens < 0)
+    # 
+    # if invalid_high.any():
+    #     idx = torch.nonzero(invalid_high)
+    #     print(f"🛑 Token(s) con índice demasiado alto detectados:")
+    #     for i in idx:
+    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}, vocab_size: {vocab_size}")
+    #     raise ValueError("Se encontraron índices fuera del rango superior del vocabulario.")
+    # 
+    # if invalid_low.any():
+    #     idx = torch.nonzero(invalid_low)
+    #     print(f"🛑 Token(s) con índice negativo detectados:")
+    #     for i in idx:
+    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}")
+    #     raise ValueError("Se encontraron índices negativos en los tokens.")
+
 
     # a technical detail: the token 0 is reserved for padding, so we shift all tokens by one
     tokens = tokens + 1
@@ -135,15 +160,13 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         ages = ages[:, cut_margin:]
 
     # shift by one to generate targets
-    x = tokens[:, :-1]
-    a = ages[:, :-1]
-    y = tokens[:, 1:]
-    b = ages[:, 1:]
+    x, y = tokens[:, :-1], tokens[:, 1:]
+    a, b = ages[:, :-1]  , ages[:, 1:]
 
     # if the first token is a "no event" token, mask it and the corresponding target
     x = x.masked_fill((x == 0) * (y == 1), 0)
     y = y.masked_fill(x == 0, 0)
-    b = b.masked_fill(x == 0, mask_time)
+    b = b.masked_fill(x == 0, MASKING_AGE)
 
     if device == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
