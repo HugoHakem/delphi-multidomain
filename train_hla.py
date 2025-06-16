@@ -34,9 +34,7 @@ from dagshub_helper import (
 import random
 
 MLFLOW_LOG_INTERVAL = 1000
-# EVAL_INTERVAL = 1000
 EVAL_INTERVAL = 1000
-
 
 def set_global_seed(seed=42):
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -65,24 +63,14 @@ def estimate_loss(model, eval_iters, batch_size, block_size, train_data, val_dat
         for k in range(eval_iters):
             ix = torch.randint(len(p2i), (batch_size,))
             X, A, Y, B = get_batch(ix, data, p2i, block_size=block_size,
-                                   device=device, select='left',
+                                   device=device, select='left', lifestyle_augmentations=True,
                                    no_event_token_rate=no_event_token_rate, 
                                    cut_batch=True)
             with ctx:
                 logits, loss, _ = model(X, A, Y, B, validation_loss_mode=True)
             losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
         out[split] = losses.mean(0)
-    model.train()
-    
-    # import gc
-    # import psutil
-    
-    # print(f"[DEBUG] RAM used: {psutil.Process().memory_info().rss / 1024**2:.2f} MB")
-    # print(f"[DEBUG] CUDA mem allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-    # print(f"[DEBUG] CUDA mem reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-    
-    # gc.collect()
-    # torch.cuda.empty_cache()
+    model.train()   
     return out
 
 
@@ -132,9 +120,14 @@ def get_lr(it, learning_rate, warmup_iters, lr_decay_iters, min_lr):
 
 def main(args, replacement_values, code_to_exec):
 
-    if args.log_to_dagshub and not args.dry_run:
+    if args.experiment_name is None:
+        args.experiment_name = "delphi" + ("" if args.no_hla else "-hla")
+    elif args.no_hla:
+        assert ("no-hla" in args.experiment_name) or ("hla" not in args.experiment_name), f'''The experiment {args.experiment_name} name might be wrong considering you are not including HLA allele information.'''
+
+    if not args.dry_run:
         local_client = MlflowClient(tracking_uri="./mlruns")
-        experiment_name = "delphi-hla"
+        experiment_name = args.experiment_name
         experiment = local_client.get_experiment_by_name(experiment_name)
         if experiment is None:
             experiment_id = local_client.create_experiment(experiment_name)
@@ -174,7 +167,7 @@ def main(args, replacement_values, code_to_exec):
     
     # ──────────────────── BATCHING ────────────────────
     gradient_accumulation_steps = 1  # used to simulate larger batch sizes
-    batch_size = 512  # if gradient_accumulation_steps > 1, this is the micro-batch size
+    batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
     block_size = 24
     
     # ──────────────────────── MODEL ──────────────────────────
@@ -191,7 +184,7 @@ def main(args, replacement_values, code_to_exec):
     
     # ──────────────── LEARNING RATE SCHEDULER ────────────────
     decay_lr = True  # whether to decay the learning rate
-    warmup_iters = 2000  # how many steps to warm up for
+    warmup_iters = 5000  # how many steps to warm up for
     lr_decay_iters = 10000  # should be ~= max_iters per Chinchilla
     min_lr = learning_rate / 10  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
     
@@ -199,7 +192,7 @@ def main(args, replacement_values, code_to_exec):
     device = 'cuda:0'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
     device_type = 'cuda'
     dtype = 'float32'  # 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-    compile = False  # use PyTorch 2.0 to compile the model to be faster
+    compile = True  # use PyTorch 2.0 to compile the model to be faster
     
     # ──────────────────── DELPHI TRAINING ────────────────────
     token_dropout = 0.0
@@ -211,13 +204,12 @@ def main(args, replacement_values, code_to_exec):
     # ─────────────────────────────────────────────────────────
 
     # ──────────────────── EARLY STOPPING ──────────────────────
-    patience = 5
+    patience = 10
     eps = 1e-4
     best_val_loss = float('inf')
     patience_counter = 0
 
-    # ──────────────────── OVERWRITE CONFIG ────────────────────
-
+    # ──────────────────── OVERWRITE DEFAULT CONFIG ────────────────────
     code_to_exec = [code_to_exec] if isinstance(code_to_exec, str) else code_to_exec
     if code_to_exec[0]:
         print("\n──────── REPLACING VARIABLE BASED ON FILE... ────────")
@@ -231,17 +223,19 @@ def main(args, replacement_values, code_to_exec):
     # _locals = 
     replace_config_items(global_variables=globals(), replacement_values=replacement_values)
     # max_steps = _locals['max_steps']
-   
-    model_args = { k: globals()[k] for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size", "dropout", "token_dropout", "t_min", "mask_ties", "ignore_tokens"] }    
+  
+    MODEL_ARG_NAMES = ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size", "dropout", "token_dropout", "t_min", "mask_ties", "ignore_tokens"]
+    model_args = { k: globals()[k] for k in MODEL_ARG_NAMES }
     
     set_global_seed(seed)
-
     # torch.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 
+    full_config = model_args | { k: globals()[k] for k in ["seed", "mask_ties", "ignore_tokens", "data_fraction", "no_event_token_rate", "patience", "learning_rate", "batch_size"] }
+
     if args.dry_run or args.show_config:
-        pprint(model_args | { k: globals()[k] for k in ["seed", "mask_ties", "ignore_tokens", "data_fraction", "no_event_token_rate", "patience", "learning_rate", "batch_size"]})
+        pprint(full_config)
         if args.dry_run: exit()
     
     gptconf = DelphiConfig(**model_args)
@@ -255,16 +249,19 @@ def main(args, replacement_values, code_to_exec):
     
     # ────────────────────────── DATASET ──────────────────────────
     # dataset, file_prefix = 'ukb_simulated_data', ''        
-    # dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_", "real"
-    dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_hla_", "real"
-    data_dir = os.path.join('data', dataset)    
+    
+    if args.no_hla:
+        dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_", "real"
+    else:
+        dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_hla2d_", "real-hla"
+
+    data_dir = os.path.join('data', dataset)
     
     load_data_from_bin = lambda datadir, file: np.memmap(os.path.join(data_dir, file), dtype=np.uint32, mode='r').reshape(-1, 3)
 
     train_data = load_data_from_bin(data_dir, f'{file_prefix}train.bin')
     val_data   = load_data_from_bin(data_dir, f'{file_prefix}val.bin')
-    train_p2i  = get_p2i(train_data)
-    val_p2i    = get_p2i(val_data)
+    train_p2i, val_p2i = get_p2i(train_data), get_p2i(val_data)
     
     # ─────────────────────────────────────────────────────────────
 
@@ -283,9 +280,23 @@ def main(args, replacement_values, code_to_exec):
     for k, v in model_args.items():
         local_client.log_param(run_id, k, v)
 
+    local_client.log_param(run_id, "learning_rate", learning_rate)
+    local_client.log_param(run_id, "batch_size", batch_size)
+    local_client.log_param(run_id, "seed", seed)
+    local_client.log_param(run_id, "hla", str(not args.no_hla))
+    
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    local_client.log_param(run_id, "num_parameters", num_params)
+    local_client.log_param(run_id, "dtype", dtype)
+
     metric_buffer = defaultdict(list)        
 
     print(f"{max_steps=}")
+
+    if compile:
+        print("compiling the model... (takes a ~minute)")
+        unoptimized_model = model
+        model = torch.compile(model)  # requires PyTorch 2.0
 
     print("\n──────── TRAINING STARTS ──────────────────────────────────────────────────────────────────────────")
     # ─────────────────────────────── TRAINING LOOP ───────────────────────────────
@@ -304,17 +315,46 @@ def main(args, replacement_values, code_to_exec):
             metric_buffer.clear()
                 
         if step % EVAL_INTERVAL == 0 and iter_num > 0:
-            # start_eval = time.time()
+            
             losses = estimate_loss(model, eval_iters, batch_size, block_size, train_data, val_data, train_p2i, val_p2i, no_event_token_rate, device, ctx)
-            # print(f"[eval] time: {time.time() - start_eval:.2f}s")            
+
+            # Raw losses
+            val_loss_raw = losses['val'].sum().item()
+            train_loss_raw = losses['train'].sum().item()
+            
+            # Smooth losses
             if val_loss is None:
                 val_loss_unpooled = losses['val']
-            val_loss_unpooled = (gamma := 0.5) * losses['val'] + (1 - gamma) * val_loss_unpooled  # ie exponential decay
+                train_loss_unpooled = losses['train']
+            val_loss_unpooled = (gamma := 0.1) * losses['val'] + (1 - gamma) * val_loss_unpooled
+            train_loss_unpooled = gamma * losses['train'] + (1 - gamma) * train_loss_unpooled
+            
             val_loss = val_loss_unpooled.sum().item()
+            train_loss = train_loss_unpooled.sum().item()
+            
+            # Logging
             local_client.log_metric(run_id, "val_loss", val_loss, step=step)
+            local_client.log_metric(run_id, "val_loss_raw", val_loss_raw, step=step)
+            local_client.log_metric(run_id, "train_loss", train_loss, step=step)
+            local_client.log_metric(run_id, "train_loss_raw", train_loss_raw, step=step)
+
+            # start_eval = time.time()
+            # losses = estimate_loss(model, eval_iters, batch_size, block_size, train_data, val_data, train_p2i, val_p2i, no_event_token_rate, device, ctx)
+            # print(f"[eval] time: {time.time() - start_eval:.2f}s")            
+            # if val_loss is None:
+            #    val_loss_unpooled = losses['val']
+            # val_loss_unpooled = (gamma := 0.5) * losses['val'] + (1 - gamma) * val_loss_unpooled  # ie exponential decay
+            # val_loss = val_loss_unpooled.sum().item()
+            # local_client.log_metric(run_id, "val_loss", val_loss, step=step)
+
+            #print(f"[eval step {step}]")
+            #print(f"  val_loss_raw     = {val_loss_raw:.6f}")
+            #print(f"  val_loss_smooth  = {val_loss:.6f}")
+            #print(f"  train_loss_raw   = {train_loss_raw:.6f}")
+            #print(f"  train_loss_smooth= {train_loss:.6f}")
 
             if val_loss is not None and (val_loss < best_val_loss * (1 - eps)):
-                best_val_loss = val_loss
+                # best_val_loss = val_loss
                 patience_counter = 0
             elif val_loss is not None:
                 patience_counter += 1
@@ -322,6 +362,38 @@ def main(args, replacement_values, code_to_exec):
                 if patience_counter >= patience:
                     print(f"Early stopping triggered. Best val loss {best_val_loss}")
                     break
+
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                if iter_num > 0:
+                    best_ckpt = {
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': val_loss,
+                        'config': full_config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    best_iter_num = iter_num
+                    best_ckpt_path = os.path.join(out_dir, ckpt_file := f'best_ckpt__{run_id}__{iter_num}.pt')
+                    # torch.save(checkpoint, ckpt_path)
+                    # mlflow.log_artifact(ckpt_path, artifact_path="checkpoints")
+
+            if iter_num % 100_000 == 0:
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': full_config,
+                }
+                print(f"saving checkpoint to {out_dir}")
+                ckpt_path = os.path.join(out_dir, ckpt_file := f'ckpt__{run_id}__{iter_num}.pt')
+                torch.save(checkpoint, ckpt_path)
+                local_client.log_artifact(run_id, ckpt_path, artifact_path="checkpoints")
 
         step += 1
         for micro_step in range(gradient_accumulation_steps):
@@ -359,7 +431,11 @@ def main(args, replacement_values, code_to_exec):
         if max_steps <= step:
             break
         
-        # local_iter_num += 1
+    torch.save(best_ckpt, best_ckpt_path)
+    local_client.log_metric(run_id, "best_val_loss", best_val_loss)
+    local_client.log_artifact(run_id, best_ckpt_path, artifact_path="checkpoints")
+    # local_iter_num += 1
+    
     
     mlflow.end_run()
     sync_run_to_dagshub("file:./mlruns", "https://dagshub.com/rbonazzola/Delphi-HLA.mlflow", run_id)
@@ -380,6 +456,7 @@ def parse_manual_args(manual_args):
             assert not arg.startswith('--'), "Arguments with -- should be of the form --x=y unless handled by argparse"
             assert os.path.exists(arg), f"{arg} should be a file but it does not exist"
             config_file = arg
+            print(config_file)
             with open(config_file) as f:
                 code_to_exec.append(open(config_file).read())
                 # print(f.read())
@@ -406,9 +483,11 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser("Delphi CLI")
     parser.add_argument("--dry-run", "--dry_run", "--dryrun", dest="dry_run", action="store_true", default=False)
+    parser.add_argument("--experiment-name", "--experiment_name", "-x", dest="experiment_name", default=None, help="Default: delphi-hla or delphi (if --no-hla is set)")
+    parser.add_argument("--no-hla", "--no_hla", dest="no_hla", action="store_true", default=False)
     parser.add_argument("--show-config", "--show_config", dest="show_config", action="store_true", default=False)
     parser.add_argument("--exclude_subjects", default=None)
-    parser.add_argument("--log_to_dagshub", "--dagshub", "-d", dest="log_to_dagshub", default=True, action="store_true", help="Whether to log to DagsHub")
+    parser.add_argument("--log_to_dagshub", "--dagshub", "-d", dest="log_to_dagshub", default=False, action="store_true", help="Whether to log to DagsHub or only locally")
     parser.add_argument("--interactive", "-i", dest="interactive", default=False, action="store_true", help="Placeholder argument (behaviour not yet implemented)")
     args, manual_args = parser.parse_known_args()
     

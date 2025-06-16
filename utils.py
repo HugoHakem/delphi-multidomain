@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import re
+from IPython import embed
 
 def get_p2i(data):
     """
@@ -55,8 +56,12 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         b: target ages
     """
 
+    AGE_COLUMN = 1
+    TOKEN_COLUMN = 2
     MASKING_TOKEN, MASKING_AGE = -1, -10000
-    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
+    # N_HLA_ALLELES = 359
+    N_HLA_ALLELES = 138
+    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+N_HLA_ALLELES, 11+N_HLA_ALLELES
 
     x = torch.tensor(np.array([p2i[int(i)] for i in ix]))
     ix = torch.tensor(np.array(ix))
@@ -85,8 +90,8 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     mask = torch.from_numpy(data[:, 0][batch_idx].astype(np.int64))
     mask = mask == torch.tensor(data[p2i[ix.numpy()][:, 0], 0][:, None].astype(np.int64)).to(mask.dtype)
 
-    tokens = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
-    ages   = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
+    tokens = torch.from_numpy(data[:, TOKEN_COLUMN][batch_idx].astype(np.int64))
+    ages   = torch.from_numpy(data[:, AGE_COLUMN][batch_idx].astype(np.float32))
 
     # augment lifestyle tokens to avoid immortality bias
     if lifestyle_augmentations:
@@ -126,9 +131,10 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     tokens = torch.gather(tokens, 1, s)
     ages = torch.gather(ages, 1, s)
 
+    vocab_size = 1408
     # invalid_high = (tokens >= vocab_size)
     # invalid_low = (tokens < 0)
-    # 
+    
     # if invalid_high.any():
     #     idx = torch.nonzero(invalid_high)
     #     print(f"🛑 Token(s) con índice demasiado alto detectados:")

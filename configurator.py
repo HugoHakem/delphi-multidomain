@@ -16,8 +16,14 @@ comes up with a better simple Python solution I am all ears.
 
 import sys
 from ast import literal_eval
+from pprint import pprint 
+pprint(globals())
 
 for arg in sys.argv[1:]:
+    
+    if '=' not in arg and arg.startswith("--"):
+        # This is already being handled by argparse
+        continue
     if '=' not in arg:
         # assume it's the name of a config file
         assert not arg.startswith('--')

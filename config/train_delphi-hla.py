@@ -1,6 +1,10 @@
 
 import time
 
+HLA_2DIGIT_TOKENS = 138
+HLA_4DIGIT_TOKENS = 359
+N_HLA_ALLELES = HLA_2DIGIT_TOKENS
+
 out_dir = 'Delphi-hla'
 eval_interval = 1000 # keep frequent because we'll overfit
 eval_iters = 200
@@ -24,7 +28,7 @@ n_head = 12
 n_embd = 120
 dropout = 0.1
 weight_decay = 2e-1
-vocab_size = 1270 + 359
+vocab_size = 1270 + N_HLA_ALLELES
 
 learning_rate = 6e-4 # with baby networks can afford to go a bit higher
 max_iters = 100000
@@ -36,8 +40,9 @@ warmup_iters = 1000 # not super necessary potentially
 
 PADDING_TOKEN = 0
 SEX_TOKENS = [2,3]
-HLA_TOKENS = list(range(4, 4+359))
-LIFESTYLE_TOKENS = list(range(4+359, 13+359))
+
+HLA_TOKENS = list(range(4, 4+N_HLA_ALLELES))
+LIFESTYLE_TOKENS = list(range(4+N_HLA_ALLELES, 13+N_HLA_ALLELES))
 ignore_tokens = [PADDING_TOKEN] + SEX_TOKENS + HLA_TOKENS + LIFESTYLE_TOKENS
 
 t_min = 0.1
