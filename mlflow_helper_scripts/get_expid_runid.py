@@ -3,7 +3,10 @@ import mlflow
 import mlflow
 import re
 
-THRESHOLD = 12.
+METRIC = "best_val_loss"
+METRIC = "val_loss"
+
+THRESHOLD = 11.93
 OUTPUT_FILE = "auc_runs.txt"
 
 client = mlflow.tracking.MlflowClient()
@@ -16,8 +19,8 @@ for exp in experiments:
     for run in runs:
         run_id = run.info.run_id
         metrics = run.data.metrics
-        if "best_val_loss" in metrics:
-            val = metrics["best_val_loss"]
+        if METRIC in metrics:
+            val = metrics[METRIC]
             if val < THRESHOLD:
                 # Buscar checkpoint de mayor step
                 ckpt_dir = "checkpoints"

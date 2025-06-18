@@ -7,6 +7,8 @@ import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import os
+import glob
 
 st.set_page_config(layout="wide")
 st.title("MLflow Run Explorer")
@@ -151,7 +153,6 @@ if st.session_state.runs_loaded:
 
     with tab4:
         st.subheader("AUC values")
-
         
         experiments = client.search_experiments()
         experiments_hla = { e.name: e.experiment_id for e in experiments if "no" not in e.name }
@@ -161,36 +162,83 @@ if st.session_state.runs_loaded:
         runs_hla, _ = load_runs([exp_id for exp_name, exp_id in experiments_hla.items()], val_loss_threshold=11.95)
         runs_nohla, _ = load_runs([exp_id for exp_name, exp_id in experiments_nohla.items()], val_loss_threshold=11.95)
         
-        selected_run_hla = st.selectbox("Select run w/HLA to display loss curves", runs_hla["run_id"].tolist())
-        selected_run_nohla = st.selectbox("Select run wo/HLA to display loss curves", runs_nohla["run_id"].tolist())
+        runs_hla = sorted([ f"{k} {v:.4f}" for k, v in zip(runs_hla["run_id"].tolist(), runs_hla["val_loss"].tolist()) ], key=lambda x: float(x.split()[1]))
+        runs_nohla = sorted([ f"{k} {v:.4f}" for k, v in zip(runs_nohla["run_id"].tolist(), runs_nohla["val_loss"].tolist()) ], key=lambda x: float(x.split()[1]))
         
+        parquet_files = glob.glob("mlruns/*/*/artifacts/auc/*parquet")
+        
+        runs_hla = [ k for k in runs_hla if any([k.split(" ")[0] in f for f in parquet_files]) ]
+        runs_nohla = [ k for k in runs_nohla if any([k.split(" ")[0] in f for f in parquet_files]) ]
+        # runs_hla_dict = { k: v for k, v in runs_hla_dict.items() if any([k in parquet_files]) }
+        # runs_nohla_dict = { k: v for k, v in runs_nohla_dict.items() if any([k in parquet_files]) }
+
+        # selected_run_hla = st.selectbox("Select run w/HLA to display loss curves", runs_hla["run_id"].tolist())
+        
+        selected_run_hla   = st.select_slider("Select run w/HLA to display loss curves", runs_hla)
+        selected_run_nohla = st.select_slider("Select run wo/HLA to display loss curves", runs_nohla)
+
+        selected_run_hla = selected_run_hla.split(" ")[0]
+        selected_run_nohla = selected_run_nohla.split(" ")[0]
+
         run_hla  = client.get_run(selected_run_hla)
         run_nohla  = client.get_run(selected_run_nohla)
 
-        def fix_artifact_uri(artifact_uri):
-            artifact_dir = artifact_uri.replace("/homes", "/home")
-            artifact_dir = artifact_dir.replace('/nfs/research/birney/users', "/home")
+        def fix_artifact_uri(artifact_dir, on_codon=False):
+            if not on_codon:
+                artifact_dir = artifact_dir.replace("/homes", "/home")
+                artifact_dir = artifact_dir.replace('/nfs/research/birney/users', "/home")
             return artifact_dir
 
-
-        def get_auc_dfs(run):
-            artifact_dir = fix_artifact_uri(run.info.artifact_uri)
+        def get_auc_dfs(run, suffix=""):
+            artifact_dir = fix_artifact_uri(run.info.artifact_uri, on_codon="codon" in os.environ['HOSTNAME'])
             AUCDIR = f"{artifact_dir}/auc/"
-            unpooled_auc = pd.read_parquet(f"{AUCDIR}/df_auc_unpooled.parquet").query("n_diseased > 100")
-            both_auc = pd.read_parquet(f"{AUCDIR}/df_both.parquet")
+            unpooled_auc = pd.read_parquet(f"{AUCDIR}/df_auc_unpooled{suffix}.parquet").query("n_diseased > 100")
+            both_auc = pd.read_parquet(f"{AUCDIR}/df_both{suffix}.parquet")
             unpooled_auc = unpooled_auc.drop(["auc"], axis=1)
             unpooled_auc = unpooled_auc[~unpooled_auc.duplicated()]
             unpooled_auc = unpooled_auc.drop(['ICD-10 Chapter (short)', 'color', 'auc_variance_delong', 'count'], axis=1)
             return unpooled_auc, both_auc
         
-        unpooled_auc_hla, both_auc_hla = get_auc_dfs(run_hla)
-        unpooled_auc_nohla, both_auc_nohla = get_auc_dfs(run_nohla)
+        unpooled_auc_hla, both_auc_hla = get_auc_dfs(run_hla, suffix="_1y")
+        unpooled_auc_nohla, both_auc_nohla = get_auc_dfs(run_nohla, suffix="_1y")
 
-        print(run_hla)
-        st.text(f"HLA loss: {run_hla.data.metrics['val_loss']:.4f}")
-        st.text(f"NO HLA loss: {run_nohla.data.metrics['val_loss']:.4f}")
-        kk = pd.merge(unpooled_auc_hla, unpooled_auc_nohla, on=['token', 'age', 'n_healthy', 'n_diseased', 'index', 'name', 'sex'], suffixes=['_hla', '_nohla'])
-        kk = kk.query("auc_delong_hla > auc_delong_nohla").assign(diff=lambda x: x.auc_delong_hla - x.auc_delong_nohla).sort_values("diff", ascending=False)
-        st.dataframe(kk)
+        # print(unpooled_auc_hla)
+        # print(unpooled_auc_nohla)
+        # print(unpooled_auc_hla.token.unique())
+        # print(unpooled_auc_nohla.token.unique())
+        
+        # st.text(f"HLA loss: {run_hla.data.metrics['val_loss']:.4f}")
+        # st.text(f"NO HLA loss: {run_nohla.data.metrics['val_loss']:.4f}")
+        run_hla_params = run_hla.data.params
+        run_hla_params.pop('ignore_tokens')
+        run_nohla_params = run_nohla.data.params
+        run_nohla_params.pop('ignore_tokens')
+
+        st.table(pd.Series(run_hla_params).to_frame().T)
+        st.table(pd.Series(run_nohla_params).to_frame().T)
+
+        unpooled_auc_merged = pd.merge(unpooled_auc_hla, unpooled_auc_nohla, on=['age', 'name', 'sex'], suffixes=['_hla', '_nohla']).\
+             drop(["n_healthy_hla", "n_healthy_nohla"], axis=1).\
+             assign(diff=lambda x: x.auc_delong_hla - x.auc_delong_nohla).\
+             sort_values("diff", ascending=False).\
+             merge(pd.read_csv("hla_score_per_icd10.csv"), left_on="index_nohla", right_on="index").\
+             drop(["index_hla", "index_nohla", "token_hla", "token_nohla", "n_diseased_hla", "n_diseased_nohla"], axis=1).\
+             loc[:, ["age", "sex", "name", "auc_delong_hla", "auc_delong_nohla", "diff", '0']]
+
+        both_auc_merged = pd.merge(both_auc_hla, both_auc_nohla, on=['name'], suffixes=['_hla', '_nohla']).\
+            assign(diff=lambda x: x.auc_hla - x.auc_nohla).\
+            sort_values("diff", ascending=False).\
+            merge(pd.read_csv("hla_score_per_icd10.csv"), left_on="index_nohla", right_on="index")
+
+        # drop(['token_hla'], axis=1).\
+
+        # drop(['']).\
+
+        st.dataframe(both_auc_merged)
+        
+        # query("auc_delong_hla > auc_delong_nohla").\
+
+        st.dataframe(unpooled_auc_merged)
+
         # st.dataframe(unpooled_auc_hla)
         # st.dataframe(unpooled_auc_nohla)

@@ -3,7 +3,8 @@ import re
 from pathlib import Path
 
 # Parámetros
-BEST_VAL_LOSS_THRESHOLD = 12.0
+METRIC = "val_loss" 
+METRIC_THRESHOLD = 12.0
 OUTPUT_FILENAME = ""
 
 client = mlflow.tracking.MlflowClient()
@@ -34,13 +35,13 @@ for run in runs:
     run_id = run.info.run_id
     metrics = run.data.metrics
 
-    if "best_val_loss" not in metrics:
-        print(f"❌ Run {run_id} no tiene 'best_val_loss'. Saltando.")
+    if METRIC not in metrics:
+        print(f"❌ Run {run_id} no tiene {METRIC}. Saltando.")
         continue
 
-    best_val_loss = metrics["best_val_loss"]
-    if best_val_loss >= BEST_VAL_LOSS_THRESHOLD:
-        print(f"⚠️ Run {run_id} tiene best_val_loss={best_val_loss:.4f} >= {BEST_VAL_LOSS_THRESHOLD}. Saltando.")
+    metric_value = metrics[METRIC]
+    if metric_value >= METRIC_THRESHOLD:
+        print(f"⚠️ Run {run_id} tiene {METRIC}={metric_value:.4f} >= {METRIC_THRESHOLD}. Saltando.")
         continue
 
     # Paso 4: Buscar checkpoint con mayor step
@@ -80,5 +81,5 @@ for run in runs:
   --filter_min_total 100 \\
   --disease_chunk_size 200"""
 
-    print(f"\n✅ Run {run_id} (best_val_loss={best_val_loss:.4f}):")
+    print(f"\n✅ Run {run_id} ({METRIC}={METRIC_VALUE:.4f}):")
     print(command)

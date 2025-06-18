@@ -414,6 +414,7 @@ def evaluate_auc_pipeline(
     
     if output_path is not None:
         Path(output_path).mkdir(exist_ok=True, parents=True)
+        print(f"Created this folder to store the parquet file: {output_path}")
         df_auc_merged.to_parquet(f"{output_path}/df_both.parquet", index=False)
         df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled.parquet", index=False)
 
@@ -423,7 +424,9 @@ def evaluate_auc_pipeline(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate AUC")
     parser.add_argument("--input_path", type=str, help="Path to the dataset")
+    parser.add_argument("--data_file_prefix", type=str, default="", help="Prefix in the file name, i.e. what comes before '_val.bin'.")
     parser.add_argument("--output_path", type=str, help="Path to the output")
+    parser.add_argument("--delphi-labels", "--delphi_labels", type=str, help="Path to Delphi labels")
     parser.add_argument("--model_ckpt_path", type=str, help="Path to the model weights")
     parser.add_argument("--no_event_token_rate", type=int, help="No event token rate")
     parser.add_argument(
@@ -454,12 +457,13 @@ def main():
     conf = DelphiConfig(**checkpoint["model_args"])
     model = Delphi(conf)
     state_dict = checkpoint["model"]
+    state_dict = { k.replace("_orig_mod.", ""): v for k, v in state_dict.items() }
     model.load_state_dict(state_dict)
     model.eval()
     model = model.to(device)
 
-    # Load training and validation data.
-    val = np.fromfile(f"{input_path}/val.bin", dtype=np.uint32).reshape(-1, 3).astype(np.int64)
+    # Load validation data.
+    val = np.fromfile(f"{input_path}/{args.data_file_prefix}val.bin", dtype=np.uint32).reshape(-1, 3).astype(np.int64)
 
     val_p2i = get_p2i(val)
 
@@ -472,15 +476,15 @@ def main():
         val,
         val_p2i,
         select="left",
-        block_size=80,
+        block_size=128,
         device=device,
         padding="random",
         no_event_token_rate=no_event_token_rate,
-        health_token_replacement_prob=health_token_replacement_prob,
+        # health_token_replacement_prob=health_token_replacement_prob,
     )
 
     # Load labels (external) to be passed in.
-    delphi_labels = pd.read_csv("delphi_labels_chapters_colours_icd.csv")
+    delphi_labels = pd.read_csv(args.delphi_labels)
 
     # Call the internal evaluation function.
     df_auc_unpooled, df_auc_merged = evaluate_auc_pipeline(

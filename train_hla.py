@@ -22,8 +22,6 @@ from hla_genes import get_hla_protein_sequences
 from mlflow.tracking import MlflowClient
 from mlflow.entities import Metric
 
-from dual_logger import DualMLflowLogger
-
 import mlflow
 import dagshub
 
@@ -178,7 +176,7 @@ def main(args, replacement_values, code_to_exec):
     vocab_size = 1270 # <---- can we set this automatically?
     
     # ──────────────────── ADAMW OPTIMIZER ────────────────────
-    learning_rate, weight_decay, beta1, beta2 = 3e-4, 1e-1, 0.9, 0.95
+    learning_rate, weight_decay, beta1, beta2 = 3e-4, 3e-2, 0.9, 0.99
     max_iters = 10000  # total number of training iterations
     grad_clip = 0.01  # clip gradients at this value, or disable if == 0.0
     
@@ -205,7 +203,7 @@ def main(args, replacement_values, code_to_exec):
 
     # ──────────────────── EARLY STOPPING ──────────────────────
     patience = 10
-    eps = 1e-4
+    eps = 1e-6
     best_val_loss = float('inf')
     patience_counter = 0
 
@@ -248,19 +246,21 @@ def main(args, replacement_values, code_to_exec):
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     
     # ────────────────────────── DATASET ──────────────────────────
-    # dataset, file_prefix = 'ukb_simulated_data', ''        
     
     if args.no_hla:
-        dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_", "real"
+        dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_", "real-no-hla"
     else:
-        dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_hla2d_", "real-hla"
+        dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_hla2d_", "real-hla-2digits"
+        # dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_hla4d_", "real-hla-4digits"
 
     data_dir = os.path.join('data', dataset)
     
     load_data_from_bin = lambda datadir, file: np.memmap(os.path.join(data_dir, file), dtype=np.uint32, mode='r').reshape(-1, 3)
 
-    train_data = load_data_from_bin(data_dir, f'{file_prefix}train.bin')
-    val_data   = load_data_from_bin(data_dir, f'{file_prefix}val.bin')
+    train_filename = f'{file_prefix}train.bin'
+    val_filename = f'{file_prefix}val.bin'
+    train_data = load_data_from_bin(data_dir, train_filename)
+    val_data   = load_data_from_bin(data_dir, train_filename)
     train_p2i, val_p2i = get_p2i(train_data), get_p2i(val_data)
     
     # ─────────────────────────────────────────────────────────────
@@ -288,6 +288,9 @@ def main(args, replacement_values, code_to_exec):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     local_client.log_param(run_id, "num_parameters", num_params)
     local_client.log_param(run_id, "dtype", dtype)
+    local_client.log_param(run_id, "data_type", data_type)
+    local_client.log_param(run_id, "val_filename", val_filename)
+    local_client.log_param(run_id, "train_filename", train_filename)
 
     metric_buffer = defaultdict(list)        
 
@@ -304,9 +307,10 @@ def main(args, replacement_values, code_to_exec):
 
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num, learning_rate, warmup_iters, lr_decay_iters, min_lr) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr            
-            metric_buffer["instant_learning_rate"].append((step, lr))
+        if iter_num % MLFLOW_LOG_INTERVAL == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr            
+                metric_buffer["instant_learning_rate"].append((step, lr))
         
         if iter_num % MLFLOW_LOG_INTERVAL == 0: # and mlflow.active_run():
             for metric_name, values in metric_buffer.items():
