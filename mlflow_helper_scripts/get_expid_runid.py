@@ -26,16 +26,27 @@ for exp in experiments:
                 ckpt_dir = "checkpoints"
                 artifacts = client.list_artifacts(run_id, path=ckpt_dir)
                 candidates = []
+                ckpt_files = []
                 for a in artifacts:
                     match = re.search(rf"best_ckpt__{run_id}__(\d+)\.pt", a.path)
                     if match:
                         step = int(match.group(1))
+                        ckpt_file = f"best_ckpt__{run_id}__{step}.pt"
                         candidates.append(step)
+                        ckpt_files.append(ckpt_file) 
+                    else:
+                        match = re.search(rf"ckpt__{run_id}__(\d+)\.pt", a.path)
+                        if match:
+                            step = int(match.group(1))
+                            ckpt_file = f"ckpt__{run_id}__{step}.pt"
+                            candidates.append(step)
+                            ckpt_files.append(ckpt_file) 
                 if not candidates:
                     print(f"⚠️  Run {run_id} no tiene checkpoints válidos.")
                     continue
                 best_step = max(candidates)
-                lines.append(f"{exp.experiment_id} {run_id} {val:.6f} {best_step}")
+                best_ckpt_file = ckpt_files[candidates.index(best_step)]
+                lines.append(f"{exp.experiment_id} {run_id} {val:.6f} {best_step} {best_ckpt_file}")
 
 with open(OUTPUT_FILE, "w") as f:
     f.write("\n".join(lines))
