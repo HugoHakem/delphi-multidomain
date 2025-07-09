@@ -204,7 +204,7 @@ def get_auc_delong_var(healthy_scores, diseased_scores):
     return aucs[0], delongcov
 
 
-def get_calibration_auc(j, k, d, p, offset=365.25, age_groups=range(45, 80, 5), precomputed_idx=None, n_bootstrap=1, use_delong=False):
+def get_calibration_auc(j, k, d, p, offset=365.25, age_groups=range(10, 80, 5), precomputed_idx=None, n_bootstrap=1, use_delong=False):
     age_step = age_groups[1] - age_groups[0]
 
     # Indexes of cases with disease k
@@ -291,7 +291,7 @@ def evaluate_auc_pipeline(
     diseases_of_interest=None,
     filter_min_total=100,
     disease_chunk_size=200,
-    age_groups=np.arange(40, 80, 5),
+    age_groups=np.arange(10, 80, 5),
     offset=0.1,
     batch_size=128,
     device="cpu",
@@ -415,8 +415,8 @@ def evaluate_auc_pipeline(
     if output_path is not None:
         Path(output_path).mkdir(exist_ok=True, parents=True)
         print(f"Created this folder to store the parquet file: {output_path}")
-        df_auc_merged.to_parquet(f"{output_path}/df_both.parquet", index=False)
-        df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled.parquet", index=False)
+        df_auc_merged.to_parquet(f"{output_path}/df_both_onlywhite.parquet", index=False)
+        df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled_onlywhite.parquet", index=False)
 
     return df_auc_unpooled_merged, df_auc_merged
 
@@ -424,7 +424,7 @@ def evaluate_auc_pipeline(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate AUC")
     parser.add_argument("--input_path", type=str, help="Path to the dataset")
-    parser.add_argument("--data_file_prefix", type=str, default="", help="Prefix in the file name, i.e. what comes before '_val.bin'.")
+    parser.add_argument("--data_filename", type=str, default="", help="Prefix in the file name, i.e. what comes before '_val.bin'.")
     parser.add_argument("--output_path", type=str, help="Path to the output")
     parser.add_argument("--delphi-labels", "--delphi_labels", type=str, help="Path to Delphi labels")
     parser.add_argument("--model_ckpt_path", type=str, help="Path to the model weights")
@@ -463,7 +463,7 @@ def main():
     model = model.to(device)
 
     # Load validation data.
-    val = np.fromfile(f"{input_path}/{args.data_file_prefix}val.bin", dtype=np.uint32).reshape(-1, 3).astype(np.int64)
+    val = np.fromfile(f"{input_path}/{args.data_filename}", dtype=np.uint32).reshape(-1, 3).astype(np.int64)
 
     val_p2i = get_p2i(val)
 
