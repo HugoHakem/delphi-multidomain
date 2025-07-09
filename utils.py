@@ -28,6 +28,29 @@ def get_p2i(data):
 #     _, idx_start, counts = np.unique(patient_ids, return_index=True, return_counts=True)
 #     return np.stack([idx_start, counts], axis=1)
 
+N_HLA_ALLELES = 359
+# N_HLA_ALLELES = 138
+# N_HLA_ALLELES = 0
+VOCAB_SIZE = 1270 + N_HLA_ALLELES
+
+class Tokenizer():
+
+    def __init__(self, config):
+
+        self.N_HLA_ALLELES = config.N_HLA_ALLELES
+
+        self.PADDING_TOKEN = 0
+        self.NO_EVENT_TOKEN = 1                
+        self.LIFESTYLE_MIN_INDEX = 3 + self.N_HLA_ALLELES
+        self.LIFESTYLE_MAX_INDEX = 11 + self.N_HLA_ALLELES
+        self.SEX_TOKENS = [2, 3]
+        
+        # 1 + 1 + 2 + N_HLA_ALLELES + 9 + 1256 + 1
+        self.DISEASE_TOKENS = range(self.LIFESTYLE_MAX_INDEX+1, self.LIFESTYLE_MAX_INDEX+1257)        
+        
+        self.VOCAB_SIZE = 1270 + N_HLA_ALLELES
+
+
 
 def get_batch(ix, data, p2i, select='center', index='patient', padding='regular',
               block_size=48, device='cpu', lifestyle_augmentations=False, 
@@ -59,8 +82,6 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     AGE_COLUMN = 1
     TOKEN_COLUMN = 2
     MASKING_TOKEN, MASKING_AGE = -1, -10000
-    # N_HLA_ALLELES = 359
-    N_HLA_ALLELES = 138
     LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+N_HLA_ALLELES, 11+N_HLA_ALLELES
 
     x = torch.tensor(np.array([p2i[int(i)] for i in ix]))
@@ -82,7 +103,7 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     else:
         raise NotImplementedError
 
-    traj_start_idx = torch.clamp(traj_start_idx, 0, data.shape[0] - block_size - 1)
+    traj_start_idx = torch.clamp(traj_start_idx, min=0, max=data.shape[0]-block_size-1)
     traj_start_idx = traj_start_idx.numpy()
 
     batch_idx = np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
@@ -104,10 +125,8 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     ages   = ages.masked_fill(~mask, MASKING_AGE)
 
     # insert a "no event" token every 5 years on average
-    if (padding.lower() == 'none' or
-            padding is None or
-            no_event_token_rate == 0 or
-            no_event_token_rate is None):
+    no_padding = (padding.lower() == 'none') or (padding is None) or (no_event_token_rate == 0) or (no_event_token_rate is None)
+    if no_padding:
         pad = torch.ones(len(ix), 0)
     elif padding == 'regular':
         pad = torch.arange(0, 36525, 365.25 * no_event_token_rate) * torch.ones(len(ix), 1) + 1
@@ -131,24 +150,12 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     tokens = torch.gather(tokens, 1, s)
     ages = torch.gather(ages, 1, s)
 
-    vocab_size = 1408
-    # invalid_high = (tokens >= vocab_size)
-    # invalid_low = (tokens < 0)
-    
-    # if invalid_high.any():
-    #     idx = torch.nonzero(invalid_high)
-    #     print(f"🛑 Token(s) con índice demasiado alto detectados:")
-    #     for i in idx:
-    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}, vocab_size: {vocab_size}")
-    #     raise ValueError("Se encontraron índices fuera del rango superior del vocabulario.")
-    # 
-    # if invalid_low.any():
-    #     idx = torch.nonzero(invalid_low)
-    #     print(f"🛑 Token(s) con índice negativo detectados:")
-    #     for i in idx:
-    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}")
-    #     raise ValueError("Se encontraron índices negativos en los tokens.")
-
+    if (invalid_high := (tokens >= VOCAB_SIZE)).any():
+         idx = torch.nonzero(invalid_high)
+         print(f"🛑 Token(s) con índice demasiado alto detectados:")
+         for i in idx:
+             print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}, vocab_size: {VOCAB_SIZE}")
+         raise ValueError("Se encontraron índices fuera del rango superior del vocabulario.")
 
     # a technical detail: the token 0 is reserved for padding, so we shift all tokens by one
     tokens = tokens + 1
@@ -179,6 +186,7 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         x, a, y, b = [i.pin_memory().to(device, non_blocking=True) for i in [x, a, y, b]]
     else:
         x, a, y, b = x.to(device), a.to(device), y.to(device), b.to(device)
+
     return x, a, y, b
 
 

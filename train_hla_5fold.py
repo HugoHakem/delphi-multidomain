@@ -260,22 +260,25 @@ def main(args, replacement_values, code_to_exec):
         dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_", "real-no-hla"
         dataset, file_prefix, data_type = 'ukb_real_5_folds_nohla', "", "real-nohla-5folds"
     else:
-        # dataset, file_prefix, data_type = 'ukb_real_5_folds_2digit', "", "real-hla-2digits-5folds"
-        dataset, file_prefix, data_type = 'ukb_real_5_folds_4digit', "", "real-hla-4digits-5folds"
-        # dataset, file_prefix, data_type = 'ukb_real_5_folds_4digit', "", "real-hla-4digits"
-        # dataset, file_prefix, data_type = 'ukb_real_5_folds_4digit', "", "real-hla-4digits"
-        # dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_hla2d_", "real-hla-2digits"
-        # dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_hla4d_", "real-hla-4digits"
+        filename_rules = [ 'ukb_real_5_folds_2digit', "", "real-hla-2digits-5folds"
+          'ukb_real_5_folds_4digit', "", "real-hla-4digits-5folds"
+          'ukb_real_5_folds_4digit', "", "real-hla-4digits"
+          'ukb_real_5_folds_4digit', "", "real-hla-4digits"
+          'ukb_real_data', "ukb_real_hla2d_", "real-hla-2digits"
+          'ukb_real_data', "ukb_real_hla4d_", "real-hla-4digits"
+        ]
+        dataset, file_prefix, data_type = filename_rules[0]
 
     data_dir = os.path.join('data', dataset)
     
-    load_data_from_bin = lambda datadir, file: np.memmap(os.path.join(data_dir, file), dtype=np.uint32, mode='r').reshape(-1, 3)
+    # load_data_from_bin = lambda datadir, file: np.memmap(os.path.join(data_dir, file), dtype=np.uint32, mode='r').reshape(-1, 3)
+    load_data_from_bin = lambda datadir, file: np.fromfile(os.path.join(data_dir, file), dtype=np.uint32, mode='r').reshape(-1, 3)
 
     train_folds = []
-    for i in range(1, 6):
-        if i == args.val_fold:
+    for fold_i in [1, 2, 3, 4, 5]:
+        if fold_i == args.val_fold:
             continue
-        train_fold_filename = f'fold{i}.bin'
+        train_fold_filename = f'fold{fold_i}.bin'
         train_datafold = load_data_from_bin(data_dir, train_fold_filename)
         train_folds.append(train_datafold) 
     train_data = np.concatenate(train_folds)
@@ -287,7 +290,6 @@ def main(args, replacement_values, code_to_exec):
     
     # ─────────────────────────────────────────────────────────────
 
-    # {'float32': torch.float32, 'float64': torch.float64, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
     ptdtype = getattr(torch, dtype)
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     
