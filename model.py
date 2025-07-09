@@ -247,6 +247,7 @@ class Delphi(nn.Module):
             if validation_loss_mode:
                 ignored_tokens += [1]
                 logits[...,ignored_tokens] = -torch.inf
+            
             targets = targets.reshape(-1)
             pass_tokens = targets != -1 
             for k in ignored_tokens: # and gender
@@ -412,3 +413,22 @@ class Delphi(nn.Module):
             logits = torch.stack([logits[:,j].scatter_(1, fill[:,:j+1], -torch.inf) for j in range(fill.shape[1])]).transpose(0,1)
 
         return idx, age, logits
+
+
+    @classmethod
+    def from_checkpoint(cls, ckpt_path, device=None):
+        
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        checkpoint = torch.load(ckpt_path, map_location=device)        
+        conf = DelphiConfig(**checkpoint['model_args'])        
+        model = Delphi(conf)
+        
+        state_dict = checkpoint['model']
+        state_dict = { k.replace("_orig_mod.", ""): v for k, v in state_dict.items() }
+
+        model.load_state_dict(state_dict)         
+        model = model.to(device)
+
+        return model
