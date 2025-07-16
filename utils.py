@@ -1,55 +1,33 @@
 import numpy as np
+import pandas as pd
 import torch
 import re
-from IPython import embed
-
-def get_p2i(data):
-    """
-    Get the patient to index mapping.
-    """
-
-    px = data[:, 0].astype('int')
-    p2i = []
-    j = 0
-    q = px[0]
-    for i, p in enumerate(px):
-        if p != q:
-            p2i.append([j, i - j])
-            q = p
-            j = i
-        if i == len(px) - 1:
-            # add last participant
-            p2i.append([j, i - j + 1])
-    return np.array(p2i)
-
+import os
 
 # def get_p2i(data):
-#     patient_ids = data[:, 0].astype(int)
-#     _, idx_start, counts = np.unique(patient_ids, return_index=True, return_counts=True)
-#     return np.stack([idx_start, counts], axis=1)
+#     """
+#     Get the patient to index mapping.
+#     """
 
-N_HLA_ALLELES = 359
-# N_HLA_ALLELES = 138
-# N_HLA_ALLELES = 0
-VOCAB_SIZE = 1270 + N_HLA_ALLELES
+#     px = data[:, 0].astype('int')
+#     p2i = []
+#     j = 0
+#     q = px[0]
+#     for i, p in enumerate(px):
+#         if p != q:
+#             p2i.append([j, i - j])
+#             q = p
+#             j = i
+#         if i == len(px) - 1:
+#             # add last participant
+#             p2i.append([j, i - j + 1])
+#     return np.array(p2i)
 
-class Tokenizer():
 
-    def __init__(self, config):
-
-        self.N_HLA_ALLELES = config.N_HLA_ALLELES
-
-        self.PADDING_TOKEN = 0
-        self.NO_EVENT_TOKEN = 1                
-        self.LIFESTYLE_MIN_INDEX = 3 + self.N_HLA_ALLELES
-        self.LIFESTYLE_MAX_INDEX = 11 + self.N_HLA_ALLELES
-        self.SEX_TOKENS = [2, 3]
-        
-        # 1 + 1 + 2 + N_HLA_ALLELES + 9 + 1256 + 1
-        self.DISEASE_TOKENS = range(self.LIFESTYLE_MAX_INDEX+1, self.LIFESTYLE_MAX_INDEX+1257)        
-        
-        self.VOCAB_SIZE = 1270 + N_HLA_ALLELES
-
+def get_p2i(data):
+    patient_ids = data[:, 0].astype(int)
+    _, idx_start, counts = np.unique(patient_ids, return_index=True, return_counts=True)
+    return np.stack([idx_start, counts], axis=1)
 
 
 def get_batch(ix, data, p2i, select='center', index='patient', padding='regular',
@@ -79,10 +57,8 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         b: target ages
     """
 
-    AGE_COLUMN = 1
-    TOKEN_COLUMN = 2
     MASKING_TOKEN, MASKING_AGE = -1, -10000
-    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+N_HLA_ALLELES, 11+N_HLA_ALLELES
+    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
 
     x = torch.tensor(np.array([p2i[int(i)] for i in ix]))
     ix = torch.tensor(np.array(ix))
@@ -103,7 +79,7 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     else:
         raise NotImplementedError
 
-    traj_start_idx = torch.clamp(traj_start_idx, min=0, max=data.shape[0]-block_size-1)
+    traj_start_idx = torch.clamp(traj_start_idx, 0, data.shape[0] - block_size - 1)
     traj_start_idx = traj_start_idx.numpy()
 
     batch_idx = np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
@@ -111,8 +87,8 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     mask = torch.from_numpy(data[:, 0][batch_idx].astype(np.int64))
     mask = mask == torch.tensor(data[p2i[ix.numpy()][:, 0], 0][:, None].astype(np.int64)).to(mask.dtype)
 
-    tokens = torch.from_numpy(data[:, TOKEN_COLUMN][batch_idx].astype(np.int64))
-    ages   = torch.from_numpy(data[:, AGE_COLUMN][batch_idx].astype(np.float32))
+    tokens = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
+    ages   = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
 
     # augment lifestyle tokens to avoid immortality bias
     if lifestyle_augmentations:
@@ -125,8 +101,10 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     ages   = ages.masked_fill(~mask, MASKING_AGE)
 
     # insert a "no event" token every 5 years on average
-    no_padding = (padding.lower() == 'none') or (padding is None) or (no_event_token_rate == 0) or (no_event_token_rate is None)
-    if no_padding:
+    if (padding.lower() == 'none' or
+            padding is None or
+            no_event_token_rate == 0 or
+            no_event_token_rate is None):
         pad = torch.ones(len(ix), 0)
     elif padding == 'regular':
         pad = torch.arange(0, 36525, 365.25 * no_event_token_rate) * torch.ones(len(ix), 1) + 1
@@ -150,12 +128,23 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     tokens = torch.gather(tokens, 1, s)
     ages = torch.gather(ages, 1, s)
 
-    if (invalid_high := (tokens >= VOCAB_SIZE)).any():
-         idx = torch.nonzero(invalid_high)
-         print(f"🛑 Token(s) con índice demasiado alto detectados:")
-         for i in idx:
-             print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}, vocab_size: {VOCAB_SIZE}")
-         raise ValueError("Se encontraron índices fuera del rango superior del vocabulario.")
+    # invalid_high = (tokens >= vocab_size)
+    # invalid_low = (tokens < 0)
+    # 
+    # if invalid_high.any():
+    #     idx = torch.nonzero(invalid_high)
+    #     print(f"🛑 Token(s) con índice demasiado alto detectados:")
+    #     for i in idx:
+    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}, vocab_size: {vocab_size}")
+    #     raise ValueError("Se encontraron índices fuera del rango superior del vocabulario.")
+    # 
+    # if invalid_low.any():
+    #     idx = torch.nonzero(invalid_low)
+    #     print(f"🛑 Token(s) con índice negativo detectados:")
+    #     for i in idx:
+    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}")
+    #     raise ValueError("Se encontraron índices negativos en los tokens.")
+
 
     # a technical detail: the token 0 is reserved for padding, so we shift all tokens by one
     tokens = tokens + 1
@@ -186,74 +175,85 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         x, a, y, b = [i.pin_memory().to(device, non_blocking=True) for i in [x, a, y, b]]
     else:
         x, a, y, b = x.to(device), a.to(device), y.to(device), b.to(device)
-
     return x, a, y, b
 
 
-def shap_custom_tokenizer(s, return_offsets_mapping=True):
-    """Custom tokenizers conform to a subset of the transformers API."""
-    pos = 0
-    offset_ranges = []
-    input_ids = []
-    for m in re.finditer(r"\W", s):
-        start, end = m.span(0)
-        offset_ranges.append((pos, start))
-        input_ids.append(s[pos:start])
-        pos = end
-    if pos != len(s):
-        offset_ranges.append((pos, len(s)))
-        input_ids.append(s[pos:])
-    out = {}
-    out["input_ids"] = input_ids
-    if return_offsets_mapping:
-        out["offset_mapping"] = offset_ranges
-    return out
+def get_person(idx):
+    x, y, _, time = get_batch([idx], val, val_p2i,  
+              select='left', block_size=64, 
+              device=device, padding='random', 
+              cut_batch=True)
+    
+    x, y = x[y > -1], y[y > -1]
+    person = []
+    for token_id, date in zip(x, y):
+        person.append((id_to_token[token_id.item()], date.item()))
+    return person, y, time[0][-1]
 
+class DelphiData:
+    def __init__(self, data_dir, val_fold, delphi_labels, labels, ckpt_path, device, dtype, seed):
+        
+        self.data_dir = data_dir
+        self.delphi_labels = pd.read_csv(delphi_labels)
+        self.labels = pd.read_csv(labels, header=None, sep="\t")
+        self.ckpt_path = ckpt_path
+        self.device = device
+        self.dtype = dtype
+        self.val_fold = val_fold
 
-def shap_model_creator(model, disease_ids, person_tokens_ids, person_ages, device):
-    """
-    Creates a pseudo model that returns only logits for specified tokens.
-    Needed for SHAP values, otherwise the SHAP visualisation is too huge.
-    """
-    def f(ps):
-        xs = []
-        as_ = []
+        
+    def get_p2i(self):
 
-        for p in ps:
-            if len(p) == 0:
-                print('No tokens found??')
-                raise
-            p = list(map(int, p))
-            new_tokens = []
-            new_ages = []
-            for num, (masked, value, age) in enumerate(zip(p, person_tokens_ids, person_ages)):
-                if num == 0:
-                    new_ages.append(age)
-                    if masked == 10000:
-                        new_tokens.append(2 if value == 3 else 3)
-                    else:
-                        new_tokens.append(value)
-                else:
-                    if masked != 10000 or value == 1:
-                        new_ages.append(age)
-                        new_tokens.append(value)
+        load_data_from_bin = lambda datadir, file: np.fromfile  (os.path.join(datadir, file), dtype=np.uint32).reshape(-1, 3)
+        
+        train_folds = []
+        for fold_i in [1, 2, 3, 4, 5]:
+            if fold_i == self.val_fold:
+                continue
+            train_fold_filename = f'fold{fold_i}.bin'
+            train_datafold = load_data_from_bin(self.data_dir, train_fold_filename)
+            train_folds.append(train_datafold) 
+        self.train_data = np.concatenate(train_folds)
+        
+        self.val_filename = f'fold{self.val_fold}.bin' 
+        self.val_data = load_data_from_bin(self.data_dir, self.val_filename)
+        
+        self.train_p2i = get_p2i(self.train_data)
+        self.val_p2i = get_p2i(self.val_data)
 
-            x = (torch.tensor(new_tokens, device=device)[None, ...])
-            a = (torch.tensor(new_ages, device=device)[None, ...])
+    def get_id_to_token(self):
+        self.id_to_token = self.labels.to_dict()[0]
+        self.token_to_id = {v:k for k, v in self.id_to_token.items()}
 
-            xs.append(x)
-            as_.append(a)
+    def get_person(self, idx, data_type="validation"):
 
-        max_length = max([x.shape[-1] for x in xs])
+        if data_type == "validation":
+            data = self.val_data
+            p2i = self.val_p2i
+        elif data_type == "train":
+            data = self.train_data
+            p2i = self.train_p2i
+        else:
+            raise ValueError(f"Invalid data type: {data_type}")
 
-        xs = [torch.nn.functional.pad(x, (max_length - x.shape[-1], 0), value=0) for x in xs]
-        as_ = [torch.nn.functional.pad(x, (max_length - x.shape[-1], 0), value=-10000) for x in as_]
+        x, y, _, time = get_batch([idx], data, p2i,  
+              select='left', block_size=64, 
+              device=self.device, padding='random', 
+              cut_batch=True)
+    
+        x, y = x[y > -1], y[y > -1]
+        person = []
+        for token_id, date in zip(x, y):
+            person.append((self.id_to_token[token_id.item()], date.item()))
+        return person, y, time[0][-1]
 
-        x = torch.cat(xs)
-        a = torch.cat(as_)
+    def tokens_to_ids(self, tokens):
+        return [self.token_to_id[t] for t in tokens]
 
-        with torch.no_grad():
-            probs = model(x, a)[0][:, -1, disease_ids].detach().cpu().numpy()
-        return probs
-
-    return f
+    def ids_to_tokens(self, ids):
+        return [self.id_to_token[int(id_)] for id_ in ids]
+    
+    def split_person(self, p):
+        tokens = [i[0] for i in p]
+        ages = [i[1] for i in p]
+        return tokens, ages
