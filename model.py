@@ -208,7 +208,8 @@ class Delphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False):
+    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False, return_attentions=True):
+
         device = idx.device
         b, t = idx.size()
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -229,16 +230,25 @@ class Delphi(nn.Module):
             attn_mask += (attn_mask.sum(-1, keepdim=True)==0) * torch.diag(torch.ones(idx.size(1), device=device)) > 0
         attn_mask = attn_mask + (idx==0).view(idx.size(0), 1, 1, idx.size(1)) * torch.diag(torch.ones(idx.size(1), device=device)) > 0 # Except for padding
         attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0 #self.transformer.h[0].attn.bias[:,:,:idx.size(1),:idx.size(1)] > 0
-
         
-        att = []
-        for block in self.transformer.h:
-            x, a = block(x, attn_mask)
-            att.append(a)
-        x = self.transformer.ln_f(x)
-        att = torch.stack(att)
+        if return_attentions:
+            att = []
+            for block in self.transformer.h:
+                x, a = block(x, attn_mask)
+                att.append(a)
+            x = self.transformer.ln_f(x)
+            att = torch.stack(att)
+        else:
+            for block in self.transformer.h:
+                x, _ = block(x, attn_mask)
+            x = self.transformer.ln_f(x)
+            att = None
 
-        if targets is not None:
+        if targets is None:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, :, :]) # note: using list [-1] to preserve the time dim
+            loss = None
+        else:
             # next token cross entropy loss, padding masked
             logits = self.lm_head(x)
 
@@ -253,8 +263,8 @@ class Delphi(nn.Module):
             for k in ignored_tokens: # and gender
                 pass_tokens *= targets != k
             
-            #age_min = age.gather(1,(((idx >=4) * (idx <=12)) + 0).argmax(1)[:,None])
-            #logits[...,-1][age <= age_min] = -100. #-float('Inf') ## Death can only occur after age_min
+            # age_min = age.gather(1,(((idx >=4) * (idx <=12)) + 0).argmax(1)[:,None])
+            # logits[...,-1][age <= age_min] = -100. #-float('Inf') ## Death can only occur after age_min
             
             loss_ce = F.cross_entropy(logits.reshape(-1, logits.size(-1))[pass_tokens], targets[pass_tokens], ignore_index=-1)
             
@@ -275,10 +285,7 @@ class Delphi(nn.Module):
             loss = {'loss_ce': loss_ce, 'loss_dt': loss_dt}
             
             #loss += 5.0 * F.mse_loss(lse.view(-1)*(ldt != 0), ldt) ## Adds MSE for log time difference to next observed event
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, :, :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            
 
         return logits, loss, att
 
