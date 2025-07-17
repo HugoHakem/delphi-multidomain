@@ -191,14 +191,12 @@ def get_person(idx):
     return person, y, time[0][-1]
 
 class DelphiData:
-    def __init__(self, data_dir, val_fold, delphi_labels, labels, ckpt_path, device, dtype, seed):
+    def __init__(self, data_dir, val_fold, delphi_labels, labels, device=None):
         
         self.data_dir = data_dir
         self.delphi_labels = pd.read_csv(delphi_labels)
         self.labels = pd.read_csv(labels, header=None, sep="\t")
-        self.ckpt_path = ckpt_path
-        self.device = device
-        self.dtype = dtype
+        self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.val_fold = val_fold
 
         
