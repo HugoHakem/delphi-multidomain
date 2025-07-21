@@ -31,10 +31,13 @@ if args.run_idx is not None:
 else:
     run_ids_to_process = run_ids_sorted
 
+print(run_ids_to_process)
+
 # 2. Process each run id
-for run_id in tqdm(run_ids_to_process, desc="Run IDs"):
+for run_id in run_ids_to_process:
+    print(run_id)
     flist = grouped[run_id]
-    print(flist)
+#     print(flist)
     # Sort by chunk number
     def chunk_number(fname):
         base = os.path.basename(fname)
@@ -61,18 +64,23 @@ for run_id in tqdm(run_ids_to_process, desc="Run IDs"):
         continue
 
     # 3. Concatenate the data
-    merged = {}
+    merged_lists = {}    
     for i, fname in enumerate(tqdm(flist_sorted, desc=f"Chunks for {run_id}", leave=False)):
         with open(os.path.join(folder, fname), "rb") as f:
             data = pickle.load(f)
-        if i == 0:
-            merged = {k: v.copy() for k, v in data.items()}
-        else:
-            for k in merged:
-                merged[k] = np.concatenate([merged[k], data[k]], axis=0)
-    # 4. Save the result
+        for k, v in data.items():
+            if k == "model":
+                continue
+            if k not in merged_lists:
+                merged_lists[k] = [v]
+            else:
+                merged_lists[k].append(v)
+    
+    merged = {k: np.concatenate(vlist, axis=0) for k, vlist in merged_lists.items()}
+    
     outname = f"shap_values_merged_{run_id}.pkl"
+    print(f"saving file {outname}")
     with open(os.path.join(folder, outname), "wb") as f:
         pickle.dump(merged, f)
-    print(f"Saved: {outname} ({len(flist_sorted)} chunks)") 
-
+    
+    print(f"Saved: {outname} ({len(flist_sorted)} chunks)")
