@@ -208,8 +208,12 @@ class Delphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False, return_attentions=True):
-
+    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False, return_attentions=True, return_embeddings=False):
+        """
+        If return_embeddings=True, the method will return the final hidden states (embeddings) before the logits.
+        The return value will be a tuple: (logits, loss, att, embeddings)
+        Otherwise, the return value is (logits, loss, att) as before.
+        """
         device = idx.device
         b, t = idx.size()
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -243,6 +247,11 @@ class Delphi(nn.Module):
                 x, _ = block(x, attn_mask)
             x = self.transformer.ln_f(x)
             att = None
+
+        if return_embeddings:
+            embeddings = x  # final hidden states before logits
+        else:
+            embeddings = None
 
         if targets is None:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -287,7 +296,16 @@ class Delphi(nn.Module):
             #loss += 5.0 * F.mse_loss(lse.view(-1)*(ldt != 0), ldt) ## Adds MSE for log time difference to next observed event
             
 
-        return logits, loss, att
+        return logits, loss, att, embeddings
+
+    def get_embeddings(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False, return_attentions=True, return_embeddings=True):
+        """
+        If return_embeddings=True, the method will return the final hidden states (embeddings) before the logits.
+        The return value will be a tuple: (logits, loss, att, embeddings)
+        Otherwise, the return value is (logits, loss, att) as before.
+        """
+        return self(idx, age, targets, targets_age, validation_loss_mode, return_attentions, return_embeddings)[-1]
+
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
