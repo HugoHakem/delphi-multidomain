@@ -32,7 +32,7 @@ def get_p2i(data):
 
 def get_batch(ix, data, p2i, select='center', index='patient', padding='regular',
               block_size=48, device='cpu', lifestyle_augmentations=False, 
-              no_event_token_rate=5, cut_batch=False):
+              no_event_token_rate=5, cut_batch=False, return_subject_ids=False):
     """
     Get a batch of data from the dataset. This function packs sequences in a batch and also
     inserts "no event" tokens randomly with the average rate of one every five years.
@@ -60,7 +60,15 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     MASKING_TOKEN, MASKING_AGE = -1, -10000
     LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
 
-    x = torch.tensor(np.array([p2i[int(i)] for i in ix]))
+    # Define the columns of the data array    
+    SUBJECT_ID_COLUMN = 0
+    AGE_COLUMN = 1
+    TOKEN_COLUMN = 2
+
+    subject_start_and_count = torch.tensor(np.array([p2i[int(i)] for i in ix]))
+    if return_subject_ids:
+        subject_ids = torch.tensor(np.array([data[int(subject_index[0]), SUBJECT_ID_COLUMN] for subject_index in subject_start_and_count]))        
+        
     ix = torch.tensor(np.array(ix))
 
     gen = torch.Generator(device='cpu')
@@ -68,11 +76,11 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
 
     if index == 'patient':
         if select == 'left':
-            traj_start_idx = x[:, 0]
+            traj_start_idx = subject_start_and_count[:, 0]
         elif select == 'right':
-            traj_start_idx = torch.clamp(x[:, 0] + x[:, 1] - block_size - 1, 0, data.shape[0])
+            traj_start_idx = torch.clamp(subject_start_and_count[:, 0] + subject_start_and_count[:, 1] - block_size - 1, 0, data.shape[0])
         elif select == 'random':
-            traj_start_idx = x[:, 0] + (torch.randint(2**63-1, (len(ix),), generator=gen) % torch.clamp(x[:, 1] - block_size, 1))
+            traj_start_idx = subject_start_and_count[:, 0] + (torch.randint(2**63-1, (len(ix),), generator=gen) % torch.clamp(subject_start_and_count[:, 1] - block_size, 1))
             traj_start_idx = torch.clamp(traj_start_idx, 0, data.shape[0])
         else:
             raise NotImplementedError
@@ -84,11 +92,11 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
 
     batch_idx = np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
 
-    mask = torch.from_numpy(data[:, 0][batch_idx].astype(np.int64))
-    mask = mask == torch.tensor(data[p2i[ix.numpy()][:, 0], 0][:, None].astype(np.int64)).to(mask.dtype)
+    mask = torch.from_numpy(data[:, SUBJECT_ID_COLUMN][batch_idx].astype(np.int64))
+    mask = mask == torch.tensor(data[p2i[ix.numpy()][:, SUBJECT_ID_COLUMN], SUBJECT_ID_COLUMN][:, None].astype(np.int64)).to(mask.dtype)
 
-    tokens = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
-    ages   = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
+    tokens = torch.from_numpy(data[:, TOKEN_COLUMN][batch_idx].astype(np.int64))
+    ages   = torch.from_numpy(data[:, AGE_COLUMN][batch_idx].astype(np.float32))
 
     # augment lifestyle tokens to avoid immortality bias
     if lifestyle_augmentations:
@@ -175,7 +183,11 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         x, a, y, b = [i.pin_memory().to(device, non_blocking=True) for i in [x, a, y, b]]
     else:
         x, a, y, b = x.to(device), a.to(device), y.to(device), b.to(device)
-    return x, a, y, b
+
+    if return_subject_ids:
+        return x, a, y, b, subject_ids
+    else:           
+        return x, a, y, b
 
 
 def get_person(idx):
