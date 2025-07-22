@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 class DelphiEmbeddingInterface:
-    def __init__(self, run_id, device='cpu', dtype='float32', load='all'):
+    def __init__(self, run_id, device=None, dtype='float32', load='all'):
         """
         Interface to load a Delphi model and its associated data from an MLflow run_id.
 
@@ -19,7 +19,7 @@ class DelphiEmbeddingInterface:
         """
         
         self.run_id = run_id
-        self.device = device
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = dtype
 
         # Get run information from MLflow
@@ -197,7 +197,7 @@ if __name__ == "__main__":
 
     batch_size = 128
     block_size = 128
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     no_event_token_rate = 5
 
     ix = torch.randint(len(data.train_p2i), (batch_size,))
