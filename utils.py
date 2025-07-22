@@ -192,17 +192,14 @@ def get_person(idx):
 
 class DelphiData:
     def __init__(self, data_dir, val_fold, delphi_labels, labels, device=None):
-        
         self.data_dir = data_dir
         self.delphi_labels = pd.read_csv(delphi_labels)
         self.labels = pd.read_csv(labels, header=None, sep="\t")
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.val_fold = val_fold
 
-        
     def get_p2i(self):
-
-        load_data_from_bin = lambda datadir, file: np.fromfile  (os.path.join(datadir, file), dtype=np.uint32).reshape(-1, 3)
+        load_data_from_bin = lambda datadir, file: np.fromfile(os.path.join(datadir, file), dtype=np.uint32).reshape(-1, 3)
         
         train_folds = []
         for fold_i in [1, 2, 3, 4, 5]:
@@ -210,10 +207,10 @@ class DelphiData:
                 continue
             train_fold_filename = f'fold{fold_i}.bin'
             train_datafold = load_data_from_bin(self.data_dir, train_fold_filename)
-            train_folds.append(train_datafold) 
+            train_folds.append(train_datafold)
         self.train_data = np.concatenate(train_folds)
         
-        self.val_filename = f'fold{self.val_fold}.bin' 
+        self.val_filename = f'fold{self.val_fold}.bin'
         self.val_data = load_data_from_bin(self.data_dir, self.val_filename)
         
         self.train_p2i = get_p2i(self.train_data)
@@ -221,36 +218,62 @@ class DelphiData:
 
     def get_id_to_token(self):
         self.id_to_token = self.labels.to_dict()[0]
-        self.token_to_id = {v:k for k, v in self.id_to_token.items()}
+        self.token_to_id = {v: k for k, v in self.id_to_token.items()}
 
-    def get_person(self, idx, data_type="validation"):
-
-        if data_type == "validation":
+    def get_person(self, idx, data_type="val"):
+        """
+        Returns the person data for the given index.
+        data_type: "val", "train", or "all"
+        """
+        if data_type == "val":
             data = self.val_data
             p2i = self.val_p2i
+            indices = [idx] if isinstance(idx, int) else idx
+            x, y, _, time = get_batch(indices, data, p2i,
+                                      select='left', block_size=64,
+                                      device=self.device, padding='random',
+                                      cut_batch=True)
+            x, y = x[y > -1], y[y > -1]
+            person = []
+            for token_id, date in zip(x, y):
+                person.append((self.id_to_token[token_id.item()], date.item()))
+            return person, y, time[0][-1]
         elif data_type == "train":
             data = self.train_data
             p2i = self.train_p2i
+            indices = [idx] if isinstance(idx, int) else idx
+            x, y, _, time = get_batch(indices, data, p2i,
+                                      select='left', block_size=64,
+                                      device=self.device, padding='random',
+                                      cut_batch=True)
+            x, y = x[y > -1], y[y > -1]
+            person = []
+            for token_id, date in zip(x, y):
+                person.append((self.id_to_token[token_id.item()], date.item()))
+            return person, y, time[0][-1]
+        elif data_type == "all":
+            # Concatenate train and val data
+            all_data = np.concatenate([self.train_data, self.val_data])
+            all_p2i = get_p2i(all_data)
+            indices = [idx] if isinstance(idx, int) else idx
+            x, y, _, time = get_batch(indices, all_data, all_p2i,
+                                      select='left', block_size=64,
+                                      device=self.device, padding='random',
+                                      cut_batch=True)
+            x, y = x[y > -1], y[y > -1]
+            person = []
+            for token_id, date in zip(x, y):
+                person.append((self.id_to_token[token_id.item()], date.item()))
+            return person, y, time[0][-1]
         else:
-            raise ValueError(f"Invalid data type: {data_type}")
-
-        x, y, _, time = get_batch([idx], data, p2i,  
-              select='left', block_size=64, 
-              device=self.device, padding='random', 
-              cut_batch=True)
-    
-        x, y = x[y > -1], y[y > -1]
-        person = []
-        for token_id, date in zip(x, y):
-            person.append((self.id_to_token[token_id.item()], date.item()))
-        return person, y, time[0][-1]
+            raise ValueError(f"Invalid data_type: {data_type}. Must be 'val', 'train', or 'all'.")
 
     def tokens_to_ids(self, tokens):
         return [self.token_to_id[t] for t in tokens]
 
     def ids_to_tokens(self, ids):
         return [self.id_to_token[int(id_)] for id_ in ids]
-    
+
     def split_person(self, p):
         tokens = [i[0] for i in p]
         ages = [i[1] for i in p]
