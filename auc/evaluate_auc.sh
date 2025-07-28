@@ -1,9 +1,12 @@
+RUNID="f945b0c1f1b84294bf29a6d39e6ef831"
+DELPHI_LABELS="delphi_labels_chapters_colours_icd_with_hla4d.csv"
+
 python evaluate_auc.py \
   --input_path data/ukb_real_data/ \
   --data_file_prefix "ukb_real_hla_" \
-  --output_path auc_ukb_real_hla_f945b0c1f1b84294bf29a6d39e6ef831 \
-  --model_ckpt_path ./Delphi-hla/ckpt__f945b0c1f1b84294bf29a6d39e6ef831__100000.pt \
-  --delphi-labels "delphi_labels_chapters_colours_icd_with_hla4d.csv" \
+  --output_path auc_ukb_real_hla_${RUNID} \
+  --model_ckpt_path ./Delphi-hla/ckpt__${RUNID}__100000.pt \
+  --delphi-labels ${DELPHI_LABELS} \
   --no_event_token_rate 5 \
   --health_token_replacement_prob 0.0 \
   --dataset_subset_size -1 \
