@@ -149,9 +149,9 @@ if __name__ == "__main__":
     parser.add_argument('--max_chunks', type=int, default=None, help='Maximum number of chunks to process (for testing). If not set, process all.')
     parser.add_argument('--age', type=float, default=30, help='Maximum age (in years) to filter subject events (default: 30).')
     parser.add_argument('--output', type=str, required=True, help='Path to the file where the output will be saved (.json, .npy, or .csv supported).')
+    parser.add_argument('--run_id', '--runid', '--run', dest="run_id", type=str, required=False, help='MLflow run to get embeddings for. If not provided, it is chosen interactively.')
     args = parser.parse_args()
 
-   
     # Check output extension early and warn if not supported
     supported_exts = [".json", ".npy", ".csv"]
     output_ext = None
@@ -163,72 +163,76 @@ if __name__ == "__main__":
 
     # Interactive selection of experiment and run
     client = mlflow.tracking.MlflowClient()
-    experiments = client.search_experiments()
-    if not experiments:
-        print("No MLflow experiments found.")
-        sys.exit(1)
+    
+    if args.run_id is None:
+        experiments = client.search_experiments()
+        if not experiments:
+            print("No MLflow experiments found.")
+            sys.exit(1)
 
-    print("Available MLflow experiments:")
-    for idx, exp in enumerate(experiments):
-        print(f"{idx}: {exp.name} (ID: {exp.experiment_id})")
+        print("Available MLflow experiments:")
+        for idx, exp in enumerate(experiments):
+            print(f"{idx}: {exp.name} (ID: {exp.experiment_id})")
 
-    # Ask user to select an experiment
-    while True:
-        try:
-            exp_idx = int(input("Select the experiment number: "))
-            if 0 <= exp_idx < len(experiments):
-                break
+        # Ask user to select an experiment
+        while True:
+            try:
+                exp_idx = int(input("Select the experiment number: "))
+                if 0 <= exp_idx < len(experiments):
+                    break
+                else:
+                    print("Invalid experiment number. Try again.")
+            except ValueError:
+                print("Please enter a valid integer.")
+
+        selected_experiment = experiments[exp_idx]
+        experiment_id = selected_experiment.experiment_id
+
+        # List all runs for the selected experiment
+        runs = client.search_runs(
+           experiment_ids=[experiment_id],
+           filter_string="attributes.status = 'FINISHED'",
+           order_by=["attributes.start_time DESC"],
+           max_results=1000
+        )
+
+        if not runs:
+            print("No finished runs found for this experiment.")
+            sys.exit(1)
+
+        # Sort runs by fold (ascending)
+        def get_fold(run):
+            if 'fold' in run.data.params:
+                return int(run.data.params['fold'])
+            elif 'fold' in run.data.tags:
+                return int(run.data.tags['fold'])
             else:
-                print("Invalid experiment number. Try again.")
-        except ValueError:
-            print("Please enter a valid integer.")
+                return float('inf')  # If no fold, send to the end
 
-    selected_experiment = experiments[exp_idx]
-    experiment_id = selected_experiment.experiment_id
+        runs_sorted = sorted(runs, key=get_fold)
 
-    # List all runs for the selected experiment
-    runs = client.search_runs(
-        experiment_ids=[experiment_id],
-        filter_string="attributes.status = 'FINISHED'",
-        order_by=["attributes.start_time DESC"],
-        max_results=1000
-    )
+        print(f"\nAvailable runs for experiment '{selected_experiment.name}' (sorted by fold):")
+        for idx, run in enumerate(runs_sorted):
+            run_name = run.data.tags.get('mlflow.runName', 'Unnamed')
+            fold = run.data.params.get('fold', run.data.tags.get('fold', 'N/A'))
+            print(f"{idx}: Run ID: {run.info.run_id}, Name: {run_name}, Fold: {fold}")
 
-    if not runs:
-        print("No finished runs found for this experiment.")
-        sys.exit(1)
+        # Ask user to select a run
+        while True:
+            try:
+                run_idx = int(input("Select the run number: "))
+                if 0 <= run_idx < len(runs_sorted):
+                    break
+                else:
+                    print("Invalid run number. Try again.")
+            except ValueError:
+                print("Please enter a valid integer.")
 
-    # Sort runs by fold (ascending)
-    def get_fold(run):
-        if 'fold' in run.data.params:
-            return int(run.data.params['fold'])
-        elif 'fold' in run.data.tags:
-            return int(run.data.tags['fold'])
-        else:
-            return float('inf')  # If no fold, send to the end
-
-    runs_sorted = sorted(runs, key=get_fold)
-
-    print(f"\nAvailable runs for experiment '{selected_experiment.name}' (sorted by fold):")
-    for idx, run in enumerate(runs_sorted):
-        run_name = run.data.tags.get('mlflow.runName', 'Unnamed')
-        fold = run.data.params.get('fold', run.data.tags.get('fold', 'N/A'))
-        print(f"{idx}: Run ID: {run.info.run_id}, Name: {run_name}, Fold: {fold}")
-
-    # Ask user to select a run
-    while True:
-        try:
-            run_idx = int(input("Select the run number: "))
-            if 0 <= run_idx < len(runs_sorted):
-                break
-            else:
-                print("Invalid run number. Try again.")
-        except ValueError:
-            print("Please enter a valid integer.")
-
-    selected_run = runs_sorted[run_idx]
-    run_id = selected_run.info.run_id
-
+        selected_run = runs_sorted[run_idx]
+        run_id = selected_run.info.run_id
+    else:
+        run_id = args.run_id
+ 
     print(f"\nLoading DelphiEmbeddingInterface for run ID: {run_id} ...")
     interface = DelphiEmbeddingInterface(run_id)
     print("Model, data, and config loaded successfully.")
@@ -253,13 +257,14 @@ if __name__ == "__main__":
     print("y_all:", y_all)
     print("last_time_all:", last_time_all)
 
-    batch_size = 256
+    batch_size = 4096
     block_size = 128
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"{device=}")
     no_event_token_rate = 5
 
     ix = torch.randint(len(data.train_p2i), (batch_size,))
-    X, A, Y, B = get_batch(ix, data.train_data, data.train_p2i, block_size=block_size, device=device,
+    X, A, Y, B = get_batch(ix, data.all_data, data.all_p2i, block_size=block_size, device=device,
                            padding='random', lifestyle_augmentations=True, select='left',
                            no_event_token_rate=no_event_token_rate)
     
@@ -271,7 +276,7 @@ if __name__ == "__main__":
         """
         return [dataset[i:i+batch_size] for i in range(0, len(dataset), batch_size)]
 
-    train_chunks = chunk_dataset(data.train_data, batch_size)
+    train_chunks = chunk_dataset(range(len(np.unique(data.all_data[:,0]))), batch_size)
     print(f"The training dataset has been split into {len(train_chunks)} chunks of up to {batch_size} samples each.")
 
     # We will store a list of dicts: {"subject_id": ..., "embedding": ...}
@@ -284,7 +289,7 @@ if __name__ == "__main__":
         print(f"Processing only {num_chunks_to_process} chunk(s) out of {len(train_chunks)} due to --max_chunks argument.")
 
     # Map integer index to subject_id using the first column of data.train_data
-    index_to_subject_id = {i: data.train_data[i][0] for i in range(len(data.train_data))}
+    index_to_subject_id = {i: data.all_data[i][0] for i in range(len(data.all_data))}
 
     # Filter and shift with the age chosen by the user
     age_threshold_days = args.age * 365.25
@@ -292,13 +297,15 @@ if __name__ == "__main__":
 
     # NOTE: Filtering and shifting must be done per batch, not on global X/A, so that each batch is aligned with the chunk's subjects
     for i, chunk in enumerate(train_chunks):
+
         if i >= num_chunks_to_process:
             break
         # Get the indices of the subjects in this chunk
-        indices = np.arange(i * batch_size, min((i + 1) * batch_size, len(data.train_data)))
+        # indices = np.arange(i * batch_size, min((i + 1) * batch_size, len(data.train_data)))
         # Prepare the batch using get_batch
+        indices = list(chunk)
         ix = torch.tensor(indices, dtype=torch.long)
-        X, A, Y, B, subject_ids = get_batch(ix, data.train_data, data.train_p2i, block_size=block_size, device=device,
+        X, A, Y, B, subject_ids = get_batch(ix, data.all_data, data.all_p2i, block_size=block_size, device=device,
                                padding='random', lifestyle_augmentations=True, select='left',
                                no_event_token_rate=no_event_token_rate, return_subject_ids=True)
         # Filter and shift for the chosen age
@@ -347,5 +354,5 @@ if __name__ == "__main__":
             return emb
         for i in range(len(embeddings_per_subject[0]['embedding'])-1):
             df[f'embedding_{str(i).zfill(3)}'] = df[f'embedding_{str(i).zfill(3)}'].apply(format_embedding)
-        df.to_csv(output_path, index=False)
+        df.to_csv(output_path, index=True)
         print(f"Output saved as numpy .npy to {output_path}")
