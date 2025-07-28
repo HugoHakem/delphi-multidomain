@@ -1,7 +1,7 @@
 #!/bin/bash
 
-seeds=(42)
-n_embd_vals=(240)
+seeds=(142)
+n_embd_vals=(120)
 n_layer_vals=(6)
 batch_size_vals=(128)
 learning_rate_vals=(1e-4)

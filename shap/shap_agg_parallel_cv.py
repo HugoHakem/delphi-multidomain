@@ -77,6 +77,12 @@ if __name__ == "__main__":
     device_type = 'cuda' if 'cuda' in device else 'cpu'
             
     runid = get_run_from_fold(args.experiment_id, args.val_fold)
+    output_pickle = f"shap_values_chunk{args.chunk_idx+1}of{args.num_chunks}_{runid}.pkl"
+
+    import os
+    if os.path.exists(output_pickle):
+        exit()
+
     ckpt_path = get_best_ckpt_from_mlflow(runid)
 
     runinfo = mlflow.get_run(run_id=runid)
@@ -130,7 +136,6 @@ if __name__ == "__main__":
     all_people = np.concatenate([i[3] for i in shaply_val])
     
 
-    output_pickle = f"shap_values_chunk{args.chunk_idx+1}of{args.num_chunks}_{runid}.pkl"
     with open(output_pickle, 'wb') as f:
         pickle.dump({
             'tokens': all_tokens,

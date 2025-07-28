@@ -33,7 +33,6 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 
 delphi_labels = pd.read_csv(args.delphi_labels)
 labels = pd.read_csv(args.labels, header=None, sep="\t")
-
 model = Delphi.from_checkpoint(args.ckpt_path).eval()
 
 train = np.fromfile(os.path.join(args.data_root, 'train.bin'), dtype=np.uint32).reshape(-1, 3)
