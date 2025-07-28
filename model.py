@@ -208,7 +208,7 @@ class Delphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False, return_attentions=True, return_embeddings=False):
+    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False, return_attentions=False, return_embeddings=False):
         """
         If return_embeddings=True, the method will return the final hidden states (embeddings) before the logits.
         The return value will be a tuple: (logits, loss, att, embeddings)
