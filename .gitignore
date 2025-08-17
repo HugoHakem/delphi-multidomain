@@ -1,0 +1,17 @@
+*pkl
+*png
+*parquet
+__pycache__/
+.ipynb_checkpoints/
+*csv
+logs/
+dcgm/
+mlruns/
+tmp*/
+*txt
+*gz
+*plink
+checkpoints/
+*swp
+*output*
+data
