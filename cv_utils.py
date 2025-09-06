@@ -2,7 +2,6 @@ import mlflow
 import re
 import os
 
-
 DATA_TYPE_CONFIGS = {
 
     'real-hla-4digits-5folds': {
@@ -30,14 +29,11 @@ def get_best_ckpt_from_mlflow(runid):
     best_ckpt = os.path.join(ckpt_dir, best_ckpt)
     return best_ckpt
 
-
-
 def get_run_from_fold(experiment_id=None, val_fold=None):
-    
-    """
-    Recupera val_fold y la ruta del checkpoint desde los metadatos de MLflow usando experiment_id.
-    Asegura que el experimento contenga los 5 folds.
-    Retorna (val_fold, run_id, ckpt_path).
+    """ 
+    Retrieves val_fold and the checkpoint path from MLflow metadata using experiment_id.
+    Ensures the experiment contains all 5 folds.
+    Returns (val_fold, run_id, ckpt_path).
     """
 
     experiment_id = str(experiment_id)
@@ -48,9 +44,9 @@ def get_run_from_fold(experiment_id=None, val_fold=None):
         filter_string="attributes.status = 'FINISHED'",
         order_by=["attributes.start_time DESC"],
         max_results=1000
-    )
+    )   
     if not runs:
-        raise ValueError(f"No se encontraron ejecuciones exitosas en el experimento {experiment_id}")
+        raise ValueError(f"No successful runs found in experiment {experiment_id}")
 
     val_folds = []
     fold_to_run = {}
@@ -62,16 +58,16 @@ def get_run_from_fold(experiment_id=None, val_fold=None):
             val_fold_run = int(run.data.tags['fold'])
         if val_fold_run is not None:
             if val_fold_run not in fold_to_run:
-                fold_to_run[val_fold_run] = run
+                fold_to_run[val_fold_run] = run 
                 val_folds.append(val_fold_run)
 
-    if sorted(val_folds) != [1, 2, 3, 4, 5]:
-        raise ValueError(f"¡El experimento {experiment_id} no tiene los 5 folds! Folds encontrados: {sorted(val_folds)}")
+    if sorted(val_folds) != [1, 2, 3, 4, 5]: 
+        raise ValueError(f"Experiment {experiment_id} does not contain all 5 folds! Found folds: {sorted(val_folds)}")
 
     requested_fold = val_fold
 
     if requested_fold not in fold_to_run:
-        raise ValueError(f"El fold solicitado {requested_fold} no se encontró en el experimento {experiment_id}")
+        raise ValueError(f"Requested fold {requested_fold} not found in experiment {experiment_id}")
 
     run = fold_to_run[requested_fold]
 
