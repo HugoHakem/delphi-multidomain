@@ -65,7 +65,7 @@ def estimate_loss(model, eval_iters, batch_size, block_size, train_data, val_dat
                                    no_event_token_rate=no_event_token_rate, 
                                    cut_batch=True)
             with ctx:
-                logits, loss, _ = model(X, A, Y, B, validation_loss_mode=True)
+                logits, loss, _, _ = model(X, A, Y, B, validation_loss_mode=True)
             losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
         out[split] = losses.mean(0)
     model.train()   
@@ -260,7 +260,8 @@ def main(args, replacement_values, code_to_exec):
         dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_", "real-no-hla"
         dataset, file_prefix, data_type = 'ukb_real_5_folds_nohla', "", "real-nohla-5folds"
     else:
-        filename_rules = [ 'ukb_real_5_folds_2digit', "", "real-hla-2digits-5folds"
+        filename_rules = [ 
+          'ukb_real_5_folds_2digit', "", "real-hla-2digits-5folds"
           'ukb_real_5_folds_4digit', "", "real-hla-4digits-5folds"
           'ukb_real_5_folds_4digit', "", "real-hla-4digits"
           'ukb_real_5_folds_4digit', "", "real-hla-4digits"
@@ -270,9 +271,9 @@ def main(args, replacement_values, code_to_exec):
         dataset, file_prefix, data_type = filename_rules[0]
 
     data_dir = os.path.join('data', dataset)
-    
+   
     # load_data_from_bin = lambda datadir, file: np.memmap(os.path.join(data_dir, file), dtype=np.uint32, mode='r').reshape(-1, 3)
-    load_data_from_bin = lambda datadir, file: np.fromfile(os.path.join(data_dir, file), dtype=np.uint32, mode='r').reshape(-1, 3)
+    load_data_from_bin = lambda datadir, file: np.fromfile(os.path.join(data_dir, file), dtype=np.uint32).reshape(-1, 3)
 
     train_folds = []
     for fold_i in [1, 2, 3, 4, 5]:
@@ -282,7 +283,8 @@ def main(args, replacement_values, code_to_exec):
         train_datafold = load_data_from_bin(data_dir, train_fold_filename)
         train_folds.append(train_datafold) 
     train_data = np.concatenate(train_folds)
-    
+   
+    print(f"Loading data from {data_dir}/fold{args.val_fold}...") 
     val_filename = f'fold{args.val_fold}.bin'
     val_data   = load_data_from_bin(data_dir, val_filename)
 
@@ -437,7 +439,7 @@ def main(args, replacement_values, code_to_exec):
         step += 1
         for micro_step in range(gradient_accumulation_steps):
             with ctx:
-                logits, loss, att = model(X, A, Y, B)
+                logits, loss, att, embeddings= model(X, A, Y, B)
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             ix = torch.randint(len(train_p2i), (batch_size,))
             

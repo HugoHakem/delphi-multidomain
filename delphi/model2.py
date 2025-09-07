@@ -167,6 +167,7 @@ class DelphiConfig:
     mask_ties: bool = False
     ignore_tokens: list = field(default_factory=lambda: [0])
 
+
 class Delphi(nn.Module):
 
     def __init__(self, config):
@@ -523,7 +524,7 @@ class Delphi(nn.Module):
         return optimizer
 
     @torch.no_grad()
-    def generate(self, idx, age, max_new_tokens=100, max_age=85*365.25, no_repeat=True, termination_tokens=None, top_k=None):
+    def generate(self, idx, age, max_new_tokens=100, max_age=85*365.25, no_repeat=True, termination_tokens=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -535,8 +536,8 @@ class Delphi(nn.Module):
         termination_tokens: list[int] -  a list of tokens that indicate the and of the trajectory.
         Usually it is the "Death" token, but could be several tokens e.g. to indicate different
         death reasons.
-        top_k: None, does nothing
         """
+
         if termination_tokens is None:
             warnings.warn('When using a custem dataset, consider changing the `termination_tokens` argument.')
             termination_tokens = [1269]
@@ -578,7 +579,10 @@ class Delphi(nn.Module):
         if no_repeat:
             fill = idx + 0
             fill[fill == 1] = 0
-            logits = torch.stack([logits[:,j].scatter_(1, fill[:,:j+1], -torch.inf) for j in range(fill.shape[1])]).transpose(0,1)
+            logits = torch.stack([
+                logits[:,j].scatter_(1, fill[:,:j+1], -torch.inf) 
+                for j in range(fill.shape[1])
+            ]).transpose(0,1)
 
         return idx, age, logits
 

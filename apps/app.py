@@ -7,6 +7,8 @@ import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from scipy.stats import norm
+
 import os
 
 import re
@@ -36,6 +38,114 @@ if "runs_loaded" not in st.session_state:
 
 if st.sidebar.button("Load runs"):
     st.session_state.runs_loaded = True
+
+
+def compute_consensus_auc_by_sex(df):
+    results = []
+
+    for (disease, sex, age), group in df.groupby(["name", "sex", 'age']):
+        # Con HLA
+        aucs_hla = group["auc_delong_hla"].values
+        vars_hla = group["auc_variance_delong_hla"].values
+        weights_hla = 1 / vars_hla
+
+        auc_consensus_hla = (aucs_hla * weights_hla).sum() / weights_hla.sum()
+        var_consensus_hla = 1 / weights_hla.sum()
+
+        # Sin HLA
+        aucs_nohla = group["auc_delong_nohla"].values
+        vars_nohla = group["auc_variance_delong_nohla"].values
+        weights_nohla = 1 / vars_nohla
+
+        auc_consensus_nohla = (aucs_nohla * weights_nohla).sum() / weights_nohla.sum()
+        var_consensus_nohla = 1 / weights_nohla.sum()
+
+        results.append({
+            "name": disease,
+            "sex": sex,
+            "age": age,
+            "AUC_consensus_hla": auc_consensus_hla,
+            "SE_consensus_hla": var_consensus_hla**0.5,
+            "AUC_consensus_nohla": auc_consensus_nohla,
+            "SE_consensus_nohla": var_consensus_nohla**0.5
+        })
+
+    return pd.DataFrame(results)
+
+
+def compare_sex_differences(df):
+    results = []
+
+    for disease, group in df.groupby("name"):
+        print(set(group["sex"]))
+        if set(group["sex"]) != {"female", "male"}:
+            continue  # skip if not both sexes present
+
+        male = group[group["sex"] == "male"].iloc[0]
+        female = group[group["sex"] == "female"].iloc[0]
+
+        # Con HLA
+        delta_hla = male["AUC_consensus_hla"] - female["AUC_consensus_hla"]
+        se_hla = (male["SE_consensus_hla"]**2 + female["SE_consensus_hla"]**2)**0.5
+        z_hla = delta_hla / se_hla
+        p_hla = 2 * norm.sf(abs(z_hla))
+
+        # Sin HLA
+        delta_nohla = male["AUC_consensus_nohla"] - female["AUC_consensus_nohla"]
+        se_nohla = (male["SE_consensus_nohla"]**2 + female["SE_consensus_nohla"]**2)**0.5
+        z_nohla = delta_nohla / se_nohla
+        p_nohla = 2 * norm.sf(abs(z_nohla))
+
+        results.append({
+            "name": disease,
+            "delta_auc_male_vs_female_hla": delta_hla,
+            "pvalue_male_vs_female_hla": p_hla,
+            "delta_auc_male_vs_female_nohla": delta_nohla,
+            "pvalue_male_vs_female_nohla": p_nohla
+        })
+
+    return pd.DataFrame(results).sort_values("pvalue_interaction")
+
+
+def test_interaction_by_age(df):
+    results = []
+
+    for (disease, age_group), group in df.groupby(["name", "age"]):
+        if set(group["sex"]) != {"male", "female"}:
+            continue  # need both sexes to compare
+
+        male = group[group["sex"] == "male"].iloc[0]
+        female = group[group["sex"] == "female"].iloc[0]
+
+        # Delta AUC por sexo
+        delta_male = male["AUC_consensus_hla"] - male["AUC_consensus_nohla"]
+        delta_female = female["AUC_consensus_hla"] - female["AUC_consensus_nohla"]
+
+        # Error estándar total
+        se_total = (
+            male["SE_consensus_hla"]**2 +
+            male["SE_consensus_nohla"]**2 +
+            female["SE_consensus_hla"]**2 +
+            female["SE_consensus_nohla"]**2
+        ) ** 0.5
+
+        z = (delta_male - delta_female) / se_total
+        p_value = 2 * norm.sf(abs(z))
+
+        results.append({
+            "name": disease,
+            "age": age_group,
+            "delta_auc_hla_male": delta_male,
+            "delta_auc_hla_female": delta_female,
+            "diff_of_deltas": delta_male - delta_female,
+            "pvalue_interaction": p_value
+        })
+
+    return pd.DataFrame(results).sort_values("pvalue_interaction").head(20)
+
+
+
+
 
 @st.cache_data
 def load_runs(experiment_ids: str, val_loss_threshold: float = 1.0):
@@ -369,7 +479,7 @@ if st.session_state.runs_loaded:
             runs_nohla_df = mlflow.search_runs(experiment_ids=[EXP_NOHLA])
             
             unpooled_auc_mergeds, both_auc_mergeds = [], []
-
+            
             for fold_i in range(1, 6):
                 fold_i = str(fold_i)
                 run_nohla_id = runs_nohla_df.query("`params.fold` == @fold_i").run_id.iloc[0]
@@ -416,11 +526,29 @@ if st.session_state.runs_loaded:
 
         unpooled_auc_merged = unpooled_auc_mergeds.query("fold == @fold_index")
 
+        print(unpooled_auc_mergeds.columns)
+        import numpy as np
+        kk = compute_consensus_auc_by_sex(unpooled_auc_mergeds)
+        print(kk.head())
+        kk = kk.assign(zscore=lambda df: (df.AUC_consensus_hla-df.AUC_consensus_nohla)/np.sqrt(df.SE_consensus_hla**2+df.SE_consensus_nohla**2))
+        kk = kk.sort_values('zscore', ascending=False)
+        st.dataframe(kk)
+        
+        # print(kk.loc[((kk.AUC_consensus_hla-kk.AUC_consensus_nohla)/np.sqrt(kk.SE_consensus_hla**2+kk.SE_consensus_nohla**2)).sort_values().index])
+        print(kk)        
+        
+        kk2 = test_interaction_by_age(kk)
+        # print(kk2)
+
         col1, col2 = st.columns([2, 1])
         
         if diseases == []:
             with col1:
+                st.header("ΔAUC (HLA - noHLA)")
                 st.dataframe(unpooled_auc_merged)
+
+                st.header("ΔAUC(male) vs. ΔAUC(female)")
+                st.dataframe(kk2)
             with col2:
                 average = st.checkbox("Average over sex and age bins", key=2)
                 if average:
@@ -492,4 +620,6 @@ if st.session_state.runs_loaded:
                 ax2.set_title(f'{diseases[0]}')
 
                 ax2.axhline(0, color='gray', linestyle='--', linewidth=1)
-                st.pyplot(fig2)              
+                st.pyplot(fig2)
+
+            

@@ -2,9 +2,9 @@
 import time
 
 out_dir = 'Delphi'
-eval_interval = 250 # keep frequent because we'll overfit
-eval_iters = 25
-log_interval = 25 # don't print too too often
+eval_interval = 1000 # keep frequent because we'll overfit
+eval_iters = 200
+log_interval = 100 # don't print too too often
 seed = 42
 
 # we expect to overfit on this small dataset, so only save when val improves

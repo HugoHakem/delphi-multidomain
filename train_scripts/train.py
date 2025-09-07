@@ -26,18 +26,18 @@ wandb_project = 'delphi'
 wandb_run_name = 'run' + str(time.time())
 
 # data
-dataset = 'ukb_data'
+dataset = 'ukb_simulated_data'
 gradient_accumulation_steps = 1  # used to simulate larger batch sizes
 batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 24
 
 # model
-n_layer = 6
-n_head = 6
-n_embd = 96
+n_layer = 12
+n_head = 10
+n_embd = 120
 dropout = 0.2  # for pretraining 0 is good, for finetuning try 0.1+
 bias = False  # do we use bias inside LayerNorm and Linear layers?
-vocab_size = 256
+vocab_size = 1270
 
 # adamw optimizer
 learning_rate = 6e-4  # max learning rate
@@ -54,7 +54,7 @@ lr_decay_iters = 10000  # should be ~= max_iters per Chinchilla
 min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # system
-device = 'cpu'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda:0'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'float32'  # 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False  # use PyTorch 2.0 to compile the model to be faster
 
@@ -66,6 +66,12 @@ ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
 
+print(f"found vocab_size = {vocab_size}")
+
+# model init
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                  bias=bias, vocab_size=vocab_size, dropout=dropout, token_dropout=token_dropout, t_min=t_min,
+                  mask_ties=mask_ties, ignore_tokens=ignore_tokens)  # start with model_args from command line
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -101,13 +107,6 @@ if data_fraction < 1.0:
 iter_num = 0
 best_val_loss = 1e9
 
-
-print(f"found vocab_size = {vocab_size}")
-
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=vocab_size, dropout=dropout, token_dropout=token_dropout, t_min=t_min,
-                  mask_ties=mask_ties, ignore_tokens=ignore_tokens)  # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -209,6 +208,7 @@ t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 
 val_loss = None
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -269,7 +269,6 @@ while True:
             logits, loss, att = model(X, A, Y, B)
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         ix = torch.randint(len(train_p2i), (batch_size,))
-        # print(ix)
         X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
                                padding='random', lifestyle_augmentations=True, select='left',
                                no_event_token_rate=no_event_token_rate, cut_batch=True)

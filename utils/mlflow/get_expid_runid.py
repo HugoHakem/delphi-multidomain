@@ -6,7 +6,7 @@ import re
 METRIC = "best_val_loss"
 METRIC = "val_loss"
 
-THRESHOLD = 11.93
+THRESHOLD = 12.00
 OUTPUT_FILE = "auc_runs.txt"
 
 client = mlflow.tracking.MlflowClient()
@@ -19,6 +19,8 @@ for exp in experiments:
     for run in runs:
         run_id = run.info.run_id
         metrics = run.data.metrics
+        params = run.data.params
+        val_filename = params.get("val_filename", None)
         if METRIC in metrics:
             val = metrics[METRIC]
             if val < THRESHOLD:
@@ -46,7 +48,7 @@ for exp in experiments:
                     continue
                 best_step = max(candidates)
                 best_ckpt_file = ckpt_files[candidates.index(best_step)]
-                lines.append(f"{exp.experiment_id} {run_id} {val:.6f} {best_step} {best_ckpt_file}")
+                lines.append(f"{exp.experiment_id} {exp.name} {run_id} {val:.6f} {best_step} {best_ckpt_file} {val_filename}")
 
 with open(OUTPUT_FILE, "w") as f:
     f.write("\n".join(lines))

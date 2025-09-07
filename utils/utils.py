@@ -4,25 +4,6 @@ import torch
 import re
 import os
 
-# def get_p2i(data):
-#     """
-#     Get the patient to index mapping.
-#     """
-
-#     px = data[:, 0].astype('int')
-#     p2i = []
-#     j = 0
-#     q = px[0]
-#     for i, p in enumerate(px):
-#         if p != q:
-#             p2i.append([j, i - j])
-#             q = p
-#             j = i
-#         if i == len(px) - 1:
-#             # add last participant
-#             p2i.append([j, i - j + 1])
-#     return np.array(p2i)
-
 
 def get_p2i(data):
     patient_ids = data[:, 0].astype(int)
@@ -58,7 +39,8 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     """
 
     MASKING_TOKEN, MASKING_AGE = -1, -10000
-    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
+    # LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
+    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3, 11
 
     # Define the columns of the data array    
     SUBJECT_ID_COLUMN = 0
@@ -227,6 +209,9 @@ class DelphiData:
         
         self.train_p2i = get_p2i(self.train_data)
         self.val_p2i = get_p2i(self.val_data)
+        
+        self.all_data = np.concatenate([self.train_data, self.val_data])
+        self.all_p2i  = get_p2i(self.all_data) 
 
     def get_id_to_token(self):
         self.id_to_token = self.labels.to_dict()[0]

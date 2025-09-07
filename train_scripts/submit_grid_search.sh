@@ -11,7 +11,8 @@ for seed in "${seeds[@]}"; do
     for layer in "${n_layer_vals[@]}"; do
       for batch in "${batch_size_vals[@]}"; do
         for lr in "${learning_rate_vals[@]}"; do
-            sbatch train.slurm --n_embd=$embd --n_layer=$layer --batch_size=$batch --learning_rate=$lr --seed=$seed --min_lr=$(awk "BEGIN {print $lr / 10}")
+            MIN_LR=$(awk "BEGIN {print $lr / 10}")
+            sbatch train.slurm --n_embd=$embd --n_layer=$layer --batch_size=$batch --learning_rate=$lr --seed=$seed --min_lr=${MIN_LR}
         done
       done
     done

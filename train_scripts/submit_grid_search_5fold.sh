@@ -13,7 +13,15 @@ for seed in "${seeds[@]}"; do
       for batch in "${batch_size_vals[@]}"; do
         for lr in "${learning_rate_vals[@]}"; do
           for val_fold in "${val_folds[@]}"; do
-            sbatch train.slurm --val_fold $val_fold --n_embd=$embd --n_layer=$layer --batch_size=$batch --learning_rate=$lr --seed=$seed --min_lr=$(awk "BEGIN {print $lr / 10}")
+            MIN_LR=$(awk "BEGIN {print $lr / 10}")
+            sbatch train.slurm \
+              --val_fold $val_fold \
+              --n_embd=$embd \
+              --n_layer=$layer \
+              --batch_size=$batch \
+              --learning_rate=$lr \
+              --seed=$seed \
+              --min_lr=${MIN_LR}
             sleep 5
           done
         done
