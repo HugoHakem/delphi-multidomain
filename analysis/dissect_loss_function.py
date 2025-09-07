@@ -12,7 +12,7 @@ import re
 import torch
 
 import importlib
-import model
+import model.model as model
 model = importlib.reload(model)
 Delphi = model.Delphi
 
@@ -113,7 +113,6 @@ def get_best_ckpt(runinfo):
     best_ckpt_path = ckpt_dir / sorted(os.listdir(ckpt_dir), key=get_epoch_from_ckpt)[-1]
     return best_ckpt_path
 
-'''
 # %%
 runs_df = mlflow.search_runs(experiment_ids = [exp.experiment_id for exp in mlflow.search_experiments()])
 runs_df = runs_df[runs_df['fold'].notnull()]
@@ -132,7 +131,7 @@ runs_df = runs_df[runs_df['experiment_id'].isin(exp_ids)]
 display(runs_df)
 
 runinfo = runs_df.iloc[0]
-'''
+
 # %%
 run = mlflow.get_run("6b47df60154d4f67a70a7f0c94f712b6")
 runinfo = pd.Series({"run_id": run.info.run_id, "status": run.info.status, "artifact_uri": run.info.artifact_uri, **run.data.params, **run.data.metrics, **run.data.tags})
