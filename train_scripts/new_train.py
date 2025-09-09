@@ -1,15 +1,22 @@
 # %%
 import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
+os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
+
 import time
 import math
 import pickle as pkl
 from contextlib import nullcontext
+# import ipdb
 
 import numpy as np
 import pandas as pd
 import torch
 
 from ast import literal_eval
+
+from torch.utils.data import Dataset
 
 from pprint import pprint
 from collections import defaultdict
@@ -23,34 +30,39 @@ from typing import Iterator, Optional
 
 from omegaconf import OmegaConf
 
-# %%
+import yaml
+import warnings
+from typing import List, Dict, Set
+from delphi.data.ukb import UKBDataConfig, UKBDataset
 
-# from delphi.data.multimodal import (
-#     UKBDataConfig,
-#     load_sequences,
-# )
+# %%
+from delphi.data.multimodal import (
+    UKBDataConfig,
+    load_sequences,
+)
 
 # from model import Delphi, DelphiConfig
-from utils import get_p2i, get_batch
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import hla_genes
-from hla_genes import get_hla_protein_sequences
+from utils.utils import get_p2i, get_batch
 
-from delphi.data.utils import train_iter
-from delphi.env import DELPHI_CKPT_DIR
+# import hla_genes
+# from hla_genes import get_hla_protein_sequences
+
+# from delphi.data.utils import train_iter
+# from delphi.env import DELPHI_CKPT_DIR
 from delphi.log import TrainLogConfig, TrainLogger
 from delphi.model.config import (
     DelphiConfig,
-    parse_token_list,
-    validate_model_config,
-    validate_model_config_for_finetuning,
+    # parse_token_list,
+    # validate_model_config,
+    # validate_model_config_for_finetuning,
 )
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
 
 
 # %%
-
 @dataclass
 class TrainBaseConfig:
     ckpt_dir: str = "."
@@ -83,6 +95,7 @@ class TrainBaseConfig:
 
 @dataclass
 class TrainConfig(TrainBaseConfig):
+
     # finetune
     resume_from: Optional[str] = None
 
@@ -92,6 +105,7 @@ class TrainConfig(TrainBaseConfig):
     train_data: UKBDataConfig = field(default_factory=UKBDataConfig)
     infer_train_biomarkers: bool = True
     val_data: UKBDataConfig = field(default_factory=UKBDataConfig)
+
     infer_val_biomarkers: bool = True
     infer_val_expansion_packs: bool = True
     infer_val_transforms: bool = True
@@ -99,10 +113,6 @@ class TrainConfig(TrainBaseConfig):
 
     model: DelphiConfig = field(default_factory=DelphiConfig)
     ignore_expansion_tokens: bool = True
-
-# %%
-import torch
-from torch.utils.data import Dataset
 
 # %%
 class DelphiTokenizer():
@@ -116,13 +126,141 @@ class DelphiTokenizer():
     def ids_to_tokens(self, ids):
         return [self.id_to_token[int(id_)] for id_ in ids]
 
+# %%
+
+
+class TokenDomainManager:
+    def __init__(self):
+        # Dictionary of domains -> per-domain vocab {token: local_id}
+        self.domains: Dict[str, Dict[str, int]] = {}
+
+    def add_tokens(self, domain: str, tokens: List[str]):
+        """
+        Add new tokens to a given domain.
+        If the domain does not exist, create it.
+        Tokens already present will be ignored.
+        """
+        if domain not in self.domains:
+            self.domains[domain] = {}
+        d = self.domains[domain]
+        for tok in tokens:
+            if tok not in d:
+                d[tok] = len(d)
+
+    def flatten(self, domains: List[str] = None) -> Dict[str, int]:
+        """
+        Return a flat vocabulary combining one or multiple domains.
+        Token IDs are assigned contiguously, domain by domain.
+        Keys in the flat vocab are namespaced as "domain:token".
+        """
+        flat, offset = {}, 0
+        if domains is None:
+            domains = list(self.domains.keys())
+        for dom in domains:
+            for tok, idx in self.domains[dom].items():
+                flat[f"{dom}:{tok}"] = offset + idx
+            offset += len(self.domains[dom])
+        return flat
+
+    def shared_tokens(self, domains: List[str]) -> Set[str]:
+        """
+        Return the set of tokens that are shared across all given domains.
+        Comparison is done on raw token strings (not prefixed).
+        """
+        sets = [set(self.domains[d].keys()) for d in domains]
+        return set.intersection(*sets)
+
+    def get_domain_tokens(self, domain: str) -> List[str]:
+        """Return the list of tokens in a given domain."""
+        return list(self.domains.get(domain, {}).keys())
 
 # %%
-class DelphiDataset(Dataset):
 
-    def __init__(self, data):
-        super().__init__()
-        self.data = data
+class TokenDomain:
+    def __init__(self, path: str):
+        """
+        Load a single domain: tokenizer.yaml + tokens.csv
+        """
+        self.path = path
+        self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))
+        self.tokens = self._load_tokens(os.path.join(path, "tokens.csv"))
+
+    def _load_tokenizer(self, path: str) -> Dict:
+        with open(path, "r") as f:
+            tok = yaml.safe_load(f)
+        return tok
+
+    def _load_tokens(self, path: str) -> pd.DataFrame:
+        if not os.path.exists(path):
+            return pd.DataFrame(columns=["subject_id", "token_id", "age"])
+        df = pd.read_csv(path)
+        # enforce schema
+        if "subject_id" not in df.columns or "token_id" not in df.columns:
+            raise ValueError(f"Invalid tokens file {path}, must contain subject_id and token_id")
+        if "age" not in df.columns:
+            df["age"] = None
+        return df
+
+
+class DelphiDataset:
+    def __init__(self, root: str, domains: List[str], fold: int = None, exclusions: List[str] = []):
+        """
+        Args:
+            root: base data directory
+            domains: list of domain names (e.g. ["diagnosis", "lifestyle", "sex", "death"])
+            fold: if specified, restrict subjects to that fold
+            exclusions: list of exclusion list filenames under exclusion_lists/
+        """
+        self.root = root
+        self.domains = {d: TokenDomain(os.path.join(root, "domains", d)) for d in domains}
+        self.subjects = pd.read_csv(os.path.join(root, "subjects.csv"))
+        
+        # apply exclusions
+        self.excluded_subjects = set()
+        for excl in exclusions:
+            excl_path = os.path.join(root, "exclusion_lists", excl)
+            if os.path.exists(excl_path):
+                ids = open(excl_path).read().strip().splitlines()
+                self.excluded_subjects |= set(map(str, ids))
+
+        if fold is not None:
+            fold_path = os.path.join(root, "folds", f"fold{fold}.txt")
+            with open(fold_path) as f:
+                fold_ids = set(f.read().strip().splitlines())
+            self.subjects = self.subjects[self.subjects["subject_id"].astype(str).isin(fold_ids)]
+
+        # apply exclusion lists
+        self.subjects = self.subjects[~self.subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
+
+    def get_subject_events(self, subject_id: str) -> Dict[str, pd.DataFrame]:
+        """
+        Return all events for a subject, per domain.
+        """
+        subject_events = {}
+        for dname, domain in self.domains.items():
+            ev = domain.events
+            ev_sub = ev[ev["subject_id"].astype(str) == str(subject_id)]
+            subject_events[dname] = ev_sub
+        return subject_events
+
+    def iter_subjects(self):
+        """Iterate over subject IDs in dataset"""
+        for sid in self.subjects["subject_id"].astype(str).tolist():
+            yield sid, self.get_subject_events(sid)
+
+    def validate(self):
+        """Check domain-specific constraints, e.g. age presence"""
+        for dname, domain in self.domains.items():
+            if dname == "diagnosis":
+                missing_age = domain.events["age"].isna().sum()
+                if missing_age > 0:
+                    raise ValueError(f"{dname} domain has {missing_age} missing ages")
+            if dname == "genetics":
+                with_age = domain.events["age"].notna().sum()
+                if with_age > 0:
+                    warnings.warn(f"{dname} domain has {with_age} rows with age provided (should not).")
+
+
 
     @staticmethod
     def get_p2i(data):
@@ -130,11 +268,27 @@ class DelphiDataset(Dataset):
         _, idx_start, counts = np.unique(patient_ids, return_index=True, return_counts=True)
         return np.stack([idx_start, counts], axis=1)
 
-    def len(self):
+    def __len__(self):
         return len(self.data)
 
-    def getitem(self, index):
+    def __getitem__(self, index):
         return self.data[index]
+
+
+class DelphiDataloader():
+    
+    def __init__(self, dataset, batch_size, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.indices = np.arange(len(dataset))
+
+    def __iter__(self):
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+        for start_idx in range(0, len(self.dataset), self.batch_size):
+            batch_indices = self.indices[start_idx:start_idx + self.batch_size]
+            yield [self.dataset[i] for i in batch_indices]
 
 
 def get_batch(
@@ -143,30 +297,6 @@ def get_batch(
     block_size=48, device='cpu', lifestyle_augmentations=False, 
     no_event_token_rate=5, cut_batch=False, return_subject_ids=False
     ):
-    
-    """
-    Get a batch of data from the dataset. This function packs sequences in a batch and also
-    inserts "no event" tokens randomly with the average rate of one every five years.
-
-    Args:
-        ix: list of indices to get data from
-        data: numpy array of the dataset
-        p2i: numpy array of the patient to index mapping
-        select: 'center', 'right', 'smart_random', 'smart_right'
-        index: 'patient', 'random'
-        padding: 'regular', 'random'
-        block_size: size of the block to get
-        device: 'cpu' or 'cuda'
-        lifestyle_augmentations: whether to perform aurmentations of lifestyle token times
-        no_event_token_rate: average rate of "no event" tokens in years
-        cut_batch: whether to cut the batch to the smallest size possible
-
-    Returns:
-        x: input tokens
-        a: input ages
-        y: target tokens
-        b: target ages
-    """
     
     MASKING_TOKEN, MASKING_AGE = -1, -10000    
     
@@ -302,9 +432,7 @@ class Trainer():
 
 
     def train_step(self):
-
-
-        
+        pass
 
 
     def evaluate(self):
@@ -332,5 +460,3 @@ class Trainer():
         model.train()   
         return out
 
-
-    def 

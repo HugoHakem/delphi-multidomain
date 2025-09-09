@@ -13,7 +13,7 @@ from ast import literal_eval
 from pprint import pprint
 from collections import defaultdict
 
-from model import Delphi, DelphiConfig
+from delphi.transforms import Delphi, DelphiConfig
 from utils import get_p2i, get_batch
 
 import hla_genes
