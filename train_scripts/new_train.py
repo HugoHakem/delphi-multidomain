@@ -16,7 +16,7 @@ import torch
 
 from ast import literal_eval
 
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, random_split
 
 from pprint import pprint
 from collections import defaultdict
@@ -35,13 +35,28 @@ import warnings
 from typing import List, Dict, Set
 from delphi.data.ukb import UKBDataConfig, UKBDataset
 
-# %%
+from data.dataset import DelphiDataset, DelphiDataloader
+
+from delphi.model.transformer import Delphi
+
+from delphi.model.components import (
+    EmbedConfig,
+    DelphiConfig,
+    DomainEmbedding,
+    DelphiEmbedding,
+    CrossEntropyHead,
+    CompetingExpHead,
+    causal_attention_mask,
+    target_mask,
+    ties_adjusted_delta_t,
+)
+
 from delphi.data.multimodal import (
     UKBDataConfig,
     load_sequences,
 )
 
-# from model import Delphi, DelphiConfig
+from sklearn.model_selection import train_test_split
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.utils import get_p2i, get_batch
@@ -61,7 +76,7 @@ from delphi.model.config import (
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
 
-
+print(EmbedConfig)
 # %%
 @dataclass
 class TrainBaseConfig:
@@ -73,8 +88,9 @@ class TrainBaseConfig:
 
     seed: int = 42
     gradient_accumulation_steps: int = 1  # used to simulate larger batch sizes
-    batch_size: int = 128
+
     # if gradient_accumulation_steps > 1, this is the micro-batch size
+    batch_size: int = 128
 
     # system
     device: str = "cpu"
@@ -87,9 +103,7 @@ class TrainBaseConfig:
     val_data: dict = field(default_factory=dict)
 
     model: dict = field(default_factory=dict)
-
     optim: OptimConfig = field(default_factory=OptimConfig)
-
     log: TrainLogConfig = field(default_factory=TrainLogConfig)
 
 
@@ -126,8 +140,6 @@ class DelphiTokenizer():
     def ids_to_tokens(self, ids):
         return [self.id_to_token[int(id_)] for id_ in ids]
 
-# %%
-
 
 class TokenDomainManager:
     def __init__(self):
@@ -147,6 +159,7 @@ class TokenDomainManager:
             if tok not in d:
                 d[tok] = len(d)
 
+
     def flatten(self, domains: List[str] = None) -> Dict[str, int]:
         """
         Return a flat vocabulary combining one or multiple domains.
@@ -162,6 +175,7 @@ class TokenDomainManager:
             offset += len(self.domains[dom])
         return flat
 
+
     def shared_tokens(self, domains: List[str]) -> Set[str]:
         """
         Return the set of tokens that are shared across all given domains.
@@ -170,50 +184,25 @@ class TokenDomainManager:
         sets = [set(self.domains[d].keys()) for d in domains]
         return set.intersection(*sets)
 
+
     def get_domain_tokens(self, domain: str) -> List[str]:
         """Return the list of tokens in a given domain."""
         return list(self.domains.get(domain, {}).keys())
 
-# %%
-
-class TokenDomain:
-    def __init__(self, path: str):
-        """
-        Load a single domain: tokenizer.yaml + tokens.csv
-        """
-        self.path = path
-        self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))
-        self.tokens = self._load_tokens(os.path.join(path, "tokens.csv"))
-
-    def _load_tokenizer(self, path: str) -> Dict:
-        with open(path, "r") as f:
-            tok = yaml.safe_load(f)
-        return tok
-
-    def _load_tokens(self, path: str) -> pd.DataFrame:
-        if not os.path.exists(path):
-            return pd.DataFrame(columns=["subject_id", "token_id", "age"])
-        df = pd.read_csv(path)
-        # enforce schema
-        if "subject_id" not in df.columns or "token_id" not in df.columns:
-            raise ValueError(f"Invalid tokens file {path}, must contain subject_id and token_id")
-        if "age" not in df.columns:
-            df["age"] = None
-        return df
-
-
+'''
 class DelphiDataset:
-    def __init__(self, root: str, domains: List[str], fold: int = None, exclusions: List[str] = []):
+    def __init__(self, root: str, domains: List[str], subjects: str = None, exclusions: List[str] = []):
         """
         Args:
             root: base data directory
             domains: list of domain names (e.g. ["diagnosis", "lifestyle", "sex", "death"])
-            fold: if specified, restrict subjects to that fold
+            subjects: if specified, restrict subjects
             exclusions: list of exclusion list filenames under exclusion_lists/
         """
         self.root = root
         self.domains = {d: TokenDomain(os.path.join(root, "domains", d)) for d in domains}
-        self.subjects = pd.read_csv(os.path.join(root, "subjects.csv"))
+              
+        self.subjects = [ pd.read_csv(os.path.join(root, subj_file)) for subj_file in subjects ] 
         
         # apply exclusions
         self.excluded_subjects = set()
@@ -232,6 +221,7 @@ class DelphiDataset:
         # apply exclusion lists
         self.subjects = self.subjects[~self.subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
 
+
     def get_subject_events(self, subject_id: str) -> Dict[str, pd.DataFrame]:
         """
         Return all events for a subject, per domain.
@@ -242,6 +232,7 @@ class DelphiDataset:
             ev_sub = ev[ev["subject_id"].astype(str) == str(subject_id)]
             subject_events[dname] = ev_sub
         return subject_events
+
 
     def iter_subjects(self):
         """Iterate over subject IDs in dataset"""
@@ -274,6 +265,7 @@ class DelphiDataset:
     def __getitem__(self, index):
         return self.data[index]
 
+'''
 
 class DelphiDataloader():
     
@@ -418,22 +410,20 @@ class Trainer():
     def __init__(self, model, training_loader, valid_loader, test_loader, optimizer):
 
         self.model           = model
-        
         self.training_loader = training_loader
         self.valid_loader    = valid_loader
         self.test_loader     = test_loader
-
         self.optimizer   = optimizer
 
 
     def train(self):
-        while True:
-            self.train_step()
 
+        for batch in self.training_loader:
+            X, A, Y, B = batch
+            logits, _, _, _ = model(X, A, Y, B, validation_loss_mode=True)
 
     def train_step(self):
         pass
-
 
     def evaluate(self):
 
@@ -460,3 +450,74 @@ class Trainer():
         model.train()   
         return out
 
+
+
+# %%
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from delphi.model.components import (
+    EmbedConfig,
+    DelphiConfig,
+    DomainEmbedding,
+    DelphiEmbedding,
+)
+
+root_path = "../data/transforms"
+domain_names = ["diseases", "lifestyle", "hla_alleles", 'sex', 'death']
+
+domains = {}
+for d in domain_names:
+    domains[d] = EmbedConfig(
+        projector="embed",
+        input_size=None,
+        path=os.path.join(root_path, d),
+    )
+
+cfg = DelphiConfig(    
+    # n_embd=n_embd,
+    token_dropout=0.1,
+    domains=domains,
+)
+
+model = DelphiEmbedding(cfg)
+
+# %%
+folds = [ f"subject_lists/fold{i}.csv" for i in range(1, 6) ]
+test_fold, dev_folds = [folds.pop(0)], folds
+
+dev_dataset = DelphiDataset(
+    root="../data/transforms",
+    domains=domains,
+    subjects=dev_folds,
+    exclusions=["subject_lists/genetic_white_ids.txt"]
+)
+
+test_dataset = DelphiDataset(
+    root="../data/transforms",
+    domains=domains,
+    subjects=test_fold,
+    exclusions=["subject_lists/genetic_white_ids.txt"]
+)
+
+n_valid = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
+
+train_dataset, valid_dataset = random_split(
+    dev_dataset, 
+    [ n_train, n_valid ],
+    generator=torch.Generator().manual_seed(42)
+)
+
+dataloaders = [ DelphiDataloader(d, batch_size=4) for d in [train_dataset, valid_dataset, test_dataset]]
+
+config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domains)
+model = Delphi(config)
+
+optimizer, scheduler = configure_optimizers(
+   model=model, cfg=OptimConfig(), device_type="cpu"
+)
+
+trainer = Trainer(model, *dataloaders, optimizer=optimizer)
+trainer.train()
+
+# %%
