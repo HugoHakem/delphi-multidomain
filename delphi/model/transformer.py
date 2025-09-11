@@ -134,6 +134,7 @@ def initialize_weights(model: torch.nn.Module, config: GPT2Config):
 
 
 class Delphi(torch.nn.Module):
+    
     model_type = "delphi-m4"
 
     def __init__(self, config: DelphiConfig):
@@ -141,6 +142,7 @@ class Delphi(torch.nn.Module):
         self.config = config
         self.build_model(config)
         initialize_weights(self, config=config)
+
 
     def build_model(self, config: DelphiConfig):
 
@@ -153,6 +155,7 @@ class Delphi(torch.nn.Module):
             )
         )
         assert config.vocab_size is not None
+        
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.embed.token_embedding.weight = self.lm_head.weight
 
@@ -163,18 +166,19 @@ class Delphi(torch.nn.Module):
             pi_head=config.zero_inflate_projector,
         )
 
+
     def forward(
         self,
         idx: torch.Tensor,
         age: torch.Tensor,
-        modality: torch.Tensor,
-        biomarker: Optional[dict[str, torch.Tensor]] = None,
+        # modality: torch.Tensor,
+        # biomarker: Optional[dict[str, torch.Tensor]] = None,
         targets: Optional[torch.Tensor] = None,
         targets_age: Optional[torch.Tensor] = None,
         validation_loss_mode: bool = False,
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], torch.Tensor]:
 
-        x = self.transformer.embed(x0=idx, t0=age, M=modality, biomarker_x=biomarker)
+        x = self.transformer.embed(x=idx, t=age) #, M=modality, biomarker_x=biomarker)
         x = self.transformer.drop(x)
 
         attn_mask = causal_attention_mask(
@@ -212,8 +216,9 @@ class Delphi(torch.nn.Module):
             loss_dt = torch.mean(loss_dt[is_valid_target])
 
             loss = {
-                "loss_ce": loss_ce * self.config.ce_beta,
-                "loss_dt": loss_dt * self.config.dt_beta,
+                "loss_ce": loss_ce, # * self.config.ce_beta,
+                "loss_dt": loss_dt, # * self.config.dt_beta,
+                "loss": loss_ce * self.config.ce_beta + loss_dt * self.config.dt_beta,
             }
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position

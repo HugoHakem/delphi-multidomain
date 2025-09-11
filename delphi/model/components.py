@@ -5,9 +5,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from delphi.model.config import BiomarkerEmbedConfig, DelphiConfig
-from delphi.multimodal import Modality, module_name
+# from delphi.model.config import EmbedConfig, DelphiConfig
 
+from delphi.multimodal import Modality, module_name
+from dataclasses import dataclass, field
+from typing import Optional
+import yaml
+
+import logging
+logger = logging.getLogger(__name__)
+
+# ——————————————————————————————————————————————————————————————————————————————————————————————————
 
 class AgeEncoding(nn.Module):
 
@@ -84,108 +92,233 @@ class PiecewiseAgeEncoding(nn.Module):
 
         return y
 
+# ———————————————————— CONFIG ————————————————————————————————————————————————————————————————
 
-class BiomarkerEmbedding(nn.Module):
+@dataclass
+class EmbedConfig:
+    projector:  str           = "linear"  # "linear", "mlp", or "embed"
+    n_layers:   Optional[int] = None
+    n_hidden:   Optional[int] = None
+    input_size: Optional[int] = None
+    pretrained_path: Optional[str] = None  # path to .pt/.npy/.pkl with lookup table
+    freeze: bool = True                    # if previous lookup table is to be left fixed
+    path: Optional[str] = None 
 
-    def __init__(self, config: BiomarkerEmbedConfig, n_embed: int) -> None:
+
+
+@dataclass
+class DelphiConfig:
+    vocab_size: Optional[int] = None
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 120
+    resid_pdrop: float = 0.1
+    embd_pdrop: float = 0.1
+    attn_pdrop: float = 0.1
+    bias: bool = True
+    block_size: int = 64
+    dropout: float = 0.1
+    token_dropout: float = 0.1
+    mask_ties: bool = False
+    ignore_tokens: list = field(default_factory=lambda: [0])
+    domains: dict[str, EmbedConfig] = field(default_factory=dict)
+    modality_emb: bool = False
+    ce_beta: float = 1.0
+    dt_beta: float = 1.0
+    zero_inflate: bool = False
+    zero_inflate_projector: str = "linear"
+
+
+# ———————————————————— VALIDATE CONFIGS ——————————————————————————————————————————————————————————
+
+def validate_model_config(config: DelphiConfig):
+    assert config.mask_ties != config.zero_inflate, "mask_ties and zero_inflate cannot be both True or both False"
+
+
+def validate_model_config_for_finetuning(
+    finetune_config: DelphiConfig, pretrain_config: DelphiConfig
+) -> None:
+
+    assert (
+        finetune_config.vocab_size == pretrain_config.vocab_size
+        and finetune_config.n_layer == pretrain_config.n_layer
+        and finetune_config.n_head == pretrain_config.n_head
+        and finetune_config.n_embd == pretrain_config.n_embd
+        and finetune_config.bias == pretrain_config.bias
+    ), "model dimensions must match between finetune and pretrain configs"
+
+    finetune_biomarkers = set(finetune_config.biomarkers.keys())
+    pretrain_biomarkers = set(pretrain_config.biomarkers.keys())
+    assert pretrain_biomarkers.issubset(
+        finetune_biomarkers
+    ), "finetune config must have all biomarkers from pretrain config"
+
+    intersect_biomarkers = finetune_biomarkers.intersection(pretrain_biomarkers)
+    for biomarker in intersect_biomarkers:
+        finetune_bm = finetune_config.biomarkers[biomarker]
+        pretrain_bm = pretrain_config.biomarkers[biomarker]
+
+        assert (
+            finetune_bm.projector == pretrain_bm.projector
+            and finetune_bm.n_layers == pretrain_bm.n_layers
+            and finetune_bm.n_hidden == pretrain_bm.n_hidden
+            and finetune_bm.input_size == pretrain_bm.input_size
+        ), f"biomarker {biomarker} embed configs must match between finetune and pretrain configs"
+
+
+def parse_token_list(token_list: list[str]) -> list:
+    if not token_list:
+        return []
+
+    parsed = []
+    for token in token_list:
+        if token.endswith(".yaml") or token.endswith(".yml"):
+            with open(token, "r") as f:
+                tokens = yaml.safe_load(f)
+            if not isinstance(tokens, list):
+                raise ValueError(f"Expected a list of tokens in {token}")
+            parsed.extend(tokens)
+        else:
+            parsed.append(token)
+
+    return parsed
+
+# ———————————————————— EMBEDDINGS ————————————————————————————————————————————————————————————————
+
+class DomainEmbedding(nn.Module):
+
+    def __init__(self, config: EmbedConfig, n_embed: int) -> None:
 
         super().__init__()
         self.config = config
-        assert config.input_size is not None, "input_size must be specified"
-        if config.projector == "linear":
+        # assert config.input_size is not None, "input_size must be specified"
+
+        if config.input_size is None and config.projector.lower() != "pretrained":
+            self.config.input_size = len(yaml.load(open(config.path + "/tokenizer.yaml"), Loader=yaml.FullLoader))            
+
+        elif config.projector.lower() == "pretrained":
+            weights = torch.load(config.pretrained_path)  # Tensor [vocab_size, d_ext]
+            self.config.input_size, d_ext = weights.shape
+
+        if config.projector.lower() == "linear":
             self.projector = nn.Linear(config.input_size, n_embed, bias=False)
-        elif config.projector == "mlp":
+
+        elif config.projector.lower() == "mlp":
+            
+            assert config.n_layers is not None, "n_layers must be specified for mlp projector"
+            assert config.n_hidden is not None, "n_hidden must be specified for mlp projector"
+
+            I, L, H, E = config.input_size, config.n_layers, config.n_hidden, n_embed
+            
+            sizes = [I] + [H] * (L-1) + [E]
+            isizes, osizes = sizes[:-1], sizes[1:]
+
+            # build MLP
             layers = []
-            assert (
-                config.n_layers is not None
-            ), "n_layers must be specified for mlp projector"
-            assert (
-                config.n_hidden is not None
-            ), "n_hidden must be specified for mlp projector"
-            for i in range(config.n_layers):
-                in_size = config.input_size if i == 0 else config.n_hidden
-                out_size = n_embed if i == config.n_layers - 1 else config.n_hidden
-                layers.append(nn.Linear(in_size, out_size, bias=False))
-                if i < config.n_layers - 1:
+            for i in range(L):
+                linear_layer = nn.Linear(isizes[i], osizes[i], bias=False)
+                layers.append(linear_layer)
+                if i < L-1:
                     layers.append(nn.ReLU())
+            
             self.projector = nn.Sequential(*layers)
+
+        elif config.projector.lower() == "embed":
+            print(f"DomainEmbedding: Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
+            self.projector = nn.Embedding(self.config.input_size, n_embed, padding_idx=0)
+
+        elif config.projector.lower() == "pretrained":
+            weights = torch.load(config.pretrained_path)  # Tensor [vocab_size, d_ext]
+            vocab_size, d_ext = weights.shape
+            logger.info(f"Loading pretrained embedding: vocab_size={vocab_size}, d_ext={d_ext}")
+            self.embed = nn.Embedding(vocab_size, d_ext, padding_idx=0)
+            self.embed.weight.data.copy_(weights)
+            self.embed.weight.requires_grad = not config.freeze
+
+            # To project onto Delphi embedding space
+            self.projector = nn.Linear(d_ext, n_embed, bias=False)
+
         else:
             raise ValueError(f"unknown projector type: {config.projector}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.config.projector == "embed":
-            x = x[x != 0]  # remove padding
-            return self.projector(x)
+        logger.debug(f"DomainEmbedding.forward | projector={self.config.projector} | input_shape={tuple(x.shape)}")
 
-        return self.projector(x)
+        if self.config.projector.lower() == "pretrained":
+            x = self.embed(x)
+            logger.debug(f"After pretrained lookup: {tuple(x.shape)}")
+            out = self.projector(x)
+            logger.debug(f"After projection: {tuple(out.shape)}")
+            return out
+
+        out = self.projector(x)
+        logger.debug(f"After projector: {tuple(out.shape)}")
+        return out
 
 
 class DelphiEmbedding(nn.Module):
 
     def __init__(self, config: DelphiConfig) -> None:
         super().__init__()
+        
         self.config = config
-        assert config.vocab_size is not None
-        self.token_embedding = nn.Embedding(
-            config.vocab_size, config.n_embd, padding_idx=0
-        )
+        # assert config.vocab_size is not None
+
+        # self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=0)
         self.age_encoding = AgeEncoding(n_embd=config.n_embd)
         self.token_drop = nn.Dropout(config.token_dropout)
 
-        self.biomarker_embed = nn.ModuleDict()
-        biomarker_modalities = []
-        for biomarker, biomarker_cfg in config.biomarkers.items():
-            bm_key = module_name(Modality[biomarker.upper()])
-            self.biomarker_embed[bm_key] = BiomarkerEmbedding(
-                config=biomarker_cfg, n_embed=config.n_embd
-            )
-            biomarker_modalities.append(Modality[biomarker.upper()])
+        self.domain_embed = nn.ModuleDict()
+        for domain_name, domain_cfg in config.domains.items():
+            self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, n_embed=config.n_embd)
 
-        if config.modality_emb:
-            max_modality_idx = (
-                max([modality.value for modality in biomarker_modalities])
-                if len(biomarker_modalities) > 0
-                else 1
-            )
-            self.mod_embedding = nn.Embedding(
-                max_modality_idx + 1, config.n_embd, padding_idx=0
-            )
+        # domain_modalities = []
+        # for domain_name, domain_cfg in config.domains.items():
+            # domain_key = module_name(Modality[domain_name.upper()])
+            # self.domain_embed[domain_key] = DomainEmbedding(config=domain_cfg, n_embed=config.n_embd)
+            # domain_modalities.append(Modality[domain_name.upper()])
 
-    def forward(
-        self,
-        x0: torch.Tensor,
-        t0: torch.Tensor,
-        M: torch.Tensor,
-        biomarker_x: dict[Modality, torch.Tensor] = {},
-    ) -> torch.Tensor:
+        # if config.modality_emb:
+        #     max_modality_idx = (
+        #         max([modality.value for modality in domain_modalities])
+        #         if len(domain_modalities) > 0
+        #         else 1
+        #     )
+        #     self.mod_embedding = nn.Embedding(max_modality_idx + 1, config.n_embd, padding_idx=0)
 
-        token_emb = self.token_embedding(x0)
 
-        token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
-        age_emb = self.age_encoding(t0.unsqueeze(-1))
+    def forward(self, x: dict[str, torch.Tensor], t: dict[str, torch.Tensor]) -> torch.Tensor: # , M: torch.Tensor, biomarker_x: dict[Modality, torch.Tensor] = {},) -> torch.Tensor:
 
-        for modality in biomarker_x.keys():
-            m_pos = torch.nonzero(M == modality.value)  # N * 2
-            if m_pos.size == 0:
-                continue
-            m_emb = self.biomarker_embed[module_name(modality)](
-                biomarker_x[modality]
-            )  # N * H
-            assert m_emb.shape[0] == m_pos.shape[0]
+        for domain_name in self.domain_embed:
+            token_emb = self.domain_embed[domain_name](x[domain_name])
+            age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
+            x[domain_name] = token_emb + age_emb
+        
+        return x            
+            
+        # token_emb = self.token_embedding(x)
+        # token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
+        # age_emb = self.age_encoding(t.unsqueeze(-1))
+        # x = token_emb + age_emb
 
-            token_emb[m_pos[:, 0], m_pos[:, 1], :] *= 0
-            token_emb[m_pos[:, 0], m_pos[:, 1], :] += m_emb
+        # for modality in biomarker_x.keys():
+        #     m_pos = torch.nonzero(M == modality.value)  # N * 2
+        #     if m_pos.size == 0: continue
+        #     # m_emb = self.domain_embed[module_name(modality)](biomarker_x[modality])  # N * H
+        #     assert m_emb.shape[0] == m_pos.shape[0]
+        #     token_emb[m_pos[:, 0], m_pos[:, 1], :] *= 0
+        #     token_emb[m_pos[:, 0], m_pos[:, 1], :] += m_emb
 
-        x = token_emb + age_emb
+        # if self.config.modality_emb:
+            # mod_emb = self.mod_embedding(M)
+            # x += mod_emb
 
-        if self.config.modality_emb:
-            mod_emb = self.mod_embedding(M)
-            x += mod_emb
+        # return x
 
-        return x
-
+# ———————————————————— HEADS ————————————————————————————————————————————————————————————————
 
 class CrossEntropyHead(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -199,11 +332,11 @@ class CrossEntropyHead(nn.Module):
 
 
 class CompetingExpHead(nn.Module):
-    def __init__(
-        self,
-        n_input: Optional[int] = None,
+
+    def __init__(self,
+        n_input:      Optional[int] = None,
         zero_inflate: bool = False,
-        pi_head: Optional[str] = None,
+        pi_head:      Optional[str] = None,
     ):
         super().__init__()
 
@@ -222,11 +355,7 @@ class CompetingExpHead(nn.Module):
             else:
                 raise ValueError(f"Unknown pi_head: {pi_head}")
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        delta_t: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
 
         lse = torch.logsumexp(logits, -1)
         lse = -torch.log(torch.exp(-lse) + 1.0)
@@ -248,6 +377,7 @@ class CompetingExpHead(nn.Module):
 
         return loss_dt
 
+# ———————————————————— MASKS ————————————————————————————————————————————————————————————————
 
 def causal_attention_mask(
     pad: torch.Tensor,
@@ -258,8 +388,9 @@ def causal_attention_mask(
 
     b, l = pad.shape
     device = pad.device
+    dd = {"device": device}
 
-    lower_tri_mask = torch.tril(torch.ones((l, l), device=device))
+    lower_tri_mask = torch.tril(torch.ones((l, l), **dd))
     lower_tri_mask = lower_tri_mask.view(1, l, l)
     pad_mask = pad.view(b, 1, l).to(torch.int)
     attn_mask = pad_mask * lower_tri_mask
@@ -271,47 +402,39 @@ def causal_attention_mask(
             attn_mask *= ties_mask
 
     attn_mask += (attn_mask.sum(-1, keepdim=True) == 0) * torch.diag(
-        torch.ones(l, device=device)
+        torch.ones(l, **dd)
     ) > 0
 
     return attn_mask.unsqueeze(1)
 
 
-def target_mask(
-    x1: torch.Tensor,
-    ignore_tokens: list[int],
-) -> torch.Tensor:
+def target_mask(x1: torch.Tensor, ignore_tokens: list[int]) -> torch.Tensor:
 
     is_valid_target = x1 != 0
+    
     for k in ignore_tokens:
         is_valid_target *= x1 != k
 
     return is_valid_target
 
 
-def ties_adjusted_delta_t(
-    t0: torch.Tensor,
-    t1: torch.Tensor,
-    attn_mask: torch.Tensor,
-    mask_ties: bool,
-    eps: float = 1.0,
-) -> torch.Tensor:
+def ties_adjusted_delta_t(t0, t1, attn_mask, mask_ties: bool, eps: float = 1.0) -> torch.Tensor:
 
-    delta_t = t1 - t0
-    delta_t = torch.clamp(delta_t, min=eps)
+    delta_t = torch.clamp(t1-t0, min=eps)
 
+    dd = dict(device=t0.device, dtype=torch.float32)
+    
     if mask_ties:
-        delta_t = torch.gather(
-            delta_t,
-            -1,
-            (
-                attn_mask
-                * torch.arange(
-                    0, t0.size(1), device=t0.device, dtype=torch.float32
-                ).view(1, 1, 1, -1)
-            )
-            .max(-1)
-            .indices.squeeze((1, 2)),
-        )
+        idx = ( attn_mask * torch.arange(0, t0.size(1), **dd).view(1, 1, 1, -1) ).max(-1).indices.squeeze((1, 2))
+        delta_t = torch.gather(delta_t, -1, idx)
+
+   #  if mask_ties:
+   #      delta_t = torch.gather(delta_t, -1, (attn_mask * torch.arange(
+   #                  0, t0.size(1), 
+   #              ).view(1, 1, 1, -1)
+   #          )
+   #          .max(-1)
+   #          .indices.squeeze((1, 2)),
+   #      )
 
     return delta_t

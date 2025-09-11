@@ -93,7 +93,7 @@ class TokenDomain:
 
 class DelphiDataset:
 
-    def __init__(self, root: str, domains: List[str], subjects: str = None, exclusions: List[str] = []):
+    def __init__(self, root: str, domains: List[str], subjects: List[str] = None, exclusions: List[str] = []):
         """
         Args:
             root: base data directory
@@ -103,7 +103,11 @@ class DelphiDataset:
         """
         self.root = root
         self.domains = {d: TokenDomain(os.path.join(root, d)) for d in domains}
-        self.subjects = pd.read_csv(os.path.join(root, subjects), names=["subject_id"])
+        
+        print(subjects)
+        self.subjects = pd.concat([
+            pd.read_csv(os.path.join(root, subj_file), names=["subject_id"]) for subj_file in subjects
+        ])
         
         self.excluded_subjects = set()
         for excl in exclusions:
@@ -152,7 +156,7 @@ class DelphiDataset:
         return np.stack([idx_start, counts], axis=1)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.subjects)
 
     def __getitem__(self, index):
         if isinstance(index, int):
@@ -176,35 +180,3 @@ class DelphiDataloader():
             batch_indices = self.indices[start_idx:start_idx + self.batch_size]
             yield [self.dataset[i] for i in batch_indices]
 
-
-# %%
-folds = [ f"subject_lists/fold{i}.csv" for i in range(1, 6) ]
-
-test_fold, dev_folds = folds.pop(0), folds
-
-test_dataset = DelphiDataset(
-    root="../data/transforms",
-    domains=["diseases", "lifestyle", "hla_alleles", 'sex'],
-    subjects=test_fold,
-    exclusions=["subject_lists/genetic_white_ids.txt"]
-)
-
-dev_dataset = DelphiDataset(
-    root="../data/transforms",
-    domains=["diseases", "lifestyle", "hla_alleles", 'sex'],
-    subjects=dev_folds,
-    exclusions=["subject_lists/genetic_white_ids.txt"]
-)
-
-# %%
-from delphi.model.transformer import Delphi, DelphiConfig
-config = DelphiConfig(vocab_size=1270, n_embd=120)
-
-model = Delphi(config=config)
-# dataset.get_subject_events("1000015")
-
-# %%
-model(
-  torch.randint(0, 1270, (2, 10)), 
-  torch.tensor([[0,10],[0,10]])
-)
