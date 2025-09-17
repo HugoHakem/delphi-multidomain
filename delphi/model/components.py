@@ -270,8 +270,8 @@ class DelphiEmbedding(nn.Module):
         
         print(config.domains)
         
+        self.domain_embed = nn.ModuleDict()
         if len(config.domains) > 0:
-            self.domain_embed = nn.ModuleDict()
             for domain_name, domain_cfg in config.domains.items():
                 self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, n_embed=config.n_embd)
         else:
@@ -294,7 +294,7 @@ class DelphiEmbedding(nn.Module):
 
     def forward(self, x: dict[str, torch.Tensor], t: dict[str, torch.Tensor]) -> torch.Tensor: # , M: torch.Tensor, biomarker_x: dict[Modality, torch.Tensor] = {},) -> torch.Tensor:
 
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
 
         if len(self.domain_embed) > 0:
             for domain_name in self.domain_embed:
@@ -302,7 +302,6 @@ class DelphiEmbedding(nn.Module):
                 age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
                 x[domain_name] = token_emb + age_emb
         else:
-            print("KKKKKKKKKKKKKKKKKK")
             token_emb = self.token_embedding(x)
             token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
             age_emb = self.age_encoding(t.unsqueeze(-1))

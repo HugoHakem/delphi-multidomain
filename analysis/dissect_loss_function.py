@@ -20,7 +20,7 @@ DELPHI_DIR = os.getenv("D", os.getenv("HOME") + "/repos/delphi")
 DELPHI_DIR = Path(DELPHI_DIR) 
 DATADIR = DELPHI_DIR / "data/transforms/ukb_real_data/"
 os.chdir(DELPHI_DIR)
-sys.path.append(os.getcwd())
+sys.path.insert(0, os.getcwd())
 
 import delphi.model.transformer
 delphi.model.transformer = importlib.reload(delphi.model.transformer)
@@ -97,7 +97,6 @@ count_tokens_df = get_top_counts(test_data, labels, N:=100, ignored_tokens)
     #   xlabel="Count", ylabel="Token"
     # );
 
-# %%
 def get_batch_wrapper(token_stream):
     return get_batch(ix=token_stream, data=test_data, p2i=test_p2i, select='left', block_size=block_size, device=device, padding='random')
 
@@ -106,7 +105,7 @@ def model_forward(X, age_X):
         return model(X, age_X)
 
 mini_batch_size = 32
-n_chunks = 512
+n_chunks = 8
 block_size = 128
 
 ix = torch.randint(len(test_p2i), (batch_size := n_chunks * mini_batch_size,))
@@ -121,7 +120,6 @@ with concurrent.futures.ThreadPoolExecutor() as executor:
     targets_age  = torch.stack([b[3] for b in batches]).view(batch_size, block_size)
     
     # outputs = list(executor.map(lambda b: model_forward(b[0], b[1]), batches))
-
     # logits = torch.concat([ outputs[b][0] for b in range(len(outputs)) ])
     # logits = torch.concat([ o[0] for o in outputs ])
     # del outputs
@@ -131,32 +129,29 @@ age          = age[0]
 targets      = targets[0]
 targets_age  = targets_age 
 
-# %%
-model(token_stream, age, targets, targets_age)
-# %%
+logits, loss, att = model(token_stream, age, targets, targets_age)
 id_to_token = dict(zip(labels.index-1, labels.name))
 list( map(lambda x: id_to_token[x-1], ignored_tokens) )
 
-# %%
 with torch.no_grad():
-
+ 
     # if we are given some desired targets also calculate the loss
-    # ignored_tokens = self.config.ignore_tokens.copy()    
-    
+    ignored_tokens = model.config.ignore_tokens.copy()    
+     
     # "filter" columns (setting to -Inf)
     if (validation_loss_mode := True):
-        logits = model.blackout_ignored(logits, ignored_tokens)
-
+         logits = model.blackout_ignored(logits, ignored_tokens)
+ 
     # filter rows
-    pass_tokens = model.get_allowed_tokens_mask(targets, ignored_tokens)
+    attn_mask   = model.build_attention_mask(token_stream, age, targets, targets_age, mask_ties=True)
+    pass_tokens = model.get_allowed_tokens_mask(targets, ignored_tokens).reshape(-1)
+    loss_ce     = model.cross_entropy_loss(logits, targets, pass_tokens, agg='per_disease')
     
-    loss_ce = model.cross_entropy_loss(logits, targets, pass_tokens, agg='per_disease')
-
     loss_dt = model.time_to_event_loss(
         logits, delta_t:= targets_age-age, 
         pass_tokens, attn_mask, mask_ties, t_min, agg=None
     )
-
+ 
     loss = dict(loss_ce=loss_ce, loss_dt=loss_dt)
 
 # %%
@@ -168,10 +163,7 @@ with torch.no_grad():
 
 # %%
 loss, loss_ce, loss_dt = EasyDict(), EasyDict(), EasyDict()
-
-# def 
-
-loss_ce_per_disease = model.cross_entropy_loss(logits, targets)
+loss_ce_per_disease = model.cross_entropy_loss(logits, targets, pass_tokens)
 
 
 # %%
@@ -192,10 +184,10 @@ def loss_dt_for_token(logits, targets, delta_age, token, t_min):
 
     dt_for_token = - torch.log(torch.clamp(delta_age, min=1.0) + t_min)
 
-    flattened_logits = logits.reshape(-1, logits.size(-1))
+    # flattened_logits = logits.reshape(-1, logits.size(-1))
 
     lse = torch.logsumexp(logits, -1)
-    flattened_lse = lse.reshape(-1)
+    flattened_lse = lse.reshape(-1)    
 
     flat_lse_pass = flattened_lse[pass_tokens]
     loss_for_token = - (flat_lse_pass - torch.exp(flat_lse_pass - dt_for_token)).sum() / len(logits) ## Exponential log-likelihood (real statistics, TM)
@@ -222,52 +214,20 @@ with torch.no_grad():
                
         loss_for_token = loss_dt_for_token(logits, targets, targets_age-age, token=token_of_interest, t_min=t_min)
         loss_dt[str(token_of_interest)] = loss_for_token
-
-        # loss_dt = loss_dt_for_token()
-
         total_loss += loss_for_token
 
-        # pass_tokens = targets != -1
-        # pass_tokens *= targets == allowed_token
-
-        # if pass_tokens.sum() > 0:
-
-            # flat_targets_age_pass = flattened_targets_age[pass_tokens]
-            # flat_age_pass = flattened_age[pass_tokens]
-            # flat_lse_pass = flattened_lse[pass_tokens]
-            
-            # dt = flattened_targets_age - flattened_age
-            # dt_for_token = - torch.log(torch.clamp(dt[pass_tokens], min=1.0) + t_min)
-            # dt_for_token = - (flat_lse_pass - torch.exp(flat_lse_pass - dt_for_token)).sum() / len(logits) ## Exponential log-likelihood (real statistics, TM)
-            # loss[f'loss_dt_{allowed_token}'] = dt_for_token
-            # loss_dt[str(allowed_token)] = dt_for_token
-            
-
-            # ce_for_token = -torch.log(F.softmax(flattened_logits[pass_tokens])[:, allowed_token]).sum().item() / len(logits)
-            # loss[f'loss_ce_{allowed_token}'] = ce_for_token
-            # loss_ce[str(allowed_token)] = ce_for_token
-            # print(f"{ce_for_token:.4f}")
-            # print(f"{dt_for_token:.4f}")
-            # total_loss += ce_for_token
-            
-            # print(total_loss)
 
 # %%
 { id_to_token.get(int(k), k): v for k, v in loss_dt.items() }
 
-# %%
 labels['ce'] = labels['index'].apply(lambda x: loss_ce.get(str(x), 0))
 labels.sort_values('ce', ascending=False).head(600)
 
-# %%
-print(allowed_token, pass_tokens.sum(), ce_for_token)      
-
-# %%
 loss_ce = F.cross_entropy(
     logits.reshape(-1, logits.size(-1))[pass_tokens], 
     targets[pass_tokens], ignore_index=-1
 )
 
 # %%
-F.cross_entropy(flattened_logits[pass_tokens], targets[pass_tokens], weight=1/sum(pass_tokens))
-sum(pass_tokens)
+# F.cross_entropy(flattened_logits[pass_tokens], targets[pass_tokens], weight=1/sum(pass_tokens))
+# sum(pass_tokens)

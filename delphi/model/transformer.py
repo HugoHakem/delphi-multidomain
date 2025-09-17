@@ -8,6 +8,8 @@ from torch.nn import functional as F
 from dataclasses import fields, is_dataclass
 import inspect
 
+import pandas as pd
+
 from delphi.model.components import (
     CompetingExpHead,
     CrossEntropyHead,
@@ -222,6 +224,125 @@ class Delphi(torch.nn.Module):
     def is_not_padding(self, x):
         return x > 1
 
+   
+    def get_allowed_tokens_mask(self, targets, ignore_tokens):
+
+        targets = targets.reshape(-1)
+        pass_tokens = targets != -1 
+        for k in ignore_tokens: # and gender
+            pass_tokens *= targets != k
+
+        return pass_tokens
+
+
+    def set_valid_loss_mode(self, validation_loss_mode):
+
+        self.validation_loss_mode = validation_loss_mode
+   
+
+    def build_attention_mask(self, idx, age, targets, targets_age, mask_ties):
+
+        # causal self-attention mask, to ensure that attention is only applied to the left in the input sequence
+        device = idx.device
+        # Do not attend to padded positions
+        attn_mask = (idx>0).view(idx.size(0), 1, 1, idx.size(1)) * (idx>0).view(idx.size(0), 1, idx.size(1), 1)  
+        
+        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0
+        
+        # if targets is not None and self.config.mask_ties:
+        if targets is not None and mask_ties:
+            # Mask co-occuring tokens
+            attn_mask *= ((age.view(idx.size(0),1,1,idx.size(1)) != targets_age.view(idx.size(0),1,idx.size(1),1))) 
+            attn_mask += (attn_mask.sum(-1, keepdim=True)==0) * torch.diag(torch.ones(idx.size(1), device=device)) > 0
+        
+        # Except for padding
+        attn_mask = attn_mask + (idx==0).view(idx.size(0), 1, 1, idx.size(1)) * torch.diag(torch.ones(idx.size(1), device=device)) > 0 
+        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0
+        
+        return attn_mask
+    
+
+    def cross_entropy_loss(self, logits, targets, pass_tokens, agg=None):
+        '''
+        Cross entropy loss for the next token prediction.
+        Arguments:
+            logits: Tensor, shape [batch_size, sequence_length, vocab_size]
+            targets: Tensor, shape [batch_size, sequence_length]
+            pass_tokens: Tensor of bools, batch_size * sequence_length
+            agg: one of None, "mean" or "sum"
+        '''
+
+        print(f"{pass_tokens.shape=}")
+        print(f"{logits.shape=}")
+        print(f"{targets.shape=}")
+
+        n_classes = logits.size(-1)            
+        if agg == "per_token":
+            log_softmax = F.log_softmax(logits.view(-1, n_classes)[pass_tokens], dim=-1)
+            loss_ce_per_token = log_softmax[torch.arange(log_softmax.size(0)), targets.view(-1)[pass_tokens]]
+            return loss_ce_per_token
+        if agg == "per_disease":
+            loss_ce_per_token = self.cross_entropy_loss(logits, targets, pass_tokens, agg="per_token")
+            loss_ce_agg_per_disease = pd.DataFrame([loss_ce_per_token, targets.view(-1)[pass_tokens].cpu().numpy()]).T.\
+                set_axis(["log_p", "token_id"], axis=1).\
+                astype({"token_id": int}).\
+                groupby("token_id").sum().\
+                log_p.apply(lambda x: x.item())
+            return loss_ce_agg_per_disease / pass_tokens.sum().item()
+        elif agg is None:
+            loss_ce = F.cross_entropy(
+                logits.reshape(-1, n_classes)[pass_tokens], 
+                targets.reshape(-1)[pass_tokens], 
+                ignore_index=-1
+            )
+        else:
+            raise ValueError("agg should be in [None, 'per_disease']")
+
+        return loss_ce
+
+
+    def time_to_event_loss(self, logits, time_to_next, pass_tokens, attn_mask, mask_ties, t_min, agg=None):       
+        '''
+        '''
+        
+        lse = torch.logsumexp(logits,-1) ## More forgiving than using torch.max() for the most likely next event
+        lse = - torch.log(torch.exp(-lse) + t_min)
+
+        dt  = torch.clamp(time_to_next, min=1.0)
+        dd = dict(device=logits.device, dtype=torch.float32)
+        block_size = attn_mask.size(-1)
+
+        if mask_ties:
+            # Use time from last untied token
+            dt = torch.gather(
+                dt, -1, (attn_mask * torch.arange(0, block_size, **dd).view(1, 1, 1, -1)).max(-1).indices.squeeze((1, 2))
+            )  
+
+        log_dt = - torch.log(dt + t_min).view(-1)        
+
+        ## Exponential log-likelihood (real statistics, TM)
+        loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - log_dt.reshape(-1))) 
+
+        if agg is None:
+            pass
+        elif agg == "mean":
+            loss_dt = (loss_dt[pass_tokens]).mean()
+        elif agg == "sum":
+            loss_dt = (loss_dt[pass_tokens]).sum()
+        elif agg == "per_disease":
+            raise NotImplementedError
+          
+        return loss_dt
+
+    
+    def blackout_ignored(self, logits, ignore_tokens):
+
+        if self.validation_loss_mode:
+            ignore_tokens += [1]
+            logits[..., ignore_tokens] = -torch.inf
+
+        return logits
+
 
     def forward(
         self,
@@ -241,6 +362,8 @@ class Delphi(torch.nn.Module):
         attn_mask = causal_attention_mask(
             pad=self.is_not_padding(idx), t1=targets_age, t0=age, mask_ties=self.config.mask_ties
         )
+
+        self.set_valid_loss_mode(validation_loss_mode)
 
         att = []
         for block in self.transformer.h:
