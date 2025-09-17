@@ -15,6 +15,7 @@ import yaml
 import logging
 logger = logging.getLogger(__name__)
 
+
 # ——————————————————————————————————————————————————————————————————————————————————————————————————
 
 class AgeEncoding(nn.Module):
@@ -103,7 +104,6 @@ class EmbedConfig:
     pretrained_path: Optional[str] = None  # path to .pt/.npy/.pkl with lookup table
     freeze: bool = True                    # if previous lookup table is to be left fixed
     path: Optional[str] = None 
-
 
 
 @dataclass
@@ -264,13 +264,18 @@ class DelphiEmbedding(nn.Module):
         self.config = config
         # assert config.vocab_size is not None
 
-        # self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=0)
+         
         self.age_encoding = AgeEncoding(n_embd=config.n_embd)
-        self.token_drop = nn.Dropout(config.token_dropout)
-
-        self.domain_embed = nn.ModuleDict()
-        for domain_name, domain_cfg in config.domains.items():
-            self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, n_embed=config.n_embd)
+        self.token_drop = nn.Dropout(config.token_dropout)        
+        
+        print(config.domains)
+        
+        if len(config.domains) > 0:
+            self.domain_embed = nn.ModuleDict()
+            for domain_name, domain_cfg in config.domains.items():
+                self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, n_embed=config.n_embd)
+        else:
+            self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=0)
 
         # domain_modalities = []
         # for domain_name, domain_cfg in config.domains.items():
@@ -289,10 +294,19 @@ class DelphiEmbedding(nn.Module):
 
     def forward(self, x: dict[str, torch.Tensor], t: dict[str, torch.Tensor]) -> torch.Tensor: # , M: torch.Tensor, biomarker_x: dict[Modality, torch.Tensor] = {},) -> torch.Tensor:
 
-        for domain_name in self.domain_embed:
-            token_emb = self.domain_embed[domain_name](x[domain_name])
-            age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
-            x[domain_name] = token_emb + age_emb
+        import ipdb; ipdb.set_trace()
+
+        if len(self.domain_embed) > 0:
+            for domain_name in self.domain_embed:
+                token_emb = self.domain_embed[domain_name](x[domain_name])
+                age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
+                x[domain_name] = token_emb + age_emb
+        else:
+            print("KKKKKKKKKKKKKKKKKK")
+            token_emb = self.token_embedding(x)
+            token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
+            age_emb = self.age_encoding(t.unsqueeze(-1))
+            x = token_emb + age_emb
         
         return x            
             
@@ -376,6 +390,7 @@ class CompetingExpHead(nn.Module):
             loss_dt = -exp_log_likelihood
 
         return loss_dt
+
 
 # ———————————————————— MASKS ————————————————————————————————————————————————————————————————
 

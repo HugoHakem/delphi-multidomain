@@ -22,11 +22,16 @@ DATADIR = DELPHI_DIR / "data/transforms/ukb_real_data/"
 os.chdir(DELPHI_DIR)
 sys.path.append(os.getcwd())
 
-import model
-model = importlib.reload(model)
-Delphi = model.Delphi
-from cv_utils import get_data_partitions
-from utils import *
+import delphi.model.transformer
+delphi.model.transformer = importlib.reload(delphi.model.transformer)
+
+Delphi = delphi.model.transformer.Delphi
+# from delphi.model.transformer import Delphi
+# model = importlib.reload(model)
+# Delphi = model.Delphi
+
+from utils.cv_utils import get_data_partitions
+from utils.utils import *
 
 # ———————————————————————————————————————————————————————————————
 
@@ -115,19 +120,19 @@ with concurrent.futures.ThreadPoolExecutor() as executor:
     targets      = torch.stack([b[2] for b in batches]).view(batch_size, block_size),
     targets_age  = torch.stack([b[3] for b in batches]).view(batch_size, block_size)
     
-    outputs = list(executor.map(lambda b: model_forward(b[0], b[1]), batches))
+    # outputs = list(executor.map(lambda b: model_forward(b[0], b[1]), batches))
 
     # logits = torch.concat([ outputs[b][0] for b in range(len(outputs)) ])
-    logits = torch.concat([ o[0] for o in outputs ])
-    del outputs
+    # logits = torch.concat([ o[0] for o in outputs ])
+    # del outputs
 
 token_stream = token_stream[0]
 age          = age[0]
 targets      = targets[0]
-targets_age  = targets_age[0]
+targets_age  = targets_age 
 
-token_stream
-
+# %%
+model(token_stream, age, targets, targets_age)
 # %%
 id_to_token = dict(zip(labels.index-1, labels.name))
 list( map(lambda x: id_to_token[x-1], ignored_tokens) )

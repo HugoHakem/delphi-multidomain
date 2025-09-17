@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from dataclasses import fields, is_dataclass
+import inspect
+
 from delphi.model.components import (
     CompetingExpHead,
     CrossEntropyHead,
@@ -13,7 +16,52 @@ from delphi.model.components import (
     target_mask,
     ties_adjusted_delta_t,
 )
-from delphi.model.config import DelphiConfig, GPT2Config
+from delphi.model.components import DelphiConfig
+
+
+def check_config(cls, args):
+    """
+    Validate a config dict or object against the expected config class.
+
+    - If cls.__init__ expects a config object (e.g. DelphiConfig), the valid keys
+      are taken from that config class (its dataclass fields if applicable).
+    - If args is a dict: its keys are compared.
+    - If args is an object: its attributes are compared.
+    """
+    sig = inspect.signature(cls.__init__)
+    params = sig.parameters
+
+    # Case 1: __init__ takes a config object (e.g. config: DelphiConfig)
+    if len(params) == 2 and "config" in params:
+        ann = params["config"].annotation
+        if is_dataclass(ann):
+            valid_keys = {f.name for f in fields(ann)}
+        else:
+            ann_sig = inspect.signature(ann.__init__)
+            valid_keys = set(ann_sig.parameters.keys()) - {"self"}
+    else:
+        # Case 2: normal kwargs in __init__
+        valid_keys = set(params.keys()) - {"self"}
+
+    # Provided keys: handle dict vs object
+    if isinstance(args, dict):
+        provided_keys = set(args.keys())
+    else:
+        provided_keys = set(vars(args).keys())
+
+    missing = valid_keys - provided_keys
+    extra   = provided_keys - valid_keys
+
+    if missing:
+        print(f"[ERROR] Missing keys for {cls.__name__}: {sorted(missing)}")
+    if extra:
+        print(f"[WARN] Unused config keys for {cls.__name__}: {sorted(extra)}")
+
+    # Return dict suitable for instantiation if args is dict
+    if isinstance(args, dict):
+        return {k: v for k, v in args.items() if k in valid_keys}
+    else:
+        return args
 
 
 class LayerNorm(nn.Module):
@@ -33,10 +81,13 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -116,7 +167,7 @@ class Block(nn.Module):
         return x, att
 
 
-def initialize_weights(model: torch.nn.Module, config: GPT2Config):
+def initialize_weights(model: torch.nn.Module, config: DelphiConfig):
 
     def _init_weights(module: torch.nn.Module):
         if isinstance(module, nn.Linear):
@@ -138,7 +189,7 @@ class Delphi(torch.nn.Module):
     model_type = "delphi-m4"
 
     def __init__(self, config: DelphiConfig):
-        super().__init__()
+        super().__init__()        
         self.config = config
         self.build_model(config)
         initialize_weights(self, config=config)
@@ -158,6 +209,7 @@ class Delphi(torch.nn.Module):
         
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.embed.token_embedding.weight = self.lm_head.weight
+        # self.transformer.embed.weight = self.lm_head.weight
 
         self.ce_head = CrossEntropyHead(config)
         self.dt_head = CompetingExpHead(
@@ -165,6 +217,10 @@ class Delphi(torch.nn.Module):
             zero_inflate=config.zero_inflate,
             pi_head=config.zero_inflate_projector,
         )
+
+
+    def is_not_padding(self, x):
+        return x > 1
 
 
     def forward(
@@ -178,11 +234,12 @@ class Delphi(torch.nn.Module):
         validation_loss_mode: bool = False,
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], torch.Tensor]:
 
+        
         x = self.transformer.embed(x=idx, t=age) #, M=modality, biomarker_x=biomarker)
         x = self.transformer.drop(x)
 
         attn_mask = causal_attention_mask(
-            pad=(modality > 0), t1=targets_age, t0=age, mask_ties=self.config.mask_ties
+            pad=self.is_not_padding(idx), t1=targets_age, t0=age, mask_ties=self.config.mask_ties
         )
 
         att = []
@@ -228,3 +285,56 @@ class Delphi(torch.nn.Module):
             loss = None
 
         return logits, loss, att
+
+
+    @classmethod
+    def from_checkpoint(cls, ckpt_path, device=None):
+
+        import inspect
+
+        def safe_load_config(cls, args_dict):
+            sig = inspect.signature(cls.__init__)
+            valid_keys = set(sig.parameters.keys()) - {"self"}
+            
+            used = {k: v for k, v in args_dict.items() if k in valid_keys}
+            unused = {k: v for k, v in args_dict.items() if k not in valid_keys}
+            
+            if unused:
+                print(f"[WARN] Unused config keys for {cls.__name__}: {list(unused.keys())}")
+            
+            return cls(**used)
+                        
+        
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        checkpoint = torch.load(ckpt_path, map_location=device)        
+
+        # conf = DelphiConfig(**checkpoint['model_args'])        
+        conf = safe_load_config(DelphiConfig, checkpoint["model_args"])
+
+        def translate_keys(state_dict):
+
+            mapping = {
+                "transformer.wte.weight": "transformer.embed.token_embedding.weight",
+                "transformer.wae.div_term": "transformer.embed.age_encoding.div_term",
+                "transformer.wae.linear.weight": "transformer.embed.age_encoding.linear.weight",
+            }
+            new_state = {}
+            for k, v in state_dict.items():
+                new_key = mapping.get(k, k)  # usa el mapeo si existe, si no deja igual
+                new_state[new_key] = v
+
+            return new_state        
+        
+        check_config(Delphi, conf)
+        model = Delphi(conf)
+        
+        state_dict = checkpoint['model']
+        state_dict = { k.replace("_orig_mod.", ""): v for k, v in state_dict.items() }
+        state_dict = translate_keys(state_dict)
+
+        model.load_state_dict(state_dict)         
+        model = model.to(device)
+
+        return model
