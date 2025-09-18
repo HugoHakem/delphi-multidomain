@@ -209,8 +209,8 @@ class Delphi(torch.nn.Module):
         )
         assert config.vocab_size is not None
         
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.embed.token_embedding.weight = self.lm_head.weight
+        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # self.transformer.embed.token_embedding.weight = self.lm_head.weight
         # self.transformer.embed.weight = self.lm_head.weight
 
         self.ce_head = CrossEntropyHead(config)
@@ -271,10 +271,6 @@ class Delphi(torch.nn.Module):
             pass_tokens: Tensor of bools, batch_size * sequence_length
             agg: one of None, "mean" or "sum"
         '''
-
-        print(f"{pass_tokens.shape=}")
-        print(f"{logits.shape=}")
-        print(f"{targets.shape=}")
 
         n_classes = logits.size(-1)            
         if agg == "per_token":

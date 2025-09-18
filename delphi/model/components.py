@@ -5,8 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# from delphi.model.config import EmbedConfig, DelphiConfig
-
 from delphi.multimodal import Modality, module_name
 from dataclasses import dataclass, field
 from typing import Optional
@@ -104,7 +102,8 @@ class EmbedConfig:
     pretrained_path: Optional[str] = None  # path to .pt/.npy/.pkl with lookup table
     freeze: bool = True                    # if previous lookup table is to be left fixed
     path: Optional[str] = None 
-
+    predict: bool = False
+    age_jitter: bool = False
 
 @dataclass
 class DelphiConfig:
@@ -263,7 +262,6 @@ class DelphiEmbedding(nn.Module):
         
         self.config = config
         # assert config.vocab_size is not None
-
          
         self.age_encoding = AgeEncoding(n_embd=config.n_embd)
         self.token_drop = nn.Dropout(config.token_dropout)        
@@ -271,7 +269,7 @@ class DelphiEmbedding(nn.Module):
         print(config.domains)
         
         self.domain_embed = nn.ModuleDict()
-        if len(config.domains) > 0:
+        if len(config.domains) > 0:            
             for domain_name, domain_cfg in config.domains.items():
                 self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, n_embed=config.n_embd)
         else:
@@ -294,10 +292,9 @@ class DelphiEmbedding(nn.Module):
 
     def forward(self, x: dict[str, torch.Tensor], t: dict[str, torch.Tensor]) -> torch.Tensor: # , M: torch.Tensor, biomarker_x: dict[Modality, torch.Tensor] = {},) -> torch.Tensor:
 
-        # import ipdb; ipdb.set_trace()
-
         if len(self.domain_embed) > 0:
             for domain_name in self.domain_embed:
+                print(x[domain_name])
                 token_emb = self.domain_embed[domain_name](x[domain_name])
                 age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
                 x[domain_name] = token_emb + age_emb
