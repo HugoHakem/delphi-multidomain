@@ -17,7 +17,7 @@ except ImportError:
 import yaml
 from omegaconf import OmegaConf
 
-from delphi import distributed
+# from delphi import distributed
 
 
 @dataclass
