@@ -54,9 +54,8 @@ from utils.utils import get_p2i, get_batch
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
 
-DEVICE = "cuda"
+DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
-pprint(EmbedConfig)
 # %%
 @dataclass
 class TrainBaseConfig:
@@ -87,27 +86,6 @@ class TrainBaseConfig:
     # log: TrainLogConfig = field(default_factory=TrainLogConfig)
 
 
-# @dataclass
-# class TrainConfig(TrainBaseConfig):
-# 
-#     # finetune
-#     resume_from: Optional[str] = None
-# 
-#     # data
-#     data_fraction: float = 1.0
-#     memmap: bool = False
-#     train_data: UKBDataConfig = field(default_factory=UKBDataConfig)
-#     infer_train_biomarkers: bool = True
-#     val_data: UKBDataConfig = field(default_factory=UKBDataConfig)
-# 
-#     infer_val_biomarkers: bool = True
-#     infer_val_expansion_packs: bool = True
-#     infer_val_transforms: bool = True
-#     infer_val_subject_filters: bool = True
-# 
-#     model: DelphiConfig = field(default_factory=DelphiConfig)
-#     ignore_expansion_tokens: bool = True
-
 # %%
 class DelphiTokenizer():
 
@@ -121,53 +99,40 @@ class DelphiTokenizer():
         return [self.id_to_token[int(id_)] for id_ in ids]
 
 
-#  class TokenDomainManager:
-     # def __init__(self):
-        #  Dictionary of domains -> per-domain vocab {token: local_id}
-         # self.domains: Dict[str, Dict[str, int]] = {}
-#  
-     # def add_tokens(self, domain: str, tokens: List[str]):
-         # """
-         # Add new tokens to a given domain.
-         # If the domain does not exist, create it.
-         # Tokens already present will be ignored.
-         # """
-         # if domain not in self.domains:
-             # self.domains[domain] = {}
-         # d = self.domains[domain]
-         # for tok in tokens:
-             # if tok not in d:
-                 # d[tok] = len(d)
-#  
-#  
-     # def flatten(self, domains: List[str] = None) -> Dict[str, int]:
-         # """
-         # Return a flat vocabulary combining one or multiple domains.
-         # Token IDs are assigned contiguously, domain by domain.
-         # Keys in the flat vocab are namespaced as "domain:token".
-         # """
-         # flat, offset = {}, 0
-         # if domains is None:
-             # domains = list(self.domains.keys())
-         # for dom in domains:
-             # for tok, idx in self.domains[dom].items():
-                 # flat[f"{dom}:{tok}"] = offset + idx
-             # offset += len(self.domains[dom])
-         # return flat
-#  
-#  
-     # def shared_tokens(self, domains: List[str]) -> Set[str]:
-         # """
-         # Return the set of tokens that are shared across all given domains.
-         # Comparison is done on raw token strings (not prefixed).
-         # """
-         # sets = [set(self.domains[d].keys()) for d in domains]
-         # return set.intersection(*sets)
-#  
-#  
-     # def get_domain_tokens(self, domain: str) -> List[str]:
-         # """Return the list of tokens in a given domain."""
-         # return list(self.domains.get(domain, {}).keys())
+def batch_to_tensors(df, block_size):
+    # aseguramos orden por subject_id y edad
+    df = df.sort_values(["subject_id", "age"])
+
+    # agrupamos por sujeto
+    grouped = df.groupby("subject_id")
+
+    tokens = []
+    ages = []
+    masks = []
+
+    for _, g in grouped:
+        # cortar o rellenar al block_size
+        g = g.head(block_size).copy()  # o pad si hay menos
+        if len(g) < block_size:
+            pad_len = block_size - len(g)
+            g = pd.concat([
+                g,
+                pd.DataFrame({
+                    "token_id": [0]*pad_len,
+                    "age": [0]*pad_len,
+                    "predict": [False]*pad_len
+                })
+            ], ignore_index=True)
+
+        tokens.append(torch.tensor(g["token_id"].values, dtype=torch.long))
+        ages.append(torch.tensor(g["age"].values, dtype=torch.float32))
+        masks.append(torch.tensor(g["predict"].astype(int).values, dtype=torch.bool))
+    
+    tokens = torch.stack(tokens)
+    ages = torch.stack(ages)
+    masks = torch.stack(masks)
+
+    return tokens, ages, masks
 
 
 # %%
@@ -185,9 +150,16 @@ class Trainer():
     def train(self):
 
         for batch in self.training_loader:
-            print(batch)
-            X, A, Y, B = batch['x'], batch['a'], batch['y'], batch['b']
-            logits, _, _, _ = model(X, A, Y, B, validation_loss_mode=True)
+            import ipdb; ipdb.set_trace()
+            tokens, ages, masks = batch_to_tensors(batch, block_size=128)
+
+            # apply dropout
+            # 
+            
+            # logits, _, _, _ = model(tokens, ages, validation_loss_mode=True)
+            logits, _, _ = model(tokens, ages, validation_loss_mode=True)
+
+            # logits, _, _, _ = model(tokens, ages, Y, B, validation_loss_mode=True)
 
 
     def train_step(self):
@@ -234,12 +206,13 @@ from delphi.model.components import (
 root_path = "../data/transforms"
 
 domain_config = {
-    'diseases': EmbedConfig(
-        projector="embed",
-        input_size=None,
-        path=os.path.join(root_path, 'diseases'),
-        predict=True
-    ),
+
+    # 'diseases': EmbedConfig(
+    #    projector="embed",
+    #    input_size=None,
+    #    path=os.path.join(root_path, 'diseases'),
+    #    predict=True
+    #),
     'death': EmbedConfig(
         projector="embed",
         input_size=None,
@@ -264,40 +237,13 @@ domain_config = {
     )    
 }
 
-# domains = {
-#     'diseases': {
-#         'predict': True
-#     },
-#     'lifestyle': {
-#         'predict': False
-#     },
-#     "hla_alleles": {
-#         'predict': True
-#     },
-#     'sex': {
-#         'predict': False
-#     }, 
-#     'death': {
-#         'predict': True
-#     }
-# }
-# 
-# domain_config = {}
-# for d in domains:
-#     domain_config[d] = EmbedConfig(
-#         projector="embed",
-#         input_size=None,
-#         path=os.path.join(root_path, d),
-#         predict=domains[d]['predict']
-#     )
-
 cfg = DelphiConfig(    
-    # n_embd=n_embd,
     token_dropout=0.1,
     domains=domain_config,
 )
 
-model = DelphiEmbedding(cfg)
+import logging, time
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # %%
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
@@ -305,35 +251,50 @@ test_fold, dev_folds = [folds.pop(0)], folds
 
 dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=["subject_lists/genetic_white_ids.txt"])
 
-dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config)
-test_dataset = DelphiDataset(subjects=test_fold, **dataset_config)
+t0 = time.perf_counter()
+dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config, n_samples=200)
+print(len(dev_dataset))
 
+logging.info(f"DelphiDataset(dev) built in {time.perf_counter()-t0:.2f}s")
+
+t0 = time.perf_counter()
+
+test_dataset = DelphiDataset(subjects=test_fold, **dataset_config, n_samples=100)
+
+logging.info(f"DelphiDataset(test) built in {time.perf_counter()-t0:.2f}s")
+
+t0 = time.perf_counter()
 dev_dataset  = DelphiBatchDataset(dev_dataset)
 test_dataset = DelphiBatchDataset(test_dataset)
+
+logging.info(f"BatchDatasets built in {time.perf_counter()-t0:.2f}s")
+
 n_valid      = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
+t0 = time.perf_counter()
+
 train_dataset, valid_dataset = random_split(
-    dev_dataset, [ n_train, n_valid ],
+    # dev_dataset, [ n_train, n_valid ],
+    dev_dataset, [ 100, 100 ],
     generator=torch.Generator().manual_seed(42)
 )
+logging.info(f"Random split done in {time.perf_counter()-t0:.2f}s")
 
+t0 = time.perf_counter()
 dataloaders = [ DelphiDataloader(d, batch_size=32) for d in [train_dataset, valid_dataset, test_dataset] ]
+logging.info(f"Dataloaders built in {time.perf_counter()-t0:.2f}s")
 
 config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domain_config)
+
+t0 = time.perf_counter()
 model  = Delphi(config).to(DEVICE)
+logging.info(f"Model built in {time.perf_counter()-t0:.2f}s")
+
+t0 = time.perf_counter()
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
+logging.info(f"Optimizers configured in {time.perf_counter()-t0:.2f}s")
 
 trainer = Trainer(model, *dataloaders, optimizer=optimizer)
-trainer.train()
 
-# ds = DelphiDataset(root_path, domains=domains, subjects=dev_folds)
-# batch_ds = DelphiBatchDataset(ds)
-# 
-# item = batch_ds[0]
-# 
-# print("Subject ID:", item["subject_id"])
-# print("Dominios disponibles:", list(item["domains"].keys()))
-# 
-# for dname, arr in item["domains"].items():
-#     print(f"\nDominio: {dname}")
-#     print("Shape:", arr.shape)
-#     print("Primeras filas:\n", arr[:20])
+t0 = time.perf_counter()
+trainer.train()
+logging.info(f"Training finished in {time.perf_counter()-t0:.2f}s")

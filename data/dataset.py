@@ -1,6 +1,7 @@
 #%%
 import os, sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
 os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
 
@@ -45,7 +46,6 @@ DEVICE='cuda'
 # )
 
 # from model import Delphi, DelphiConfig
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.utils import get_p2i, get_batch
 
@@ -98,7 +98,7 @@ class TokenDomain:
 
 class DelphiDataset:
 
-    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = []):
+    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None):
         """
         Args:
             root: base data directory
@@ -116,6 +116,9 @@ class DelphiDataset:
         self.subjects = pd.concat([
             pd.read_csv(os.path.join(root, subj_file), names=["subject_id"]) for subj_file in subjects
         ])
+
+        if n_samples is not None:
+           self.subjects = self.subjects.sample(n_samples)
         
         self.excluded_subjects = set()
         for excl in exclusions:
@@ -195,6 +198,14 @@ class DelphiBatchDataset(torch.utils.data.Dataset):
 
     def __init__(self, delphi_dataset):
         self.ds = delphi_dataset
+        
+        self.base = delphi_dataset
+        while isinstance(self.base, torch.utils.data.Subset):
+            self.base = self.base.dataset
+
+    @property
+    def subjects(self):
+        return self.base.subjects
 
     def __len__(self):
         return len(self.ds)
@@ -400,41 +411,49 @@ def build_batch_indices(traj_start_idx, block_size):
     """Return indices into data for each subject's window."""
     return np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
 
+# block_size=48, select="left", padding="regular"
+# no_event_token_rate=5
 
-def process_domain(data, p2i, block_size=48, device="", select="left",
-                   padding="regular", no_event_token_rate=5, age_jitter=False,
-                   gen=None, predict=True):
+def process_domain(data, domain_id, p2i,  device="", age_jitter=False, predict=True, gen=None):
+
     """General pipeline for one domain."""
-    subject_start_and_count = torch.tensor(np.array([p2i[int(i)] for i in range(len(p2i))]))
-    traj_start_idx = select_window(subject_start_and_count, block_size, data, mode=select, gen=gen)
-    batch_idx = build_batch_indices(traj_start_idx, block_size)
+    # subject_start_and_count = torch.tensor(np.array([p2i[int(i)] for i in range(len(p2i))]))
+    # traj_start_idx = select_window(p2i, block_size, data, mode=select, gen=gen)
+    # print("traj_start_idx.max():", traj_start_idx.max())
+    # print("traj_start_idx.min():", traj_start_idx.min())
+    
+    # batch_idx = build_batch_indices(traj_start_idx, block_size)
+
+    # print("data.shape:", data.shape)
+    # print("batch_idx.max():", batch_idx.max())
+    # print("batch_idx.shape:", batch_idx.shape)
 
     import ipdb; ipdb.set_trace()
-    print("data.shape:", data.shape)
-    print("traj_start_idx.max():", traj_start_idx.max())
-    print("traj_start_idx.min():", traj_start_idx.min())
-    print("batch_idx.max():", batch_idx.max())
-    print("batch_idx.shape:", batch_idx.shape)
-
-    tokens = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
-    ages   = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
-
-    max_age = ages.max(1, keepdim=True).values
-    tokens, ages = insert_no_event_tokens(tokens, ages, max_age,
-                                          no_event_token_rate=no_event_token_rate,
-                                          padding=padding, gen=gen)
-
-    tokens, ages = sort_by_age(tokens, ages)
-
+    # tokens  = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
+    # ages    = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
+    
     if age_jitter:
-        tokens, ages = jitter_tokens(tokens, ages, generator=gen)
+        tokens, ages = age_jitter_tokens(tokens, ages, generator=gen)
 
-    if predict:
-        x, a, y, b = make_targets(tokens, ages, block_size, device=device)
-        return {"x": x, "a": a, "y": y, "b": b, "predict": True}
-    else:
+    data = pd.DataFrame(data).assign(domain_id=domain_id, predict=predict)
+
+    return data
+
+    # domain_column  = torch.from_numpy([domain_id]*len(data)).astype(np.int64)
+    # predict_column = torch.from_numpy([predict]  *len(data)).astype(np.int64)
+
+    return ages, domains, tokens, predict_column
+        
+    # max_age = ages.max(1, keepdim=True).values
+    # tokens, ages = insert_no_event_tokens(tokens, ages, max_age, no_event_token_rate=no_event_token_rate, padding=padding, gen=gen)
+    # tokens, ages = sort_by_age(tokens, ages)
+
+    # if predict:
+        # x, a, y, b = make_targets(tokens, ages, block_size, device=device)
+        # return {"x": x, "a": a, "y": y, "b": b, "predict": True, "d": domains.to(device)}
+    # else:
         # no target: just return inputs
-        return {"x": tokens.to(device), "a": ages.to(device), "y": None, "b": None, "predict": False}
+        # return {"x": tokens.to(device), "a": ages.to(device), "y": None, "b": None, "predict": False, "d": domains.to(device)}
 
 
 
@@ -512,8 +531,18 @@ def make_targets(tokens, ages, block_size, device=DEVICE, cut_batch=False):
     return x.to(device), a.to(device), y.to(device), b.to(device)
 
 
+def get_domain_id(domain_name):
+
+    if isinstance(domain_name, str):
+        domain_id = abs(hash(domain_name)) % (10**6)
+    else:
+        domain_id = int(domain_name)
+
+    return domain_id
+
 
 def collate_fn_domains(batch, block_size=48, device=DEVICE):
+
     """
     Collate function that processes each domain separately, using domain metadata.
     Each item in batch is expected to be:
@@ -523,7 +552,9 @@ def collate_fn_domains(batch, block_size=48, device=DEVICE):
         "domains_metadata": {dname: TokenDomain}  # must expose .predict and .jitter
       }
     """
+
     subject_ids = [item["subject_id"] for item in batch]
+    out = {"subject_ids": subject_ids, "domains": {}}        
 
     # Group arrays per domain
     domains_dict = {}
@@ -531,65 +562,41 @@ def collate_fn_domains(batch, block_size=48, device=DEVICE):
         for dname, arr in item["domains"].items():
             if dname not in domains_dict:
                 domains_dict[dname] = []
-            domains_dict[dname].append(arr)
+            domains_dict[dname].append(arr)        
+   
+    domain_ids = { dname: get_domain_id(dname) for dname in domains_dict }
 
-    out = {"subject_ids": subject_ids, "domains": {}}
-
+    all_data = []
     for dname, arrs in domains_dict.items():
+
         data = np.concatenate(arrs)
         p2i_map = DelphiDataset.get_p2i(data)
-
+        domain_id = get_domain_id(dname)
         # grab meta info from the first item in the batch
         domain_meta = batch[0]["domains_metadata"][dname]
-
-        out["domains"][dname] = process_domain(
-            data,
-            p2i=p2i_map,
-            block_size=block_size,
-            device=device,
-            age_jitter=domain_meta.age_jitter,
+        
+        domain_data = pd.DataFrame(data, columns=["subject_id", "age", "token_id"]).assign(
+            domain_id=pd.Categorical([dname]*len(data), categories=domain_ids.keys()), 
             predict=domain_meta.predict
         )
 
-    return out
+        all_data.append(domain_data)
+    
+    return pd.concat(all_data, axis=0).sort_values(["subject_id", "age"])
 
+    # out["domains"][dname] = process_domain(
+        # data,
+        # domain_id,
+        # p2i=p2i_map,
+        # block_size=block_size,
+        # device=device,
+        # age_jitter=domain_meta.age_jitter,
+        # predict=domain_meta.predict
+    # )
 
-
-# def collate_fn_domains(batch, block_size=48, device=""):
-# 
-#     """
-#     Collate function that returns a dictionary per domain.
-#     
-#     batch: list of items from DelphiBatchDataset
-#     Each item: {"subject_id": ..., "domains": {dname: arr}}
-#     """
-#     subject_ids = [item["subject_id"] for item in batch]
-#     
-#     # Initialize dictionary of lists per domain
-#     domains_dict = {}    
-#     for item in batch:
-#         for dname, arr in item["domains"].items():
-#             if dname not in domains_dict:
-#                 domains_dict[dname] = []
-#             domains_dict[dname].append(arr)
-#     
-# 
-#     out = {"subject_ids": subject_ids, "domains": {}}
-# 
-#     for dname, arrs in domains_dict.items():
-#         data = np.concatenate(arrs)
-#         if dname == "diagnosis":
-#             out["domains"][dname] = process_domain(data, block_size, device, apply_jitter=False)
-#         elif dname == "lifestyle":
-#             out["domains"][dname] = process_domain(data, block_size, device, apply_jitter=True)
-#         else:
-#             out["domains"][dname] = data
-# 
-# 
-#     return {
-#         "subject_ids": subject_ids,
-#         "domains": domains_dict
-#     }
+    # import ipdb; ipdb.set_trace()
+    # enmascaramos aca? creo que es un buen lugar para hacerlo
+    # concatenamos dominios
 
 
 class DelphiDataloader(DataLoader):
@@ -605,18 +612,3 @@ class DelphiDataloader(DataLoader):
             collate_fn=collate_fn,
             **kwargs
         )
-
-# class DelphiDataloader():
-#     
-#     def __init__(self, dataset, batch_size, shuffle=True):
-#         self.dataset = dataset
-#         self.batch_size = batch_size
-#         self.shuffle = shuffle
-#         self.indices = np.arange(len(dataset))
-# 
-#     def __iter__(self):
-#         if self.shuffle:
-#             np.random.shuffle(self.indices)
-#         for start_idx in range(0, len(self.dataset), self.batch_size):
-#             batch_indices = self.indices[start_idx:start_idx + self.batch_size]
-#             yield [self.dataset[i] for i in batch_indices]
