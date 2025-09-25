@@ -14,8 +14,7 @@ from utils import get_batch, get_p2i, DelphiData
 import shap
 from shap_utils import shap_custom_tokenizer, shap_model_creator
 
-from cv_utils import get_run_from_fold, get_best_ckpt_from_mlflow
-from cv_utils import DATA_TYPE_CONFIGS
+from cv_utils import get_run_from_fold, get_best_ckpt_from_mlflow, DATA_TYPE_CONFIGS
 
 '''
 Usage:
@@ -47,7 +46,7 @@ def process_person(person_idx):
         print(repr(e))
         return None
 
-from utils import DelphiData
+
 
 if __name__ == "__main__":
     

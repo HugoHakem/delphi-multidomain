@@ -54,23 +54,6 @@ from utils.utils import get_p2i, get_batch
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
 
-# from delphi.data.multimodal import (
-    # UKBDataConfig,
-    # load_sequences,
-# )
-
-# from delphi.data.utils import train_iter
-# from delphi.env import DELPHI_CKPT_DIR
-# from delphi.log import TrainLogConfig, TrainLogger
-
-# from delphi.model.components import (
-    # parse_token_list,
-    # validate_model_config,
-    # validate_model_config_for_finetuning,
-
-# import hla_genes
-# from hla_genes import get_hla_protein_sequences
-
 DEVICE = "cuda"
 
 pprint(EmbedConfig)
