@@ -54,7 +54,7 @@ from utils.utils import get_p2i, get_batch
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
 
-DEVICE = "cuda"
+DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 # %%
 @dataclass
@@ -252,17 +252,14 @@ test_fold, dev_folds = [folds.pop(0)], folds
 dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=["subject_lists/genetic_white_ids.txt"])
 
 t0 = time.perf_counter()
-dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config)
-
-from torch.utils.data import Subset
-dev_dataset = Subset(dev_dataset, range(200))  # primeras 200 muestras
+dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config, n_samples=200)
+print(len(dev_dataset))
 
 logging.info(f"DelphiDataset(dev) built in {time.perf_counter()-t0:.2f}s")
 
 t0 = time.perf_counter()
 
-test_dataset = DelphiDataset(subjects=test_fold, **dataset_config)
-test_dataset = Subset(test_dataset, range(100))  # primeras 200 muestras
+test_dataset = DelphiDataset(subjects=test_fold, **dataset_config, n_samples=100)
 
 logging.info(f"DelphiDataset(test) built in {time.perf_counter()-t0:.2f}s")
 
@@ -274,6 +271,7 @@ logging.info(f"BatchDatasets built in {time.perf_counter()-t0:.2f}s")
 
 n_valid      = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
 t0 = time.perf_counter()
+
 train_dataset, valid_dataset = random_split(
     # dev_dataset, [ n_train, n_valid ],
     dev_dataset, [ 100, 100 ],
