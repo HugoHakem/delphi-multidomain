@@ -1,7 +1,7 @@
 #%%
 import os, sys
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
 os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
 
@@ -98,7 +98,7 @@ class TokenDomain:
 
 class DelphiDataset:
 
-    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = []):
+    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None):
         """
         Args:
             root: base data directory
@@ -116,6 +116,9 @@ class DelphiDataset:
         self.subjects = pd.concat([
             pd.read_csv(os.path.join(root, subj_file), names=["subject_id"]) for subj_file in subjects
         ])
+
+        if n_samples is not None:
+           self.subjects = self.subjects.sample(n_samples)
         
         self.excluded_subjects = set()
         for excl in exclusions:
