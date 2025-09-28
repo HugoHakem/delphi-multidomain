@@ -12,10 +12,10 @@ from contextlib import nullcontext
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import Dataset, random_split, DataLoader
 
 from ast import literal_eval
-
-from torch.utils.data import Dataset, random_split, DataLoader
+import importlib
 
 from pprint import pprint
 from collections import defaultdict
@@ -25,7 +25,7 @@ from mlflow.tracking import MlflowClient
 from mlflow.entities import Metric
 
 from dataclasses import asdict, dataclass, field
-from typing import Iterator, Optional
+from typing import Iterator, Optional, List, Dict, Set
 
 from omegaconf import OmegaConf
 import logging, time
@@ -33,19 +33,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 import yaml
 import warnings
-from typing import List, Dict, Set
 
+import delphi
+from delphi.model.transformer import Delphi
+from delphi.optim import OptimConfig, configure_optimizers
 from delphi.model.components import (
   EmbedConfig,
   DelphiConfig,
 )
 
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 from utils.utils import get_p2i, get_batch
-from delphi.model.transformer import Delphi
-from delphi.optim import OptimConfig, configure_optimizers
+
+import data.dataset
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+
+# ————————————————————————————————————————————————————————————————————————————————————————————
 
 @dataclass
 class TrainBaseConfig:
@@ -75,6 +80,7 @@ class TrainBaseConfig:
     optim: OptimConfig = field(default_factory=OptimConfig)
     # log: TrainLogConfig = field(default_factory=TrainLogConfig)
 
+# ————————————————————————————————————————————————————————————————————————————————————————————
 
 class DelphiTokenizer():
 
@@ -114,6 +120,7 @@ def batch_to_tensors(df, block_size):
     
     return tokens, ages, masks
 
+# ————————————————————————————————————————————————————————————————————————————————————————————
 
 class Trainer():
 
@@ -166,16 +173,7 @@ class Trainer():
         return out
 
 
-# %%
 
-from delphi.model.components import (
-    EmbedConfig,
-    DelphiConfig,
-    # DomainEmbedding,
-    # DelphiEmbedding,
-)
-
-from pathlib import Path
 
 root_path = Path("../data/transforms")
 
@@ -222,15 +220,10 @@ cfg = DelphiConfig(
 )
 
 # %%
-import data.dataset
-import importlib
 
 data.dataset = importlib.reload(data.dataset)
 DelphiDataset = data.dataset.DelphiDataset
-DelphiBatchDataset = data.dataset.DelphiBatchDataset
 DelphiDataloader = data.dataset.DelphiDataloader
-
-# from data.dataset import DelphiDataset, DelphiBatchDataset, DelphiDataloader
 
 # %%
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
@@ -250,11 +243,11 @@ test_dataset = DelphiDataset(subjects=test_fold, **dataset_config, n_samples=100
 
 logging.info(f"DelphiDataset(test) built in {time.perf_counter()-t0:.2f}s")
 
-t0 = time.perf_counter()
-dev_dataset  = DelphiBatchDataset(dev_dataset)
-test_dataset = DelphiBatchDataset(test_dataset)
+# t0 = time.perf_counter()
+# dev_dataset  = DelphiBatchDataset(dev_dataset)
+# test_dataset = DelphiBatchDataset(test_dataset)
 
-logging.info(f"BatchDatasets built in {time.perf_counter()-t0:.2f}s")
+# logging.info(f"BatchDatasets built in {time.perf_counter()-t0:.2f}s")
 
 n_valid      = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
 t0 = time.perf_counter()
@@ -273,8 +266,6 @@ logging.info(f"Dataloaders built in {time.perf_counter()-t0:.2f}s")
 config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domain_config)
 
 # %%
-
-import delphi
 delphi = importlib.reload(delphi)
 Delphi = delphi.model.transformer.Delphi
 
@@ -288,9 +279,9 @@ logging.info(f"Optimizers configured in {time.perf_counter()-t0:.2f}s")
 
 trainer = Trainer(model, *dataloaders, optimizer=optimizer)
 
-t0 = time.perf_counter()
-trainer.train()
-logging.info(f"Training finished in {time.perf_counter()-t0:.2f}s")
+# t0 = time.perf_counter()
+# trainer.train()
+# logging.info(f"Training finished in {time.perf_counter()-t0:.2f}s")
 
 # %%
 import data.dataset
@@ -308,8 +299,5 @@ for batch in tqdm(dataloader):
 # %%
 kk = next(iter(dataloader))
 kk.token_id = kk.token_id.cat.codes
-kk
-
 # dataset.merge_data().info()
 # dataset.merge_data().reset_index().groupby("subject_id").count()['age'].hist(bins=50)
-# %%
