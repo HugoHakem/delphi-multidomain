@@ -12,7 +12,7 @@ import yaml
 
 import logging
 logger = logging.getLogger(__name__)
-
+from pathlib import Path
 
 # ——————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -192,8 +192,10 @@ class DomainEmbedding(nn.Module):
         self.config = config
         # assert config.input_size is not None, "input_size must be specified"
 
-        if config.input_size is None and config.projector.lower() != "pretrained":
-            self.config.input_size = len(yaml.load(open(config.path + "/tokenizer.yaml"), Loader=yaml.FullLoader))            
+        if config.input_size is None and config.projector.lower() != "pretrained":            
+            tokenizer_file = Path(config.path) / "tokenizer.yaml"
+            with open(tokenizer_file, "r") as f:
+                self.config.input_size = len(yaml.load(f, Loader=yaml.FullLoader))
 
         elif config.projector.lower() == "pretrained":
             weights = torch.load(config.pretrained_path)  # Tensor [vocab_size, d_ext]
@@ -203,25 +205,8 @@ class DomainEmbedding(nn.Module):
             self.projector = nn.Linear(config.input_size, n_embed, bias=False)
 
         elif config.projector.lower() == "mlp":
+            self.projector = self.build_mlp_projector(config)
             
-            assert config.n_layers is not None, "n_layers must be specified for mlp projector"
-            assert config.n_hidden is not None, "n_hidden must be specified for mlp projector"
-
-            I, L, H, E = config.input_size, config.n_layers, config.n_hidden, n_embed
-            
-            sizes = [I] + [H] * (L-1) + [E]
-            isizes, osizes = sizes[:-1], sizes[1:]
-
-            # build MLP
-            layers = []
-            for i in range(L):
-                linear_layer = nn.Linear(isizes[i], osizes[i], bias=False)
-                layers.append(linear_layer)
-                if i < L-1:
-                    layers.append(nn.ReLU())
-            
-            self.projector = nn.Sequential(*layers)
-
         elif config.projector.lower() == "embed":
             print(f"DomainEmbedding: Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
             self.projector = nn.Embedding(self.config.input_size, n_embed, padding_idx=0)
@@ -240,7 +225,30 @@ class DomainEmbedding(nn.Module):
         else:
             raise ValueError(f"unknown projector type: {config.projector}")
 
+
+    def build_mlp_projector(self, config):
+
+        assert config.n_layers is not None, "n_layers must be specified for mlp projector"
+        assert config.n_hidden is not None, "n_hidden must be specified for mlp projector"
+
+        I, L, H, E = config.input_size, config.n_layers, config.n_hidden, n_embed
+        
+        sizes = [I] + [H] * (L-1) + [E]
+        isizes, osizes = sizes[:-1], sizes[1:]
+
+        # build MLP
+        layers = []
+        for i in range(L):
+            linear_layer = nn.Linear(isizes[i], osizes[i], bias=False)
+            layers.append(linear_layer)
+            if i < L-1:
+                layers.append(nn.ReLU())
+
+        return nn.Sequential(*layers)
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
         logger.debug(f"DomainEmbedding.forward | projector={self.config.projector} | input_shape={tuple(x.shape)}")
 
         if self.config.projector.lower() == "pretrained":
@@ -258,15 +266,14 @@ class DomainEmbedding(nn.Module):
 class DelphiEmbedding(nn.Module):
 
     def __init__(self, config: DelphiConfig) -> None:
+        
         super().__init__()
         
         self.config = config
         # assert config.vocab_size is not None
          
         self.age_encoding = AgeEncoding(n_embd=config.n_embd)
-        self.token_drop = nn.Dropout(config.token_dropout)        
-        
-        print(config.domains)
+        self.token_drop   = nn.Dropout(config.token_dropout)        
         
         self.domain_embed = nn.ModuleDict()
         if len(config.domains) > 0:            
@@ -290,19 +297,21 @@ class DelphiEmbedding(nn.Module):
         #     self.mod_embedding = nn.Embedding(max_modality_idx + 1, config.n_embd, padding_idx=0)
 
 
-    def forward(self, x: dict[str, torch.Tensor], t: dict[str, torch.Tensor]) -> torch.Tensor: # , M: torch.Tensor, biomarker_x: dict[Modality, torch.Tensor] = {},) -> torch.Tensor:
+    def forward(self, x: dict[str, torch.Tensor], t: dict[str, torch.Tensor]) -> torch.Tensor:
 
         if len(self.domain_embed) > 0:
             for domain_name in self.domain_embed:
                 print(x[domain_name])
                 token_emb = self.domain_embed[domain_name](x[domain_name])
-                age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
-                x[domain_name] = token_emb + age_emb
+                # age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
+                x[domain_name] = token_emb
+                # + age_emb
         else:
             token_emb = self.token_embedding(x)
             token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
-            age_emb = self.age_encoding(t.unsqueeze(-1))
-            x = token_emb + age_emb
+            # age_emb = self.age_encoding(t.unsqueeze(-1))
+            x = token_emb
+            # + age_emb
         
         return x            
             

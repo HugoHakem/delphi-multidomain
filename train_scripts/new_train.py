@@ -1,6 +1,6 @@
 # %%
 import os, sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
 os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
 
@@ -28,35 +28,25 @@ from dataclasses import asdict, dataclass, field
 from typing import Iterator, Optional
 
 from omegaconf import OmegaConf
+import logging, time
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 import yaml
 import warnings
 from typing import List, Dict, Set
 
-from data.dataset import DelphiDataset, DelphiBatchDataset, DelphiDataloader
-from delphi.model.transformer import Delphi
-
 from delphi.model.components import (
-    EmbedConfig,
-    DelphiConfig,
-    DomainEmbedding,
-    DelphiEmbedding,
-    CrossEntropyHead,
-    CompetingExpHead,
-    causal_attention_mask,
-    target_mask,
-    ties_adjusted_delta_t,
+  EmbedConfig,
+  DelphiConfig,
 )
 
 from sklearn.model_selection import train_test_split
-
 from utils.utils import get_p2i, get_batch
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
-# %%
 @dataclass
 class TrainBaseConfig:
     ckpt_dir: str = "."
@@ -86,7 +76,6 @@ class TrainBaseConfig:
     # log: TrainLogConfig = field(default_factory=TrainLogConfig)
 
 
-# %%
 class DelphiTokenizer():
 
     def __init__(self, mapping):
@@ -100,42 +89,32 @@ class DelphiTokenizer():
 
 
 def batch_to_tensors(df, block_size):
-    # aseguramos orden por subject_id y edad
+    
     df = df.sort_values(["subject_id", "age"])
-
-    # agrupamos por sujeto
     grouped = df.groupby("subject_id")
 
-    tokens = []
-    ages = []
-    masks = []
+    tokens, ages, mask = [], [], []
 
     for _, g in grouped:
-        # cortar o rellenar al block_size
         g = g.head(block_size).copy()  # o pad si hay menos
         if len(g) < block_size:
             pad_len = block_size - len(g)
-            g = pd.concat([
-                g,
-                pd.DataFrame({
-                    "token_id": [0]*pad_len,
-                    "age": [0]*pad_len,
-                    "predict": [False]*pad_len
-                })
-            ], ignore_index=True)
+            g = pd.concat([g, pd.DataFrame({
+                "token_id": [0]*pad_len,
+                "age": [0]*pad_len,
+                "predict": [False]*pad_len
+            })], ignore_index=True)
 
         tokens.append(torch.tensor(g["token_id"].values, dtype=torch.long))
         ages.append(torch.tensor(g["age"].values, dtype=torch.float32))
         masks.append(torch.tensor(g["predict"].astype(int).values, dtype=torch.bool))
     
-    tokens = torch.stack(tokens)
-    ages = torch.stack(ages)
-    masks = torch.stack(masks)
-
+    ts = torch.stack
+    tokens, ages, masks = ts(tokens), ts(ages), ts(masks)
+    
     return tokens, ages, masks
 
 
-# %%
 class Trainer():
 
     def __init__(self, model, training_loader, valid_loader, test_loader, optimizer):
@@ -146,17 +125,12 @@ class Trainer():
         self.test_loader     = test_loader
         self.optimizer   = optimizer
 
-
     def train(self):
 
         for batch in self.training_loader:
             import ipdb; ipdb.set_trace()
-            tokens, ages, masks = batch_to_tensors(batch, block_size=128)
-
-            # apply dropout
-            # 
             
-            # logits, _, _, _ = model(tokens, ages, validation_loss_mode=True)
+            tokens, ages, masks = batch_to_tensors(batch, block_size=128)
             logits, _, _ = model(tokens, ages, validation_loss_mode=True)
 
             # logits, _, _, _ = model(tokens, ages, Y, B, validation_loss_mode=True)
@@ -193,47 +167,52 @@ class Trainer():
 
 
 # %%
-import os, sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from delphi.model.components import (
     EmbedConfig,
     DelphiConfig,
-    DomainEmbedding,
-    DelphiEmbedding,
+    # DomainEmbedding,
+    # DelphiEmbedding,
 )
 
-root_path = "../data/transforms"
+from pathlib import Path
+
+root_path = Path("../data/transforms")
 
 domain_config = {
 
-    # 'diseases': EmbedConfig(
-    #    projector="embed",
-    #    input_size=None,
-    #    path=os.path.join(root_path, 'diseases'),
-    #    predict=True
-    #),
+    'diseases': EmbedConfig(
+       projector="embed",
+       input_size=None,
+       path=root_path / 'diseases',
+       predict=True,
+    #    mask_ties=True
+    ),
     'death': EmbedConfig(
         projector="embed",
         input_size=None,
-        path=os.path.join(root_path, 'death'),
-        predict=True
+        path=root_path / 'death',
+        predict=True,
+        # mask_ties=True
     ),
     'lifestyle': EmbedConfig(
         projector="embed",
         input_size=None,
-        path=os.path.join(root_path, 'lifestyle'),
-        age_jitter=True
+        path=root_path / 'lifestyle',
+        age_jitter=True,
+        # mask_ties=False
     ),
     "hla_alleles": EmbedConfig(
         projector="embed",
         input_size=None,
-        path=os.path.join(root_path, 'hla_alleles'),
+        path=root_path / 'hla_alleles',
+        # mask_ties=False
     ),
     "sex": EmbedConfig(
         projector="embed",
         input_size=None,
-        path=os.path.join(root_path, 'sex'),
+        path=root_path / 'sex',
+        # mask_ties=False
     )    
 }
 
@@ -242,14 +221,22 @@ cfg = DelphiConfig(
     domains=domain_config,
 )
 
-import logging, time
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# %%
+import data.dataset
+import importlib
+
+data.dataset = importlib.reload(data.dataset)
+DelphiDataset = data.dataset.DelphiDataset
+DelphiBatchDataset = data.dataset.DelphiBatchDataset
+DelphiDataloader = data.dataset.DelphiDataloader
+
+# from data.dataset import DelphiDataset, DelphiBatchDataset, DelphiDataloader
 
 # %%
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
 test_fold, dev_folds = [folds.pop(0)], folds
 
-dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=["subject_lists/genetic_white_ids.txt"])
+dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=[]) # "subject_lists/genetic_white_ids.txt"])
 
 t0 = time.perf_counter()
 dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config, n_samples=200)
@@ -285,6 +272,12 @@ logging.info(f"Dataloaders built in {time.perf_counter()-t0:.2f}s")
 
 config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domain_config)
 
+# %%
+
+import delphi
+delphi = importlib.reload(delphi)
+Delphi = delphi.model.transformer.Delphi
+
 t0 = time.perf_counter()
 model  = Delphi(config).to(DEVICE)
 logging.info(f"Model built in {time.perf_counter()-t0:.2f}s")
@@ -298,3 +291,25 @@ trainer = Trainer(model, *dataloaders, optimizer=optimizer)
 t0 = time.perf_counter()
 trainer.train()
 logging.info(f"Training finished in {time.perf_counter()-t0:.2f}s")
+
+# %%
+import data.dataset
+data.dataset = importlib.reload(data.dataset)
+DelphiDataset = data.dataset.DelphiDataset
+DelphiDataloader = data.dataset.DelphiDataloader
+
+dataset  = DelphiDataset(subjects=folds, **dataset_config, n_samples=None, required_domains=['diseases', 'lifestyle', 'sex'])
+dataloader = DelphiDataloader(dataset, batch_size=64, num_workers=8)
+
+from tqdm import tqdm
+for batch in tqdm(dataloader):
+    pass
+    
+# %%
+kk = next(iter(dataloader))
+kk.token_id = kk.token_id.cat.codes
+kk
+
+# dataset.merge_data().info()
+# dataset.merge_data().reset_index().groupby("subject_id").count()['age'].hist(bins=50)
+# %%

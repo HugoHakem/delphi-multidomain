@@ -6,11 +6,9 @@ os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
 os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
 
 import time
-import math
-import pickle as pkl
 from contextlib import nullcontext
-import ipdb
 
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
@@ -22,10 +20,6 @@ from torch.utils.data import Dataset
 from pprint import pprint
 from collections import defaultdict
 
-import mlflow
-from mlflow.tracking import MlflowClient
-from mlflow.entities import Metric
-
 from dataclasses import asdict, dataclass, field
 from typing import Iterator, Optional
 
@@ -36,38 +30,28 @@ import warnings
 from typing import List, Dict, Set
 from torch.utils.data import DataLoader
 
+import logging
+
 # from delphi.data.ukb import UKBDataConfig, UKBDataset
 DEVICE='cuda'
 
-# %%
-# from delphi.data.multimodal import (
-    # UKBDataConfig,
-    # load_sequences,
-# )
-
-# from model import Delphi, DelphiConfig
-
 from utils.utils import get_p2i, get_batch
 
-# import hla_genes
-# from hla_genes import get_hla_protein_sequences
-
-# from delphi.data.utils import train_iter
-# from delphi.env import DELPHI_CKPT_DIR
-# from delphi.log import TrainLogConfig, TrainLogger
-
-from delphi.model.components import (
-    DelphiConfig,
-    # parse_token_list,
-    # validate_model_config,
-    # validate_model_config_for_finetuning,
-)
+from delphi.model.components import DelphiConfig
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
+from typing import Union
 
-# %%
+from easydict import EasyDict
+
+# ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
 class TokenDomain:
-    def __init__(self, path: str, predict: bool, age_jitter: bool):
+    
+    '''
+    '''
+
+    def __init__(self, path: str, predict: bool, age_jitter: bool, subjects: Union[None, set]=None):
         """
         Load a single domain: tokenizer.yaml + tokens.csv
         """
@@ -75,30 +59,78 @@ class TokenDomain:
         self.predict = predict
         self.age_jitter = age_jitter
         self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))
+        
         self.tokens = self._load_tokens(os.path.join(path, "tokens.csv"))
+
+        if subjects is not None:
+            self.tokens = self.tokens.query("subject_id in @subjects")
+
+        self.tokens["token_id"] = pd.Categorical(
+            self.tokens["token_id"].map(self.tokenizer),
+            categories=self.tokenizer.values()
+            # ordered=True
+        )
 
     def _load_tokenizer(self, path: str) -> Dict:
         with open(path, "r") as f:
-            tok = yaml.safe_load(f)
-        return tok
+            tokenizer = yaml.safe_load(f)        
+        return { idx: token for idx, token in enumerate(tokenizer) } 
 
     def _load_tokens(self, path: str) -> pd.DataFrame:
         if not os.path.exists(path):
             assert False, f"Tokens file {path} does not exist"
             return pd.DataFrame(columns=["subject_id", "token_id", "age"])
         df = pd.read_csv(path)
+        
         # enforce schema
         if "subject_id" not in df.columns or "token_id" not in df.columns:
             raise ValueError(f"Invalid tokens file {path}, must contain subject_id and token_id")
         if "age" not in df.columns:
             df["age"] = None
+
         return df
     
+    
+    def filter_subjects(self, subjects: set):
+
+        from copy import deepcopy
+        filtered_domain = deepcopy(self)
+        filtered_domain.tokens = filtered_domain.tokens.query("subject_id in @subjects")
+        return filtered_domain
+
+
+    def __repr__(self):
+
+        return repr( 
+            self.tokens.\
+            assign( **{"age (years)": (self.tokens.age / 363.25).round(2)} ).\
+            drop("age", axis=1).\
+            set_index("subject_id") 
+        )
+    
+
+    def _repr_html_(self):
+        return self.tokens.\
+            assign( **{"age (years)": (self.tokens.age / 363.25).round(2)} ).\
+            drop("age", axis=1).\
+            set_index("subject_id").\
+            _repr_html_()
+             
+    
+    def __getitem__(self, subject_id):
+
+        # corner case
+
+        return self.tokens.set_index("subject_id").loc[[subject_id]].\
+            assign( **{"age (years)": lambda df: (df.age / 363.25).round(2)} ).\
+            drop("age", axis=1)
+            # set_index("subject_id")
+
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————    
 
 class DelphiDataset:
 
-    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None):
+    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None, required_domains=['sex', 'diseases']):
         """
         Args:
             root: base data directory
@@ -106,65 +138,123 @@ class DelphiDataset:
             fold: if specified, restrict subjects to that fold
             exclusions: list of exclusion list filenames under exclusion_lists/
         """
-        self.root = root
-        self.domains = {
-            dname: TokenDomain(os.path.join(root, dname), predict=dinfo.predict, age_jitter=dinfo.age_jitter) 
-            for dname, dinfo in domains.items()
-        }
-        
-        # print(subjects)
-        self.subjects = pd.concat([
-            pd.read_csv(os.path.join(root, subj_file), names=["subject_id"]) for subj_file in subjects
+
+        self.root = Path(root)
+
+        # Load the data        
+        self.domains = EasyDict()
+        for dname, dinfo in domains.items():
+            datafile = self.root / dname
+            self.domains[dname] = TokenDomain(datafile, predict=dinfo.predict, age_jitter=dinfo.age_jitter) 
+
+        # ——————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
+        self.included_subjects = pd.concat([
+            pd.read_csv(self.root / subj_file, names=["subject_id"]) for subj_file in subjects
         ])
+                
+        self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
+
+        self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
+        self._subjects = self.filter_required_domains(self._subjects, required_domains)        
 
         if n_samples is not None:
-           self.subjects = self.subjects.sample(n_samples)
+            self._subjects = self._subjects.sample(n_samples)
+        
+        self._subjects = set(self._subjects.subject_id.to_list())
+
+        # —————————————————————————————————————————————————————————————————————
+        
+        # Now we filter each domain for the final list of allowed subjects
+        for dname in self.domains:
+            self.domains[dname] = self.domains[dname].filter_subjects(self.subjects)
+
+
+        # "re-index" categories:
+        all_cats = pd.Index([])
+        for dname, domain in self.domains.items():
+            all_cats = all_cats.union(domain.tokens['token_id'].cat.categories)        
+        
+        for dname in self.domains:
+            self.domains[dname].tokens['token_id'] = self.domains[dname].tokens['token_id'].cat.set_categories(all_cats)    
+            self.domains[dname].tokens = self.domains[dname].tokens.set_index("subject_id")
+    
+        self.categories = all_cats.tolist()
+
+           
+    @property
+    def subjects(self):
+        return list(self._subjects)
+
+
+    # This returns all data (all subjects and domains) merged into a single dataframe
+    def merge_data(self):
+        return pd.concat([ self.domains[dname].tokens for dname in self.domains ]).\
+            sort_values(['subject_id', 'age']).\
+            set_index('subject_id')
+
+
+    def list_domains(self):
+        return list(self.domains.keys())
+
+
+    def filter_required_domains(self, subjects: pd.DataFrame, required_domains: List[str]) -> pd.DataFrame:
+        
+        """
+        Keep only subjects that have at least one token in all required domains.
+        """
+        
+        for dname in required_domains:
+            if dname not in self.domains:
+                logging.debug(f"Required domain '{dname}' not found in self.domains. Returning empty DataFrame.")
+                return subjects.iloc[0:0]
+
+            # Get set of subjects present in this domain
+            domain_subjects = self.domains[dname].tokens["subject_id"].astype(str).unique()
+            logging.debug(f"Domain '{dname}': {len(domain_subjects)} unique subjects.")
+
+            # Intersect with current subject list
+            before_count = len(subjects)
+            subjects = subjects[subjects["subject_id"].astype(str).isin(domain_subjects)]
+            after_count = len(subjects)
+            logging.debug(
+                f"Filtered by domain '{dname}': {before_count} → {after_count} subjects remaining."
+            )
+
+        return subjects
+
+
+    def get_excluded_subjects(self, exclusion_files):
         
         self.excluded_subjects = set()
-        for excl in exclusions:
+        for excl in exclusion_files:
             excl_path = os.path.join(root, excl)
             if os.path.exists(excl_path):
                 ids = open(excl_path).read().strip().splitlines()
-                self.excluded_subjects |= set(map(str, ids))
-
-        self.subjects = self.subjects[~self.subjects["subject_id"].astype(str).isin(self.excluded_subjects)]        
-
+                self.excluded_subjects |= set(map(str, ids))        
+        return self.excluded_subjects
+ 
 
     def get_subject_events(self, subject_id: str) -> Dict[str, pd.DataFrame]:
+        
         """
         Return all events for a subject, per domain.
-        """
+        """        
         subject_events = {}
-        for dname, domain in self.domains.items():
-            tokens = domain.tokens
-            tokens_subj = tokens[tokens["subject_id"].astype(str) == str(subject_id)]
-            subject_events[dname] = tokens_subj
+        for dname, domain in self.domains.items():            
+            # tokens_subj = tokens[tokens["subject_id"].astype(str) == str(subject_id)]            
+            try:
+                tokens_subj = domain.tokens.loc[[subject_id]]
+            except KeyError:
+                tokens_subj = pd.DataFrame()
+            # tokens_subj = domain.tokens.loc[subject_id] # [tokens["subject_id"].astype(str) == str(subject_id)]
+            subject_events[dname] = tokens_subj         
+
         return subject_events
 
 
-    def iter_subjects(self):
-        """Iterate over subject IDs in dataset"""
-        for sid in self.subjects["subject_id"].astype(str).tolist():
-            yield sid, self.get_subject_events(sid)
-
-    def validate(self):
-        """Check domain-specific constraints, e.g. age presence"""
-        for dname, domain in self.domains.items():
-            if dname == "diagnosis":
-                missing_age = domain.events["age"].isna().sum()
-                if missing_age > 0:
-                    raise ValueError(f"{dname} domain has {missing_age} missing ages")
-            if dname == "genetics":
-                with_age = domain.events["age"].notna().sum()
-                if with_age > 0:
-                    warnings.warn(f"{dname} domain has {with_age} rows with age provided (should not).")
-
-
     @staticmethod
-    def get_p2i(data):
-        patient_ids = data[:, 0].astype(int)
-        _, idx_start, counts = np.unique(patient_ids, return_index=True, return_counts=True)
-        return np.stack([idx_start, counts], axis=1)
+    def is_ukb_id(index):
+        return index > 1000000
 
 
     def __len__(self):
@@ -172,58 +262,61 @@ class DelphiDataset:
 
 
     def __getitem__(self, index):
-        if isinstance(index, int):
-            index = self.subjects.iloc[index]["subject_id"]
-        return self.get_subject_events(index)
 
+        import time
+        # t0 = time.perf_counter()
 
-    def get_subject_array(self, subject_id: str) -> np.ndarray:
-                
-        arrays = []
-        for dname, domain in self.domains.items():
-            df = domain.tokens
-            tokens_subj = df[df["subject_id"].astype(str) == str(subject_id)]
-            if tokens_subj.empty:
-                continue
-            print(tokens_subj)
-            arr = tokens_subj[["subject_id", "age", "token_id"]].to_numpy()
-            arrays.append(arr)
-        if not arrays:
-            return np.zeros((0, 3))
-        return np.vstack(arrays)
+        if not self.is_ukb_id(index) and isinstance(index, int):
+            index = self.subjects[index]
 
-
-
-class DelphiBatchDataset(torch.utils.data.Dataset):
-
-    def __init__(self, delphi_dataset):
-        self.ds = delphi_dataset
+        # assert index in self._subjects, f"{index} not in subjects."
+        out = self.get_subject_events(index)
+        # print(f"[getitem {index}] {time.perf_counter()-t0:.3f}s")
         
-        self.base = delphi_dataset
-        while isinstance(self.base, torch.utils.data.Subset):
-            self.base = self.base.dataset
+        return out
 
-    @property
-    def subjects(self):
-        return self.base.subjects
 
-    def __len__(self):
-        return len(self.ds)
+    # def iter_subjects(self):
+    #     """Iterate over subject IDs in dataset"""
+    #     for sid in self.subjects["subject_id"].astype(str).tolist():
+    #         yield sid, self.get_subject_events(sid)
 
-    def __getitem__(self, idx):
-        subj_id = self.ds.subjects.iloc[idx]["subject_id"]
-        subject_events = self.ds.get_subject_events(subj_id)
 
-        domains_dict = {}
-        for dname, df in subject_events.items():
-            arr = df[["subject_id", "age", "token_id"]].to_numpy()
-            domains_dict[dname] = arr
+    # def validate(self):
+    #     """Check domain-specific constraints, e.g. age presence"""
+    #     for dname, domain in self.domains.items():
+    #         if dname == "diagnosis":
+    #             missing_age = domain.events["age"].isna().sum()
+    #             if missing_age > 0:
+    #                 raise ValueError(f"{dname} domain has {missing_age} missing ages")
+    #         if dname == "genetics":
+    #             with_age = domain.events["age"].notna().sum()
+    #             if with_age > 0:
+    #                 warnings.warn(f"{dname} domain has {with_age} rows with age provided (should not).")
 
-        return {
-          "subject_id": subj_id,
-          "domains": domains_dict,
-          "domains_metadata": self.ds.domains
-        }
+
+    # @staticmethod
+    # def get_p2i(data):
+    #     patient_ids = data[:, 0].astype(int)
+    #     _, idx_start, counts = np.unique(patient_ids, return_index=True, return_counts=True)
+    #     return np.stack([idx_start, counts], axis=1)
+
+
+    # def get_subject_array(self, subject_id: str) -> np.ndarray:                
+    #     arrays = []
+    #     for dname, domain in self.domains.items():
+    #         df = domain.tokens
+    #         tokens_subj = df[df["subject_id"].astype(str) == str(subject_id)]
+    #         if tokens_subj.empty:
+    #             continue
+    #         print(tokens_subj)
+    #         arr = tokens_subj[["subject_id", "age", "token_id"]].to_numpy()
+    #         arrays.append(arr)
+    #     if not arrays:
+    #         return np.zeros((0, 3))
+    #     return np.vstack(arrays)
+
+  
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 
@@ -411,8 +504,6 @@ def build_batch_indices(traj_start_idx, block_size):
     """Return indices into data for each subject's window."""
     return np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
 
-# block_size=48, select="left", padding="regular"
-# no_event_token_rate=5
 
 def process_domain(data, domain_id, p2i,  device="", age_jitter=False, predict=True, gen=None):
 
@@ -428,7 +519,6 @@ def process_domain(data, domain_id, p2i,  device="", age_jitter=False, predict=T
     # print("batch_idx.max():", batch_idx.max())
     # print("batch_idx.shape:", batch_idx.shape)
 
-    import ipdb; ipdb.set_trace()
     # tokens  = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
     # ages    = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
     
@@ -442,7 +532,7 @@ def process_domain(data, domain_id, p2i,  device="", age_jitter=False, predict=T
     # domain_column  = torch.from_numpy([domain_id]*len(data)).astype(np.int64)
     # predict_column = torch.from_numpy([predict]  *len(data)).astype(np.int64)
 
-    return ages, domains, tokens, predict_column
+    # return ages, domains, tokens, predict_column
         
     # max_age = ages.max(1, keepdim=True).values
     # tokens, ages = insert_no_event_tokens(tokens, ages, max_age, no_event_token_rate=no_event_token_rate, padding=padding, gen=gen)
@@ -455,7 +545,8 @@ def process_domain(data, domain_id, p2i,  device="", age_jitter=False, predict=T
         # no target: just return inputs
         # return {"x": tokens.to(device), "a": ages.to(device), "y": None, "b": None, "predict": False, "d": domains.to(device)}
 
-
+# block_size=48, select="left", padding="regular"
+# no_event_token_rate=5
 
 def age_jitter_tokens(tokens, ages, generator=None):
     """
@@ -503,12 +594,12 @@ def insert_no_event_tokens(tokens, ages, max_age, no_event_token_rate=5, padding
     return tokens, ages
 
 
-def sort_by_age(tokens, ages):
-    """Ensure chronological order."""
-    s = torch.argsort(ages, 1)
-    tokens = torch.gather(tokens, 1, s)
-    ages   = torch.gather(ages, 1, s)
-    return tokens, ages
+# def sort_by_age(tokens, ages):
+#     """Ensure chronological order."""
+#     s = torch.argsort(ages, 1)
+#     tokens = torch.gather(tokens, 1, s)
+#     ages   = torch.gather(ages, 1, s)
+#     return tokens, ages
 
 
 def make_targets(tokens, ages, block_size, device=DEVICE, cut_batch=False):
@@ -540,8 +631,64 @@ def get_domain_id(domain_name):
 
     return domain_id
 
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————   
 
-def collate_fn_domains(batch, block_size=48, device=DEVICE):
+# class Subject:
+
+#     def __init__(self, data_domains):
+        
+#         self.data = pd.concat([ data_domains[dname].tokens for dname in data_domains ]).\
+#             sort_values(['subject_id', 'age']).\
+#             set_index('subject_id')
+
+
+#     def _repr_html_(self):
+#         pass
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————   
+
+
+# class DelphiBatchDataset(torch.utils.data.Dataset):
+
+#     def __init__(self, delphi_dataset):
+#         self.ds = delphi_dataset
+        
+#         self.base = delphi_dataset
+
+#     @property
+#     def subjects(self):
+#         return self.base.subjects
+
+#     def __len__(self):
+#         return len(self.ds)
+
+#     def __getitem__(self, idx):
+#         t0 = time.perf_counter()
+#         subj_id = self.ds.subjects[idx]
+#         # subj_id = self.ds.subjects.iloc[idx]["subject_id"]
+    
+#         # medir get_subject_events
+#         t1 = time.perf_counter()
+#         subject_events = self.ds.get_subject_events(subj_id)
+#         t2 = time.perf_counter()
+    
+#         domains_dict = {}
+#         for dname, df in subject_events.items():
+#             arr = df[["subject_id", "age", "token_id"]].to_numpy()
+#             domains_dict[dname] = arr
+#         t3 = time.perf_counter()
+    
+#         print(f"[getitem] total={t3-t0:.3f}s, get_events={t2-t1:.3f}s, df->numpy={t3-t2:.3f}s")
+    
+#         return {
+#           "subject_id": subj_id,
+#           "domains": domains_dict,
+#           "domains_metadata": self.ds.domains
+#     }
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+def collate_fn_domains(batch, device=DEVICE):
 
     """
     Collate function that processes each domain separately, using domain metadata.
@@ -553,50 +700,35 @@ def collate_fn_domains(batch, block_size=48, device=DEVICE):
       }
     """
 
-    subject_ids = [item["subject_id"] for item in batch]
-    out = {"subject_ids": subject_ids, "domains": {}}        
+    import time
+    t0 = time.perf_counter()
 
-    # Group arrays per domain
+    # subject_ids = [item["subject_id"] for item in batch]
     domains_dict = {}
     for item in batch:
-        for dname, arr in item["domains"].items():
-            if dname not in domains_dict:
-                domains_dict[dname] = []
-            domains_dict[dname].append(arr)        
-   
-    domain_ids = { dname: get_domain_id(dname) for dname in domains_dict }
+        for dname, arr in item.items():
+            domains_dict.setdefault(dname, []).append(arr)
+ 
+    t1 = time.perf_counter()
+    # print(f"[to dictionary] {t1-t0:.3f}s")
 
     all_data = []
     for dname, arrs in domains_dict.items():
-
-        data = np.concatenate(arrs)
-        p2i_map = DelphiDataset.get_p2i(data)
-        domain_id = get_domain_id(dname)
-        # grab meta info from the first item in the batch
-        domain_meta = batch[0]["domains_metadata"][dname]
-        
-        domain_data = pd.DataFrame(data, columns=["subject_id", "age", "token_id"]).assign(
-            domain_id=pd.Categorical([dname]*len(data), categories=domain_ids.keys()), 
-            predict=domain_meta.predict
-        )
-
+        t_dom0 = time.perf_counter()
+        domain_data = pd.concat(arrs)
+        t_dom1 = time.perf_counter()
+        # domain_data = pd.DataFrame(data, columns=["subject_id","age","token_id"])
         all_data.append(domain_data)
-    
-    return pd.concat(all_data, axis=0).sort_values(["subject_id", "age"])
+        t_dom2 = time.perf_counter()
+        # print(f"[collate] domain {dname}: concat={t_dom1-t_dom0:.3f}s, df={t_dom2-t_dom1:.3f}s")
 
-    # out["domains"][dname] = process_domain(
-        # data,
-        # domain_id,
-        # p2i=p2i_map,
-        # block_size=block_size,
-        # device=device,
-        # age_jitter=domain_meta.age_jitter,
-        # predict=domain_meta.predict
-    # )
+    merged = pd.concat(all_data, axis=0)
+    t2 = time.perf_counter()
+    merged = merged.reset_index().sort_values(["subject_id","age"])
+    t3 = time.perf_counter()
 
-    # import ipdb; ipdb.set_trace()
-    # enmascaramos aca? creo que es un buen lugar para hacerlo
-    # concatenamos dominios
+    # print(f"[collate] group+concat={t1-t0:.3f}s, pd.concat={t2-t1:.3f}s, sort={t3-t2:.3f}s, total={t3-t0:.3f}s")
+    return merged
 
 
 class DelphiDataloader(DataLoader):
