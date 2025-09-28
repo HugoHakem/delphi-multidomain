@@ -14,6 +14,7 @@ from delphi.model.components import (
     CompetingExpHead,
     CrossEntropyHead,
     DelphiEmbedding,
+    AgeEncoding,
     causal_attention_mask,
     target_mask,
     ties_adjusted_delta_t,
@@ -188,8 +189,6 @@ def initialize_weights(model: torch.nn.Module, config: DelphiConfig):
 
 class Delphi(torch.nn.Module):
     
-    model_type = "delphi-m4"
-
     def __init__(self, config: DelphiConfig):
         super().__init__()        
         self.config = config
@@ -202,6 +201,7 @@ class Delphi(torch.nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 embed=DelphiEmbedding(config),
+                age_embedding=AgeEncoding(n_embd=config.n_embd),
                 drop=nn.Dropout(config.dropout),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
                 ln_f=LayerNorm(config.n_embd, bias=config.bias),
@@ -243,21 +243,21 @@ class Delphi(torch.nn.Module):
     def build_attention_mask(self, idx, age, targets, targets_age, mask_ties):
 
         # causal self-attention mask, to ensure that attention is only applied to the left in the input sequence
-        device = idx.device
+        dd = dict(device=idx.device)
         # Do not attend to padded positions
         attn_mask = (idx>0).view(idx.size(0), 1, 1, idx.size(1)) * (idx>0).view(idx.size(0), 1, idx.size(1), 1)  
         
-        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0
+        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), **dd))[None,None,:,:] > 0
         
         # if targets is not None and self.config.mask_ties:
         if targets is not None and mask_ties:
             # Mask co-occuring tokens
             attn_mask *= ((age.view(idx.size(0),1,1,idx.size(1)) != targets_age.view(idx.size(0),1,idx.size(1),1))) 
-            attn_mask += (attn_mask.sum(-1, keepdim=True)==0) * torch.diag(torch.ones(idx.size(1), device=device)) > 0
+            attn_mask += (attn_mask.sum(-1, keepdim=True)==0) * torch.diag(torch.ones(idx.size(1), **dd)) > 0
         
         # Except for padding
-        attn_mask = attn_mask + (idx==0).view(idx.size(0), 1, 1, idx.size(1)) * torch.diag(torch.ones(idx.size(1), device=device)) > 0 
-        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0
+        attn_mask = attn_mask + (idx==0).view(idx.size(0), 1, 1, idx.size(1)) * torch.diag(torch.ones(idx.size(1), **dd)) > 0 
+        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), **dd))[None,None,:,:] > 0
         
         return attn_mask
     
@@ -340,27 +340,23 @@ class Delphi(torch.nn.Module):
         return logits
 
 
-    def forward(
-        self,
-        idx: torch.Tensor,
-        age: torch.Tensor,
-        # modality: torch.Tensor,
-        # biomarker: Optional[dict[str, torch.Tensor]] = None,
+    def forward(self, idx: torch.Tensor, age: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         targets_age: Optional[torch.Tensor] = None,
         validation_loss_mode: bool = False,
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], torch.Tensor]:
 
-        
-        x = self.transformer.embed(x=idx, t=age) #, M=modality, biomarker_x=biomarker)
+        self.set_valid_loss_mode(validation_loss_mode)
+
+        x = self.transformer.embed(x=idx) 
+        # x = self.insert_no_event_tokens(x)
+        x = self.transformer.age_embedding(x=x, t=age)
         x = self.transformer.drop(x)
 
         attn_mask = causal_attention_mask(
             pad=self.is_not_padding(idx), t1=targets_age, t0=age, mask_ties=self.config.mask_ties
         )
-
-        self.set_valid_loss_mode(validation_loss_mode)
-
+        
         att = []
         for block in self.transformer.h:
             x, a = block(x, attn_mask)
@@ -378,8 +374,7 @@ class Delphi(torch.nn.Module):
                 logits_cp[..., ignored_tokens] = -torch.inf
 
             dt = ties_adjusted_delta_t(
-                t0=age,
-                t1=targets_age,
+                t0=age, t1=targets_age,
                 attn_mask=attn_mask,
                 mask_ties=self.config.mask_ties,
                 eps=0.0 if self.config.zero_inflate else 1.0,
@@ -392,8 +387,8 @@ class Delphi(torch.nn.Module):
             loss_dt = torch.mean(loss_dt[is_valid_target])
 
             loss = {
-                "loss_ce": loss_ce, # * self.config.ce_beta,
-                "loss_dt": loss_dt, # * self.config.dt_beta,
+                "loss_ce": loss_ce,
+                "loss_dt": loss_dt, 
                 "loss": loss_ce * self.config.ce_beta + loss_dt * self.config.dt_beta,
             }
         else:
