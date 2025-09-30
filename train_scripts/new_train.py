@@ -8,6 +8,7 @@ import time
 import math
 import pickle as pkl
 from contextlib import nullcontext
+from tqdm import tqdm
 
 import numpy as np
 import pandas as pd
@@ -48,6 +49,8 @@ from utils.utils import get_p2i, get_batch
 
 import data.dataset
 
+root_path = Path("../data/transforms")
+
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
@@ -82,16 +85,16 @@ class TrainBaseConfig:
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
-class DelphiTokenizer():
-
-    def __init__(self, mapping):
-        self.mapping = mapping
-
-    def tokens_to_ids(self, tokens):
-        return [self.token_to_id[t] for t in tokens]
-
-    def ids_to_tokens(self, ids):
-        return [self.id_to_token[int(id_)] for id_ in ids]
+# class DelphiTokenizer():
+# 
+#     def __init__(self, mapping):
+#         self.mapping = mapping
+# 
+#     def tokens_to_ids(self, tokens):
+#         return [self.token_to_id[t] for t in tokens]
+# 
+#     def ids_to_tokens(self, ids):
+#         return [self.id_to_token[int(id_)] for id_ in ids]
 
 
 def batch_to_tensors(df, block_size):
@@ -102,7 +105,7 @@ def batch_to_tensors(df, block_size):
     tokens, ages, mask = [], [], []
 
     for _, g in grouped:
-        g = g.head(block_size).copy()  # o pad si hay menos
+        g = g.head(block_size).copy()  # or pad if there are less
         if len(g) < block_size:
             pad_len = block_size - len(g)
             g = pd.concat([g, pd.DataFrame({
@@ -132,6 +135,7 @@ class Trainer():
         self.test_loader     = test_loader
         self.optimizer   = optimizer
 
+    # ——————————————————————————————————————————————————————————————————————————————
     def train(self):
 
         for batch in self.training_loader:
@@ -147,6 +151,7 @@ class Trainer():
         pass
 
 
+    # ——————————————————————————————————————————————————————————————————————————————    
     def evaluate(self):
 
         out = {}
@@ -169,13 +174,10 @@ class Trainer():
                 losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
 
             out[split] = losses.mean(0)
+
         model.train()   
         return out
 
-
-
-
-root_path = Path("../data/transforms")
 
 domain_config = {
 
@@ -265,23 +267,6 @@ logging.info(f"Dataloaders built in {time.perf_counter()-t0:.2f}s")
 
 config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domain_config)
 
-# %%
-delphi = importlib.reload(delphi)
-Delphi = delphi.model.transformer.Delphi
-
-t0 = time.perf_counter()
-model  = Delphi(config).to(DEVICE)
-logging.info(f"Model built in {time.perf_counter()-t0:.2f}s")
-
-t0 = time.perf_counter()
-optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
-logging.info(f"Optimizers configured in {time.perf_counter()-t0:.2f}s")
-
-trainer = Trainer(model, *dataloaders, optimizer=optimizer)
-
-# t0 = time.perf_counter()
-# trainer.train()
-# logging.info(f"Training finished in {time.perf_counter()-t0:.2f}s")
 
 # %%
 import data.dataset
@@ -290,14 +275,54 @@ DelphiDataset = data.dataset.DelphiDataset
 DelphiDataloader = data.dataset.DelphiDataloader
 
 dataset  = DelphiDataset(subjects=folds, **dataset_config, n_samples=None, required_domains=['diseases', 'lifestyle', 'sex'])
-dataloader = DelphiDataloader(dataset, batch_size=64, num_workers=8)
+dataloader = DelphiDataloader(dataset, batch_size=64, num_workers=16)
 
-from tqdm import tqdm
-for batch in tqdm(dataloader):
-    pass
-    
 # %%
+# trainer = Trainer(model, *dataloaders, optimizer=optimizer)
+
+# t0 = time.perf_counter()
+# trainer.train()
+# logging.info(f"Training finished in {time.perf_counter()-t0:.2f}s")
+
+
+# %%
+
+delphi = importlib.reload(delphi)
+Delphi = delphi.model.transformer.Delphi
+model  = Delphi(config).to(DEVICE)
+optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
+
 kk = next(iter(dataloader))
-kk.token_id = kk.token_id.cat.codes
-# dataset.merge_data().info()
-# dataset.merge_data().reset_index().groupby("subject_id").count()['age'].hist(bins=50)
+
+from easydict import EasyDict
+
+pp = EasyDict()
+ages = EasyDict()
+
+for dname in model.transformer.embed.domain_embed:
+    
+    x    = torch.tensor(kk[dname].token_id.cat.codes.values).type(torch.int32)
+    ages[dname] = torch.tensor(kk[dname].age.values).type(torch.int32)
+
+    x_embed = model.transformer.embed.domain_embed[dname].projector(x)
+    print(f"{dname}: {x_embed.shape}")
+    age_embed = model.transformer.embed.age_encoding(ages[dname].unsqueeze(1))
+    print(f"{dname}: {age_embed.shape}")
+
+    pp[dname] = x_embed + age_embed
+
+
+# %%
+
+"hla_alleles"
+"sex"
+"lifestyle"
+"diseases"
+"death"
+
+pp.diseases.shape
+ages['diseases']
+
+# %%
+dataset[9]['diseases']
+# %%

@@ -354,7 +354,9 @@ class Delphi(torch.nn.Module):
         x = self.transformer.drop(x)
 
         attn_mask = causal_attention_mask(
-            pad=self.is_not_padding(idx), t1=targets_age, t0=age, mask_ties=self.config.mask_ties
+            pad=self.is_not_padding(idx), 
+            t1=targets_age, t0=age, 
+            mask_ties=self.config.mask_ties
         )
         
         att = []
@@ -436,7 +438,7 @@ class Delphi(torch.nn.Module):
             }
             new_state = {}
             for k, v in state_dict.items():
-                new_key = mapping.get(k, k)  # usa el mapeo si existe, si no deja igual
+                new_key = mapping.get(k, k)
                 new_state[new_key] = v
 
             return new_state        

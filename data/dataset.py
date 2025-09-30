@@ -74,7 +74,7 @@ class TokenDomain:
     def _load_tokenizer(self, path: str) -> Dict:
         with open(path, "r") as f:
             tokenizer = yaml.safe_load(f)        
-        return { idx: token for idx, token in enumerate(tokenizer) } 
+        return { idx: token for idx, token in enumerate(tokenizer) }  
 
     def _load_tokens(self, path: str) -> pd.DataFrame:
         if not os.path.exists(path):
@@ -130,7 +130,7 @@ class TokenDomain:
 
 class DelphiDataset:
 
-    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None, required_domains=['sex', 'diseases']):
+    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None, required_domains=['sex', 'diseases'], merge_namespaces=False):
         """
         Args:
             root: base data directory
@@ -168,17 +168,18 @@ class DelphiDataset:
         for dname in self.domains:
             self.domains[dname] = self.domains[dname].filter_subjects(self.subjects)
 
-
         # "re-index" categories:
-        all_cats = pd.Index([])
-        for dname, domain in self.domains.items():
-            all_cats = all_cats.union(domain.tokens['token_id'].cat.categories)        
         
-        for dname in self.domains:
-            self.domains[dname].tokens['token_id'] = self.domains[dname].tokens['token_id'].cat.set_categories(all_cats)    
+        if merge_namespaces:
+            all_cats = pd.Index([])
+            for dname, domain in self.domains.items():
+                all_cats = all_cats.union(domain.tokens['token_id'].cat.categories)        
+            for dname in self.domains:
+                self.domains[dname].tokens['token_id'] = self.domains[dname].tokens['token_id'].cat.set_categories(all_cats)                    
+            self.categories = all_cats.tolist()
+
+        for dname, domain in self.domains.items():
             self.domains[dname].tokens = self.domains[dname].tokens.set_index("subject_id")
-    
-        self.categories = all_cats.tolist()
 
            
     @property
@@ -189,8 +190,10 @@ class DelphiDataset:
     # This returns all data (all subjects and domains) merged into a single dataframe
     def merge_data(self):
         return pd.concat([ self.domains[dname].tokens for dname in self.domains ]).\
-            sort_values(['subject_id', 'age']).\
-            set_index('subject_id')
+            sort_index().\
+            sort_values(['age'])
+            
+            # set_index('subject_id')
 
 
     def list_domains(self):
@@ -439,45 +442,43 @@ def get_batch(
     else:           
         return x, a, y, b
 
-# %%
+# def collate_fn(batch, block_size=48, device=""):
+#     """
+#     batch: list of items returned by DelphiBatchDataset
+#            each item is { "subject_id": ..., "domains": {dname: arr} }
+#     """
+#     data_list, subject_ids = [], []
+#     for item in batch:
+#         subj_id = item["subject_id"]
+#         subject_ids.append(subj_id)
 
-def collate_fn(batch, block_size=48, device=""):
-    """
-    batch: list of items returned by DelphiBatchDataset
-           each item is { "subject_id": ..., "domains": {dname: arr} }
-    """
-    data_list, subject_ids = [], []
-    for item in batch:
-        subj_id = item["subject_id"]
-        subject_ids.append(subj_id)
+#         # collect all domains into a single array per subject
+#         arrays = [arr for arr in item["domains"].values() if arr.size > 0]
+#         if arrays:
+#             data_list.append(np.vstack(arrays))
 
-        # collect all domains into a single array per subject
-        arrays = [arr for arr in item["domains"].values() if arr.size > 0]
-        if arrays:
-            data_list.append(np.vstack(arrays))
+#     # concatenate arrays from all subjects in the batch
+#     data = np.vstack(data_list)
 
-    # concatenate arrays from all subjects in the batch
-    data = np.vstack(data_list)
+#     # map patient_id -> (start_index, count) pairs
+#     p2i_map = DelphiDataset.get_p2i(data)
 
-    # map patient_id -> (start_index, count) pairs
-    p2i_map = DelphiDataset.get_p2i(data)
+#     # use all subjects in the batch
+#     ix = list(range(len(subject_ids)))
 
-    # use all subjects in the batch
-    ix = list(range(len(subject_ids)))
+#     # call the batching function that prepares tensors
+#     x, a, y, b = get_batch(
+#         ix=ix,
+#         data=data,
+#         p2i=p2i_map,
+#         block_size=block_size,
+#         device=device,
+#     )
 
-    # call the batching function that prepares tensors
-    x, a, y, b = get_batch(
-        ix=ix,
-        data=data,
-        p2i=p2i_map,
-        block_size=block_size,
-        device=device,
-    )
-
-    return {
-        "x": x, "a": a, "y": y, "b": b,
-        "subject_ids": subject_ids
-    }
+#     return {
+#         "x": x, "a": a, "y": y, "b": b,
+#         "subject_ids": subject_ids
+#     }
 
 
 def select_window(subject_start_and_count, block_size, data, mode="left", gen=None):
@@ -500,9 +501,9 @@ def select_window(subject_start_and_count, block_size, data, mode="left", gen=No
     return traj_start_idx.numpy()
 
 
-def build_batch_indices(traj_start_idx, block_size):
-    """Return indices into data for each subject's window."""
-    return np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
+# def build_batch_indices(traj_start_idx, block_size):
+#     """Return indices into data for each subject's window."""
+#     return np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
 
 
 def process_domain(data, domain_id, p2i,  device="", age_jitter=False, predict=True, gen=None):
@@ -712,6 +713,8 @@ def collate_fn_domains(batch, device=DEVICE):
     t1 = time.perf_counter()
     # print(f"[to dictionary] {t1-t0:.3f}s")
 
+    return { dname: pd.concat(domain, axis=0) for dname, domain in domains_dict.items()}
+    
     all_data = []
     for dname, arrs in domains_dict.items():
         t_dom0 = time.perf_counter()
@@ -732,6 +735,7 @@ def collate_fn_domains(batch, device=DEVICE):
 
 
 class DelphiDataloader(DataLoader):
+    
     def __init__(self, dataset, block_size=48, device="", return_dictionary=True, **kwargs):
         
         if return_dictionary:

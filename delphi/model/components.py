@@ -34,14 +34,18 @@ class AgeEncoding(nn.Module):
     def forward(self, x: torch.Tensor):
         """
         Arguments:
-            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+            x: Tensor, shape ``[seq_len, batch_size]``
         """
         time_years = x / self.norm_factor
-        y = torch.zeros(x.shape[0], x.shape[1], self.n_embd, device=x.device)
-        y[..., 0::2] = torch.sin(time_years * self.div_term)  # * (1-self.div_term)
-        y[..., 1::2] = torch.cos(time_years * self.div_term)  # * (1-self.div_term)
-        y = self.linear(y)
+        seq_len, batch_size = x.shape
+        y = torch.zeros(seq_len, batch_size, self.n_embd, device=x.device)
 
+        # .unsqueeze(-1) is added because with batch_size == 1 the last dimension gets contracted.
+        # with this addition it works seamlessly for both batch_size == 1 and > 1.
+        y[..., 0::2] = torch.sin(time_years.unsqueeze(-1) * self.div_term)  # * (1-self.div_term)
+        y[..., 1::2] = torch.cos(time_years.unsqueeze(-1) * self.div_term)  # * (1-self.div_term)
+        y = y.squeeze(1)
+        y = self.linear(y)
         return y
 
 
