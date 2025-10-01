@@ -18,6 +18,7 @@ from torch.utils.data import Dataset, random_split, DataLoader
 from ast import literal_eval
 import importlib
 
+from easydict import EasyDict
 from pprint import pprint
 from collections import defaultdict
 
@@ -221,108 +222,82 @@ cfg = DelphiConfig(
     domains=domain_config,
 )
 
-# %%
-
-data.dataset = importlib.reload(data.dataset)
-DelphiDataset = data.dataset.DelphiDataset
-DelphiDataloader = data.dataset.DelphiDataloader
-
-# %%
-folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
-test_fold, dev_folds = [folds.pop(0)], folds
-
-dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=[]) # "subject_lists/genetic_white_ids.txt"])
-
-t0 = time.perf_counter()
-dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config, n_samples=200)
-print(len(dev_dataset))
-
-logging.info(f"DelphiDataset(dev) built in {time.perf_counter()-t0:.2f}s")
-
-t0 = time.perf_counter()
-
-test_dataset = DelphiDataset(subjects=test_fold, **dataset_config, n_samples=100)
-
-logging.info(f"DelphiDataset(test) built in {time.perf_counter()-t0:.2f}s")
-
-# t0 = time.perf_counter()
-# dev_dataset  = DelphiBatchDataset(dev_dataset)
-# test_dataset = DelphiBatchDataset(test_dataset)
-
-# logging.info(f"BatchDatasets built in {time.perf_counter()-t0:.2f}s")
-
-n_valid      = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
-t0 = time.perf_counter()
-
-train_dataset, valid_dataset = random_split(
-    # dev_dataset, [ n_train, n_valid ],
-    dev_dataset, [ 100, 100 ],
-    generator=torch.Generator().manual_seed(42)
-)
-logging.info(f"Random split done in {time.perf_counter()-t0:.2f}s")
-
-t0 = time.perf_counter()
-dataloaders = [ DelphiDataloader(d, batch_size=32) for d in [train_dataset, valid_dataset, test_dataset] ]
-logging.info(f"Dataloaders built in {time.perf_counter()-t0:.2f}s")
-
-config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domain_config)
-
-
-# %%
 import data.dataset
 data.dataset = importlib.reload(data.dataset)
 DelphiDataset = data.dataset.DelphiDataset
 DelphiDataloader = data.dataset.DelphiDataloader
 
-dataset  = DelphiDataset(subjects=folds, **dataset_config, n_samples=None, required_domains=['diseases', 'lifestyle', 'sex'])
-dataloader = DelphiDataloader(dataset, batch_size=64, num_workers=16)
+folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
+test_fold, dev_folds = [folds.pop(0)], folds
+
+# dataset  = DelphiDataset(subjects=folds, **dataset_config, n_samples=None, required_domains=['diseases', 'lifestyle', 'sex'])
+# dataloader = DelphiDataloader(dataset, batch_size=64, num_workers=16)
+
+dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=[]) # "subject_lists/genetic_white_ids.txt"])
+dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config)
+test_dataset = DelphiDataset(subjects=test_fold, **dataset_config)
+
+n_valid      = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
+train_dataset, valid_dataset = random_split(
+    dev_dataset, [ n_train, n_valid ],
+    generator=torch.Generator().manual_seed(42)
+)
+dataloaders = [ DelphiDataloader(d, batch_size=32, num_workers=8, pin_memory=True) for d in [train_dataset, valid_dataset, test_dataset] ]
+
 
 # %%
-# trainer = Trainer(model, *dataloaders, optimizer=optimizer)
-
-# t0 = time.perf_counter()
-# trainer.train()
-# logging.info(f"Training finished in {time.perf_counter()-t0:.2f}s")
-
+%%timeit
+# dev_dataset[10]
+next(iter(dataloaders[0]))
 
 # %%
-
+# %%
 delphi = importlib.reload(delphi)
 Delphi = delphi.model.transformer.Delphi
+
+config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domain_config)
 model  = Delphi(config).to(DEVICE)
+torch.compile(model)
+
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
-
-kk = next(iter(dataloader))
-
-from easydict import EasyDict
 
 pp = EasyDict()
 ages = EasyDict()
 
-for dname in model.transformer.embed.domain_embed:
-    
-    x    = torch.tensor(kk[dname].token_id.cat.codes.values).type(torch.int32)
-    ages[dname] = torch.tensor(kk[dname].age.values).type(torch.int32)
+for i, batch in enumerate(tqdm(dataloaders[0])):
 
-    x_embed = model.transformer.embed.domain_embed[dname].projector(x)
-    print(f"{dname}: {x_embed.shape}")
-    age_embed = model.transformer.embed.age_encoding(ages[dname].unsqueeze(1))
-    print(f"{dname}: {age_embed.shape}")
+    if i == 10000:
+        break
 
-    pp[dname] = x_embed + age_embed
+    for dname in model.transformer.embed.domain_embed:
+        
+        domain_data = batch[dname]
+        
+        if len(domain_data) == 0:
+            continue
+
+        x = torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
+        ages[dname] = torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
+
+        x_embed = model.transformer.embed.domain_embed[dname].projector(x)
+        age_embed = model.transformer.embed.age_encoding(ages[dname].unsqueeze(1))
+        pp[dname] = x_embed + age_embed
+
+# %%
+subject_indices = {}
+for domain in dev_dataset.list_domains():
+    ids, counts = np.unique(dev_dataset.domains[domain].tokens.index.values, return_counts=True)
+    counts = np.array([0] + counts.tolist())
+    pp = [ (int(x), int(y)) for x, y in zip(np.cumsum(counts)[:-1], counts[1:])]
+    subject_indices[domain] = { int(id): pp[i] for i, id in enumerate(ids) }
 
 
 # %%
+subject_indices['hla_alleles']
 
+# %%
 "hla_alleles"
 "sex"
 "lifestyle"
 "diseases"
 "death"
-
-pp.diseases.shape
-ages['diseases']
-
-# %%
-dataset[9]['diseases']
-# %%

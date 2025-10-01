@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 import logging
 
 # from delphi.data.ukb import UKBDataConfig, UKBDataset
-DEVICE='cuda'
+DEVICE='cpu'
 
 from utils.utils import get_p2i, get_batch
 
@@ -104,17 +104,15 @@ class TokenDomain:
         return repr( 
             self.tokens.\
             assign( **{"age (years)": (self.tokens.age / 363.25).round(2)} ).\
-            drop("age", axis=1).\
-            set_index("subject_id") 
+            drop("age", axis=1)#.set_index("subject_id") 
         )
     
 
     def _repr_html_(self):
         return self.tokens.\
             assign( **{"age (years)": (self.tokens.age / 363.25).round(2)} ).\
-            drop("age", axis=1).\
-            set_index("subject_id").\
-            _repr_html_()
+            drop("age", axis=1)._repr_html_()
+            # set_index("subject_id").\
              
     
     def __getitem__(self, subject_id):
@@ -155,7 +153,7 @@ class DelphiDataset:
         self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
 
         self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
-        self._subjects = self.filter_required_domains(self._subjects, required_domains)        
+        self._subjects = self.filter_subj_for_required_domains(self._subjects, required_domains)        
 
         if n_samples is not None:
             self._subjects = self._subjects.sample(n_samples)
@@ -168,8 +166,8 @@ class DelphiDataset:
         for dname in self.domains:
             self.domains[dname] = self.domains[dname].filter_subjects(self.subjects)
 
-        # "re-index" categories:
-        
+        # "re-index" categories (not the default behaviour, 
+        # which consists in keeping the tokens for each namespace separate):
         if merge_namespaces:
             all_cats = pd.Index([])
             for dname, domain in self.domains.items():
@@ -181,7 +179,10 @@ class DelphiDataset:
         for dname, domain in self.domains.items():
             self.domains[dname].tokens = self.domains[dname].tokens.set_index("subject_id")
 
+        # of internal use, for faster slicing
+        self._subject_indices = self._precompute_subject_indices_per_domain()
            
+
     @property
     def subjects(self):
         return list(self._subjects)
@@ -200,7 +201,7 @@ class DelphiDataset:
         return list(self.domains.keys())
 
 
-    def filter_required_domains(self, subjects: pd.DataFrame, required_domains: List[str]) -> pd.DataFrame:
+    def filter_subj_for_required_domains(self, subjects: pd.DataFrame, required_domains: List[str]) -> pd.DataFrame:
         
         """
         Keep only subjects that have at least one token in all required domains.
@@ -246,7 +247,11 @@ class DelphiDataset:
         for dname, domain in self.domains.items():            
             # tokens_subj = tokens[tokens["subject_id"].astype(str) == str(subject_id)]            
             try:
-                tokens_subj = domain.tokens.loc[[subject_id]]
+                # indexing with .loc is a bit slower than .iloc (but not too much)
+                # tokens_subj = domain.tokens.loc[[subject_id]]
+
+                start, count = self._subject_indices[dname][subject_id]
+                tokens_subj  = domain.tokens.iloc[start:(start+count)]
             except KeyError:
                 tokens_subj = pd.DataFrame()
             # tokens_subj = domain.tokens.loc[subject_id] # [tokens["subject_id"].astype(str) == str(subject_id)]
@@ -261,21 +266,40 @@ class DelphiDataset:
 
 
     def __len__(self):
-        return len(self.subjects)
+        return len(self.subjects)        
+
+
+    def _precompute_subject_indices_per_domain(self):
+
+        '''
+        pre-computes indices for each subject in each domain for fast slicing
+        returns something like:
+          { 'domain_1' : {
+                id_1: (0, 18), <- (start_index, token_count)
+                id_2: (18, 17), ... }
+            'domain_2' : {
+                id_1: (0, 4),
+                id_2: (4, 6), ... }
+            }
+        '''
+
+        subject_indices = {}
+        for domain in self.list_domains():
+            ids, counts = np.unique(self.domains[domain].tokens.index.values, return_counts=True)
+            counts = np.array([0] + counts.tolist())
+            pp = [ (int(x), int(y)) for x, y in zip(np.cumsum(counts)[:-1], counts[1:])]
+            subject_indices[domain] = { int(id): pp[i] for i, id in enumerate(ids) }
+        
+        self._subject_indices = subject_indices
+        return self._subject_indices
 
 
     def __getitem__(self, index):
 
-        import time
-        # t0 = time.perf_counter()
-
         if not self.is_ukb_id(index) and isinstance(index, int):
             index = self.subjects[index]
 
-        # assert index in self._subjects, f"{index} not in subjects."
         out = self.get_subject_events(index)
-        # print(f"[getitem {index}] {time.perf_counter()-t0:.3f}s")
-        
         return out
 
 
@@ -701,19 +725,18 @@ def collate_fn_domains(batch, device=DEVICE):
       }
     """
 
-    import time
-    t0 = time.perf_counter()
-
-    # subject_ids = [item["subject_id"] for item in batch]
     domains_dict = {}
     for item in batch:
         for dname, arr in item.items():
-            domains_dict.setdefault(dname, []).append(arr)
- 
-    t1 = time.perf_counter()
-    # print(f"[to dictionary] {t1-t0:.3f}s")
+            if len(arr) == 0:
+                continue
+            arr.token_id = arr.token_id.cat.codes
+            values = torch.tensor(arr.values).to(device)
+            domains_dict.setdefault(dname, []).append(values)
 
-    return { dname: pd.concat(domain, axis=0) for dname, domain in domains_dict.items()}
+    return domains_dict # { dname: pd.DataFrame(np.stack(domain, axis=0)) for dname, domain in domains_dict.items()}
+    # return { dname: pd.DataFrame(np.stack(domain, axis=0)) for dname, domain in domains_dict.items()}
+    # return { dname: pd.concat(domain, axis=0) for dname, domain in domains_dict.items()}
     
     all_data = []
     for dname, arrs in domains_dict.items():
@@ -748,3 +771,4 @@ class DelphiDataloader(DataLoader):
             collate_fn=collate_fn,
             **kwargs
         )
+# %%
