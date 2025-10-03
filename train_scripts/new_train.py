@@ -86,18 +86,6 @@ class TrainBaseConfig:
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
-# class DelphiTokenizer():
-# 
-#     def __init__(self, mapping):
-#         self.mapping = mapping
-# 
-#     def tokens_to_ids(self, tokens):
-#         return [self.token_to_id[t] for t in tokens]
-# 
-#     def ids_to_tokens(self, ids):
-#         return [self.id_to_token[int(id_)] for id_ in ids]
-
-
 def batch_to_tensors(df, block_size):
     
     df = df.sort_values(["subject_id", "age"])
@@ -140,16 +128,25 @@ class Trainer():
     def train(self):
 
         for batch in self.training_loader:
-            import ipdb; ipdb.set_trace()
-            
-            tokens, ages, masks = batch_to_tensors(batch, block_size=128)
+            # import ipdb; ipdb.set_trace()
+            tokens, ages = self.get_tensors_from_batch(batch)
             logits, _, _ = model(tokens, ages, validation_loss_mode=True)
 
-            # logits, _, _, _ = model(tokens, ages, Y, B, validation_loss_mode=True)
 
+    def get_tensors_from_batch(self, batch):
 
-    def train_step(self):
-        pass
+        TOKEN_COLUMN = 2
+        AGE_COLUMN = 1
+        tokens, ages = EasyDict(), EasyDict()
+        
+        for dname in batch:   
+            domain_data = batch.get(dname, [])  
+            if len(domain_data) == 0:
+                continue            
+            tokens[dname] = domain_data[:, TOKEN_COLUMN].int() # torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
+            ages[dname] = domain_data[:, AGE_COLUMN] # torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
+
+        return tokens, ages
 
 
     # ——————————————————————————————————————————————————————————————————————————————    
@@ -230,11 +227,8 @@ DelphiDataloader = data.dataset.DelphiDataloader
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
 test_fold, dev_folds = [folds.pop(0)], folds
 
-# dataset  = DelphiDataset(subjects=folds, **dataset_config, n_samples=None, required_domains=['diseases', 'lifestyle', 'sex'])
-# dataloader = DelphiDataloader(dataset, batch_size=64, num_workers=16)
-
 dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=[]) # "subject_lists/genetic_white_ids.txt"])
-dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config)
+dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config).to(DEVICE)
 test_dataset = DelphiDataset(subjects=test_fold, **dataset_config)
 
 n_valid      = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
@@ -242,16 +236,11 @@ train_dataset, valid_dataset = random_split(
     dev_dataset, [ n_train, n_valid ],
     generator=torch.Generator().manual_seed(42)
 )
-dataloaders = [ DelphiDataloader(d, batch_size=32, num_workers=8, pin_memory=True) for d in [train_dataset, valid_dataset, test_dataset] ]
+dataloaders = [ 
+    DelphiDataloader(d, batch_size=32) 
+    for d in [train_dataset, valid_dataset, test_dataset] 
+]
 
-
-# %%
-%%timeit
-# dev_dataset[10]
-next(iter(dataloaders[0]))
-
-# %%
-# %%
 delphi = importlib.reload(delphi)
 Delphi = delphi.model.transformer.Delphi
 
@@ -261,39 +250,38 @@ torch.compile(model)
 
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
 
-pp = EasyDict()
-ages = EasyDict()
-
-for i, batch in enumerate(tqdm(dataloaders[0])):
-
-    if i == 10000:
-        break
-
-    for dname in model.transformer.embed.domain_embed:
-        
-        domain_data = batch[dname]
-        
-        if len(domain_data) == 0:
-            continue
-
-        x = torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
-        ages[dname] = torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
-
-        x_embed = model.transformer.embed.domain_embed[dname].projector(x)
-        age_embed = model.transformer.embed.age_encoding(ages[dname].unsqueeze(1))
-        pp[dname] = x_embed + age_embed
-
-# %%
-subject_indices = {}
-for domain in dev_dataset.list_domains():
-    ids, counts = np.unique(dev_dataset.domains[domain].tokens.index.values, return_counts=True)
-    counts = np.array([0] + counts.tolist())
-    pp = [ (int(x), int(y)) for x, y in zip(np.cumsum(counts)[:-1], counts[1:])]
-    subject_indices[domain] = { int(id): pp[i] for i, id in enumerate(ids) }
+# x = EasyDict()
+# ages = EasyDict()
+# pp = EasyDict()
+# 
+# 
+# for batch in tqdm(dataloaders[0]):  
+#     for dname in model.transformer.embed.domain_embed:   
+# 
+#         domain_data = batch.get(dname, [])
+#     
+#         if len(domain_data) == 0:
+#             continue
+#             
+#         x[dname] = domain_data[:,2].int() # torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
+#         ages[dname] = domain_data[:,1] # torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
+#         
+#         # print(domain_data[:,0])
+#         # print(f"{x=}")
+#         # print(f"{dname}: {ages[dname]}")
+#     
+#         x_embed   = model.transformer.embed.domain_embed[dname].projector(x[dname])
+#         age_embed = model.transformer.embed.age_encoding(ages[dname].unsqueeze(1))
+#         pp[dname] = x_embed + age_embed
 
 
 # %%
-subject_indices['hla_alleles']
+trainer = Trainer(model, *dataloaders, optimizer)
+trainer.train()
+
+# %%
+x_embed.shape
+dname
 
 # %%
 "hla_alleles"

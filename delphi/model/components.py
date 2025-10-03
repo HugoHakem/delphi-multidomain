@@ -31,14 +31,14 @@ class AgeEncoding(nn.Module):
 
         self.norm_factor = norm_factor
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, age: torch.Tensor):
         """
         Arguments:
             x: Tensor, shape ``[seq_len, batch_size]``
         """
-        time_years = x / self.norm_factor
-        seq_len, batch_size = x.shape
-        y = torch.zeros(seq_len, batch_size, self.n_embd, device=x.device)
+        time_years = age / self.norm_factor
+        seq_len, batch_size = age.shape
+        y = torch.zeros(seq_len, batch_size, self.n_embd, device=age.device)
 
         # .unsqueeze(-1) is added because with batch_size == 1 the last dimension gets contracted.
         # with this addition it works seamlessly for both batch_size == 1 and > 1.
@@ -276,7 +276,7 @@ class DelphiEmbedding(nn.Module):
         self.config = config
         # assert config.vocab_size is not None
          
-        self.age_encoding = AgeEncoding(n_embd=config.n_embd)
+        # self.age_encoding = AgeEncoding(n_embd=config.n_embd)
         self.token_drop   = nn.Dropout(config.token_dropout)        
         
         self.domain_embed = nn.ModuleDict()
@@ -301,42 +301,18 @@ class DelphiEmbedding(nn.Module):
         #     self.mod_embedding = nn.Embedding(max_modality_idx + 1, config.n_embd, padding_idx=0)
 
 
-    def forward(self, x: dict[str, torch.Tensor], t: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
 
         if len(self.domain_embed) > 0:
             for domain_name in self.domain_embed:
-                print(x[domain_name])
                 token_emb = self.domain_embed[domain_name](x[domain_name])
-                # age_emb   = self.age_encoding(t[domain_name].unsqueeze(-1))
                 x[domain_name] = token_emb
-                # + age_emb
         else:
             token_emb = self.token_embedding(x)
             token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
-            # age_emb = self.age_encoding(t.unsqueeze(-1))
-            x = token_emb
-            # + age_emb
         
         return x            
             
-        # token_emb = self.token_embedding(x)
-        # token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
-        # age_emb = self.age_encoding(t.unsqueeze(-1))
-        # x = token_emb + age_emb
-
-        # for modality in biomarker_x.keys():
-        #     m_pos = torch.nonzero(M == modality.value)  # N * 2
-        #     if m_pos.size == 0: continue
-        #     # m_emb = self.domain_embed[module_name(modality)](biomarker_x[modality])  # N * H
-        #     assert m_emb.shape[0] == m_pos.shape[0]
-        #     token_emb[m_pos[:, 0], m_pos[:, 1], :] *= 0
-        #     token_emb[m_pos[:, 0], m_pos[:, 1], :] += m_emb
-
-        # if self.config.modality_emb:
-            # mod_emb = self.mod_embedding(M)
-            # x += mod_emb
-
-        # return x
 
 # ———————————————————— HEADS ————————————————————————————————————————————————————————————————
 
