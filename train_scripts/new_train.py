@@ -37,11 +37,12 @@ import yaml
 import warnings
 
 import delphi
-from delphi.model.transformer import Delphi
+
 from delphi.optim import OptimConfig, configure_optimizers
-from delphi.model.components import (
-  EmbedConfig,
-  DelphiConfig,
+from delphi.model.transformer import (
+    Delphi,
+    EmbedConfig,
+    DelphiConfig,
 )
 
 from pathlib import Path
@@ -129,24 +130,28 @@ class Trainer():
 
         for batch in self.training_loader:
             # import ipdb; ipdb.set_trace()
-            tokens, ages = self.get_tensors_from_batch(batch)
-            logits, _, _ = model(tokens, ages, validation_loss_mode=True)
+            tokens, ages, subject_ids = self.get_tensors_from_batch(batch)
+            logits, _, _ = model(tokens, ages, subject_ids, validation_loss_mode=True)
 
 
     def get_tensors_from_batch(self, batch):
 
-        TOKEN_COLUMN = 2
+        SUBJECT_ID_COLUMN = 0
         AGE_COLUMN = 1
-        tokens, ages = EasyDict(), EasyDict()
+        TOKEN_COLUMN = 2
+        
+        tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
         
         for dname in batch:   
             domain_data = batch.get(dname, [])  
             if len(domain_data) == 0:
-                continue            
+                domain_data = domain_data.view(0, 3)
+                # continue            
             tokens[dname] = domain_data[:, TOKEN_COLUMN].int() # torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
             ages[dname] = domain_data[:, AGE_COLUMN] # torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
+            subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
 
-        return tokens, ages
+        return tokens, ages, subject_ids
 
 
     # ——————————————————————————————————————————————————————————————————————————————    
@@ -217,6 +222,9 @@ domain_config = {
 cfg = DelphiConfig(    
     token_dropout=0.1,
     domains=domain_config,
+    attention_scheme= [
+        "[hla_alleles]:bidirectional,[sex,disease,lifestyle,death]:causal(mask_ties=True)"
+    ] * 12
 )
 
 import data.dataset

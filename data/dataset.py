@@ -115,7 +115,7 @@ class TokenDomain:
 
 class DelphiDataset:
 
-    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None, required_domains=['sex', 'diseases'], merge_namespaces=False):
+    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None, required_domains=['sex', 'diseases'], merge_namespaces=False, device=DEVICE):
         """
         Args:
             root: base data directory
@@ -125,6 +125,7 @@ class DelphiDataset:
         """
 
         self.root = Path(root)
+        self.device = device
 
         # Load the data        
         self.domains = EasyDict()
@@ -239,7 +240,7 @@ class DelphiDataset:
                 start, count = self._subject_indices[dname][subject_id]
                 tokens_subj  = domain.tokens[start:(start+count)]
             except KeyError as e:
-                tokens_subj = torch.empty(0, 3, dtype=torch.float32, device="cuda")
+                tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
             subject_events[dname] = tokens_subj         
 
         return subject_events
@@ -562,11 +563,24 @@ def get_domain_id(domain_name):
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 def collate_fn_domains(batch):
+
     domains_dict = {}
     for item in batch:
         for dname, arr in item.items():
             domains_dict.setdefault(dname, []).append(arr)
     out = { d: torch.concat(lst, dim=0) for d, lst in domains_dict.items() }
+    
+    # infer device from any existing tensor in the batch
+    if len(out) > 0:
+        sample_device = next(iter(out.values())).device
+    else:
+        sample_device = torch.device("cpu")
+
+    # This is for compatibility with Delphi.forward, since it expects that the data 
+    # has exactly the same keys as the embedding module, which has a 'padding' domain (for regular GPT padding tokens and no-event tokens) 
+    if "padding" not in out:
+        out["padding"] = torch.empty((0, 3), dtype=torch.long, device=sample_device)
+    
     return out
 
 
