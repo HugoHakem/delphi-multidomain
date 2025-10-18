@@ -131,6 +131,8 @@ class DelphiDataset:
         self.domains = EasyDict()
         for dname, dinfo in domains.items():
             datafile = self.root / dname
+            if dname == "padding":
+                continue
             self.domains[dname] = TokenDomain(datafile, predict=dinfo.predict, age_jitter=dinfo.age_jitter) 
 
         # ——————————————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
@@ -508,14 +510,18 @@ def age_jitter_tokens(tokens, ages, generator=None):
     return tokens, ages
 
 
-def insert_no_event_tokens(tokens, ages, max_age, no_event_token_rate=5, padding="regular", gen=None):
+def insert_no_event_tokens(tokens, ages, subject_ids, max_age, no_event_token_rate=5, padding="regular", gen=None):
 
     """Insert synthetic 'no event' tokens at regular or random intervals."""
     
+    if padding == "random" and gen is None:
+        gen = torch.Generator(device='cpu')
+        gen.manual_seed(tokens.sum().item())
+
     if padding in [None, "none"] or no_event_token_rate in [0, None]:
         pad = torch.ones(tokens.shape[0], 0)
     elif padding == "regular":
-        pad = torch.arange(0, 100 * DAYS_PER_YEAR, DAYS_PER_YEAR * no_event_token_rate) * torch.ones(tokens.shape[0], 1) + 1
+        pad = torch.arange(0, 100 * DAYS_PER_YEAR, DAYS_PER_YEAR * no_event_token_rate) * torch.ones(len(subject_ids), 1) + 1
     elif padding == "random":
         pad = torch.randint(1, 100 * DAYS_PER_YEAR, (tokens.shape[0], int(100 / no_event_token_rate)), generator=gen)
     else:

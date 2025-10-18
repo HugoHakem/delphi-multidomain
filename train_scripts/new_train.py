@@ -3,15 +3,26 @@ import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
 os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
+from pathlib import Path
+root_path = Path("../data/transforms")
 
+'''
 import time
 import math
 import pickle as pkl
 from contextlib import nullcontext
 from tqdm import tqdm
+import yaml
+import warnings
+from pprint import pprint
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from typing import Iterator, Optional, List, Dict, Set
+
+'''
+
 import torch
 from torch.utils.data import Dataset, random_split, DataLoader
 
@@ -19,25 +30,18 @@ from ast import literal_eval
 import importlib
 
 from easydict import EasyDict
-from pprint import pprint
-from collections import defaultdict
 
 import mlflow
 from mlflow.tracking import MlflowClient
 from mlflow.entities import Metric
 
 from dataclasses import asdict, dataclass, field
-from typing import Iterator, Optional, List, Dict, Set
 
 from omegaconf import OmegaConf
 import logging, time
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-import yaml
-import warnings
-
 import delphi
-
 from delphi.optim import OptimConfig, configure_optimizers
 from delphi.model.transformer import (
     Delphi,
@@ -45,13 +49,10 @@ from delphi.model.transformer import (
     DelphiConfig,
 )
 
-from pathlib import Path
-from sklearn.model_selection import train_test_split
-from utils.utils import get_p2i, get_batch
+# from sklearn.model_selection import train_test_split
+# from utils.utils import get_p2i, get_batch
 
 import data.dataset
-
-root_path = Path("../data/transforms")
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
@@ -59,6 +60,7 @@ DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 @dataclass
 class TrainBaseConfig:
+
     ckpt_dir: str = "."
     eval_interval: int = 2000
     eval_iters: int = 200
@@ -87,33 +89,35 @@ class TrainBaseConfig:
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
-def batch_to_tensors(df, block_size):
-    
-    df = df.sort_values(["subject_id", "age"])
-    grouped = df.groupby("subject_id")
-
-    tokens, ages, mask = [], [], []
-
-    for _, g in grouped:
-        g = g.head(block_size).copy()  # or pad if there are less
-        if len(g) < block_size:
-            pad_len = block_size - len(g)
-            g = pd.concat([g, pd.DataFrame({
-                "token_id": [0]*pad_len,
-                "age": [0]*pad_len,
-                "predict": [False]*pad_len
-            })], ignore_index=True)
-
-        tokens.append(torch.tensor(g["token_id"].values, dtype=torch.long))
-        ages.append(torch.tensor(g["age"].values, dtype=torch.float32))
-        masks.append(torch.tensor(g["predict"].astype(int).values, dtype=torch.bool))
-    
-    ts = torch.stack
-    tokens, ages, masks = ts(tokens), ts(ages), ts(masks)
-    
-    return tokens, ages, masks
+# def batch_to_tensors(df, block_size):
+#     
+#     df = df.sort_values(["subject_id", "age"])
+#     grouped = df.groupby("subject_id")
+# 
+#     tokens, ages, mask = [], [], []
+# 
+#     for _, g in grouped:
+#         g = g.head(block_size).copy()  # or pad if there are less
+#         if len(g) < block_size:
+#             pad_len = block_size - len(g)
+#             g = pd.concat([g, pd.DataFrame({
+#                 "token_id": [0]*pad_len,
+#                 "age": [0]*pad_len,
+#                 "predict": [False]*pad_len
+#             })], ignore_index=True)
+# 
+#         tokens.append(torch.tensor(g["token_id"].values, dtype=torch.long))
+#         ages.append(torch.tensor(g["age"].values, dtype=torch.float32))
+#         masks.append(torch.tensor(g["predict"].astype(int).values, dtype=torch.bool))
+#     
+#     ts = torch.stack
+#     tokens, ages, masks = ts(tokens), ts(ages), ts(masks)
+#     
+#     return tokens, ages, masks
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
+
+from tqdm import tqdm 
 
 class Trainer():
 
@@ -123,38 +127,34 @@ class Trainer():
         self.training_loader = training_loader
         self.valid_loader    = valid_loader
         self.test_loader     = test_loader
-        self.optimizer   = optimizer
+        self.optimizer       = optimizer
 
     # ——————————————————————————————————————————————————————————————————————————————
+
     def train(self):
 
-        for batch in self.training_loader:
-            # import ipdb; ipdb.set_trace()
+        for batch in tqdm(self.training_loader):
             tokens, ages, subject_ids = self.get_tensors_from_batch(batch)
-            logits, _, _ = model(tokens, ages, subject_ids, validation_loss_mode=True)
+            logits, _ = model(tokens, ages, subject_ids, validation_loss_mode=True)
 
 
+    # ——————————————————————————————————————————————————————————————————————————————
     def get_tensors_from_batch(self, batch):
 
-        SUBJECT_ID_COLUMN = 0
-        AGE_COLUMN = 1
-        TOKEN_COLUMN = 2
-        
+        SUBJECT_ID_COLUMN, AGE_COLUMN, TOKEN_COLUMN = 0, 1, 2
         tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
         
         for dname in batch:   
             domain_data = batch.get(dname, [])  
             if len(domain_data) == 0:
                 domain_data = domain_data.view(0, 3)
-                # continue            
             tokens[dname] = domain_data[:, TOKEN_COLUMN].int() # torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
             ages[dname] = domain_data[:, AGE_COLUMN] # torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
             subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
 
         return tokens, ages, subject_ids
 
-
-    # ——————————————————————————————————————————————————————————————————————————————    
+    # ——————————————————————————————————————————————————————————————————————————————        
     def evaluate(self):
 
         out = {}
@@ -181,51 +181,46 @@ class Trainer():
         model.train()   
         return out
 
+# ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
 domain_config = {
-
     'diseases': EmbedConfig(
        projector="embed",
-       input_size=None,
        path=root_path / 'diseases',
        predict=True,
-    #    mask_ties=True
     ),
     'death': EmbedConfig(
         projector="embed",
-        input_size=None,
         path=root_path / 'death',
         predict=True,
-        # mask_ties=True
     ),
     'lifestyle': EmbedConfig(
         projector="embed",
-        input_size=None,
         path=root_path / 'lifestyle',
         age_jitter=True,
-        # mask_ties=False
     ),
     "hla_alleles": EmbedConfig(
         projector="embed",
-        input_size=None,
         path=root_path / 'hla_alleles',
-        # mask_ties=False
     ),
     "sex": EmbedConfig(
         projector="embed",
-        input_size=None,
         path=root_path / 'sex',
-        # mask_ties=False
+    ),
+    "padding": EmbedConfig(
+        projector="embed"
     )    
 }
+
+ATTENTION_SCHEME = 12 * [ "[hla_alleles]:bidirectional,[sex,disease,lifestyle,death]:causal(mask_ties=True)" ]
 
 cfg = DelphiConfig(    
     token_dropout=0.1,
     domains=domain_config,
-    attention_scheme= [
-        "[hla_alleles]:bidirectional,[sex,disease,lifestyle,death]:causal(mask_ties=True)"
-    ] * 12
+    attention_scheme=ATTENTION_SCHEME
 )
+
+# ——————————————————————————————————————————————————————————————————————————————————————
 
 import data.dataset
 data.dataset = importlib.reload(data.dataset)
@@ -252,7 +247,7 @@ dataloaders = [
 delphi = importlib.reload(delphi)
 Delphi = delphi.model.transformer.Delphi
 
-config = DelphiConfig(vocab_size=1270, n_embd=120, domains=domain_config)
+config = DelphiConfig(n_embd=120, domains=domain_config)
 model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
@@ -261,7 +256,6 @@ optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), devi
 # x = EasyDict()
 # ages = EasyDict()
 # pp = EasyDict()
-# 
 # 
 # for batch in tqdm(dataloaders[0]):  
 #     for dname in model.transformer.embed.domain_embed:   
@@ -286,14 +280,3 @@ optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), devi
 # %%
 trainer = Trainer(model, *dataloaders, optimizer)
 trainer.train()
-
-# %%
-x_embed.shape
-dname
-
-# %%
-"hla_alleles"
-"sex"
-"lifestyle"
-"diseases"
-"death"
