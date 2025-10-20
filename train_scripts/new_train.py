@@ -6,23 +6,7 @@ os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoi
 from pathlib import Path
 root_path = Path("../data/transforms")
 
-'''
-import time
-import math
-import pickle as pkl
-from contextlib import nullcontext
-from tqdm import tqdm
-import yaml
-import warnings
-from pprint import pprint
-from collections import defaultdict
-
 import numpy as np
-import pandas as pd
-from typing import Iterator, Optional, List, Dict, Set
-
-'''
-
 import torch
 from torch.utils.data import Dataset, random_split, DataLoader
 
@@ -130,13 +114,54 @@ class Trainer():
         self.optimizer       = optimizer
 
     # ——————————————————————————————————————————————————————————————————————————————
+   
+    def get_vocab_len(self, domain_name):
+        self.transformer.embed.domain_embed[domain_name].weight.shape[0]
 
     def train(self):
 
         for batch in tqdm(self.training_loader):
-            tokens, ages, subject_ids = self.get_tensors_from_batch(batch)
-            logits, _ = model(tokens, ages, subject_ids, validation_loss_mode=True)
+            
+            x, ages, subject_ids = self.get_tensors_from_batch(batch)            
 
+            max_ages = model.get_max_ages_per_subject(ages, subject_ids)
+            x, ages, subject_ids = self.model.insert_no_event_tokens(x, ages, subject_ids)
+            x, ages, subject_ids = self.model.mask_tokens_after_age(x, ages, subject_ids, max_ages)
+            x, ages, subject_ids = self.pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
+            
+            logits, att = model(x, ages, subject_ids)
+            
+            #TODO: this is a workaround to keep track which domain each token belongs to
+            domains = model._trace['domains']
+
+            domains_to_predict = ['diseases', 'death']
+
+            logits = torch.cat([logits[dname] for dname in domains_to_predict], axis=-1)                        
+            
+            targets     = model._trace['tokens'][:,1:];
+            target_ages = model._trace['ages'][:,1:];
+            input_ages  = model._trace['ages'][:,:-1];
+            target_domains = domains[:,1:];
+            
+            domain_to_int = { k: i for i, k in enumerate(x.keys()) }
+            
+            import ipdb; ipdb.set_trace()
+
+            logits_flat = logits.reshape(-1, logits.shape[-1])
+
+
+            for dname in ['diseases', 'death']:
+                loss = model.compute_loss(logits, tokens[dname][:,1:], ages[dname][:,1:])
+
+
+        # from torch.profiler import profile, record_function, ProfilerActivity    
+        # for batch in tqdm(self.training_loader):
+        #     tokens, ages, subject_ids = self.get_tensors_from_batch(batch)
+        #     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        #         with record_function("forward_delphi"):
+        #             # output = model(batch)
+        #             logits, _ = model(tokens, ages, subject_ids, validation_loss_mode=True)
+        #     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     # ——————————————————————————————————————————————————————————————————————————————
     def get_tensors_from_batch(self, batch):
@@ -148,11 +173,69 @@ class Trainer():
             domain_data = batch.get(dname, [])  
             if len(domain_data) == 0:
                 domain_data = domain_data.view(0, 3)
-            tokens[dname] = domain_data[:, TOKEN_COLUMN].int() # torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
-            ages[dname] = domain_data[:, AGE_COLUMN] # torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
+            tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
+            ages[dname] = domain_data[:, AGE_COLUMN]
             subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
 
         return tokens, ages, subject_ids
+
+
+    def pad_to_seqlen(self, x, ages, subject_ids, seqlen, PADDING_TOKEN=0, PAD_AGE=-10000):
+
+        device = subject_ids['diseases'].device
+    
+        subject_ids_uniq, token_count = np.unique(
+            torch.concat(list(subject_ids.values())).cpu().int().numpy(), 
+            return_counts=True
+        )
+        
+        necessary_padding_tokens = { 
+            k: seqlen - v for k, v in dict(zip(subject_ids_uniq, token_count)).items() 
+        }    
+        
+        x_pad  = torch.cat([ torch.full((v,), PADDING_TOKEN) for _, v in necessary_padding_tokens.items() ]).to(device)
+        a_pad  = torch.cat([ torch.full((v,), PAD_AGE) for _, v in necessary_padding_tokens.items() ]).to(device)
+        t_subj = torch.cat([ torch.full((v,), k) for k, v in necessary_padding_tokens.items() ]).to(device)
+    
+        x['padding'] = torch.cat([x['padding'], x_pad])
+        ages['padding'] = torch.cat([ages['padding'], a_pad])
+        subject_ids['padding'] = torch.cat([subject_ids['padding'], t_subj])
+    
+        return x, ages, subject_ids
+
+    
+    def get_token_domains_from_dict(self, x, ages, subjects_flat):
+
+        all_domains = []
+        for domain_idx, dname in enumerate(x.keys()):
+            t = x[dname]
+            n = t.shape[0]
+            # domain ids (move it from dict keys to a separate tensor)
+            d = torch.full((n,), domain_idx, dtype=torch.long, device=t.device)
+            all_domains.append(d)
+        
+        domains_flat  = torch.cat(all_domains)
+        unique_subjects = subjects_flat.unique(sorted=True)
+        batch_domains = []
+        for subj in unique_subjects:
+            mask = subjects_flat == subj
+            d_subj = domains_flat[mask]
+            # sort by age
+            order = torch.argsort(a_subj)
+            t_subj = t_subj[order]
+            a_subj = a_subj[order]
+            d_subj = d_subj[order]
+    
+            batch_tokens.append(t_subj.unsqueeze(0))
+            batch_ages.append(a_subj.unsqueeze(0))
+            batch_domains.append(d_subj.unsqueeze(0))
+    
+        batch_tokens = torch.stack(batch_tokens)
+        batch_ages   = torch.stack(batch_ages)
+        batch_domains = torch.stack(batch_domains)
+    
+        return batch_tokens, batch_ages, unique_subjects, batch_domains
+        return domains_flat
 
     # ——————————————————————————————————————————————————————————————————————————————        
     def evaluate(self):
@@ -184,32 +267,12 @@ class Trainer():
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
 domain_config = {
-    'diseases': EmbedConfig(
-       projector="embed",
-       path=root_path / 'diseases',
-       predict=True,
-    ),
-    'death': EmbedConfig(
-        projector="embed",
-        path=root_path / 'death',
-        predict=True,
-    ),
-    'lifestyle': EmbedConfig(
-        projector="embed",
-        path=root_path / 'lifestyle',
-        age_jitter=True,
-    ),
-    "hla_alleles": EmbedConfig(
-        projector="embed",
-        path=root_path / 'hla_alleles',
-    ),
-    "sex": EmbedConfig(
-        projector="embed",
-        path=root_path / 'sex',
-    ),
-    "padding": EmbedConfig(
-        projector="embed"
-    )    
+  'diseases':    EmbedConfig(projector="embed", path=root_path / 'diseases', predict=True),
+  'death':       EmbedConfig(projector="embed", path=root_path / 'death', predict=True),
+  'lifestyle':   EmbedConfig(projector="embed", path=root_path / 'lifestyle', age_jitter=True),
+  "hla_alleles": EmbedConfig(projector="embed", path=root_path / 'hla_alleles'),
+  "sex":         EmbedConfig(projector="embed", path=root_path / 'sex'),
+  "padding":     EmbedConfig(projector="embed")    
 }
 
 ATTENTION_SCHEME = 12 * [ "[hla_alleles]:bidirectional,[sex,disease,lifestyle,death]:causal(mask_ties=True)" ]
@@ -277,6 +340,22 @@ optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), devi
 #         pp[dname] = x_embed + age_embed
 
 
-# %%
 trainer = Trainer(model, *dataloaders, optimizer)
-trainer.train()
+trainer.train()  
+
+# %%
+batch = next(iter(dataloaders[0]))
+x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
+
+max_ages = model.get_max_ages_per_subject(ages, subject_ids)
+
+x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
+x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+x, ages, subject_ids = pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
+
+logits, att = model(x, ages, subject_ids)
+
+# %%
+logits
+# %%
+
