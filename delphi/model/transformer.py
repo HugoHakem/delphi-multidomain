@@ -1017,17 +1017,17 @@ class Delphi(torch.nn.Module):
         
         for subj in unique_subjects:
             mask = subjects_flat == subj
-            t_subj = tokens_flat[mask]
             a_subj = ages_flat[mask]
-            e_subj = embeddings_flat[mask]
-            d_subj = domains_flat[mask]
+            a_subj = a_subj[order:=torch.argsort(a_subj)]
+            t_subj = tokens_flat[mask][order]
+            e_subj = embeddings_flat[mask][order]
+            d_subj = domains_flat[mask][order]
             
             # sort by age
-            order = torch.argsort(a_subj)
-            t_subj = t_subj[order]
-            a_subj = a_subj[order]
-            e_subj = e_subj[order]
-            d_subj = d_subj[order]
+            # t_subj = t_subj[order]
+            # a_subj = a_subj[order]
+            # e_subj = e_subj[order]
+            # d_subj = d_subj[order]
     
             batch_tokens.append(t_subj.unsqueeze(0))
             batch_ages.append(a_subj.unsqueeze(0))

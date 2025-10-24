@@ -121,7 +121,9 @@ class Trainer():
 
     def train(self):        
 
-        for batch in tqdm(self.training_loader):
+        pbar = tqdm(self.training_loader)
+
+        for batch in pbar:
             
             self.optimizer.zero_grad()
             
@@ -162,7 +164,9 @@ class Trainer():
             loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
             loss_ce.backward()
 
-            print(f"{loss_ce=}")            
+            pbar.set_postfix({"loss": f"{loss_ce.item():.4f}"})
+            # pbar.set_postfix({ "per_disease": loss_ce_per_disease }) # f"{loss_ce_per_disease}")
+            # pbar.set_description(f"loss {loss_ce.item():.4f}")
 
             self.optimizer.step()
             self.scheduler.step()
