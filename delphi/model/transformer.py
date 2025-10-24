@@ -309,7 +309,7 @@ class EmbedConfig:
     n_hidden:   Optional[int] = None
     input_size: Optional[int] = None
     pretrained_path: Optional[str] = None  # path to .pt/.npy/.pkl with lookup table
-    freeze: bool = True                    # if previous lookup table is to be left fixed
+    freeze: bool = False                    # if previous lookup table is to be left fixed
     path: Optional[str] = None
     predict: bool = False
     age_jitter: bool = False
@@ -434,14 +434,14 @@ class DomainEmbedding(nn.Module):
 
         elif config.projector.lower() == "pretrained":
             assert hasattr(config, "pretrained_path"), f"You need to provide pretrained_path in the config if using config.projector == 'pretrained'"
-            self.projector = self.get_from_pretrained(config.pretrained_path, config.freeze)
+            self.projector = self.get_from_pretrained(config.pretrained_path, n_embed, config.freeze)
 
         else:
             raise ValueError(f"unknown projector type: {config.projector}")
         
         # ————————————————————————————————————————————————————————————————————————————————————
     
-    def get_from_pretrained(self, path, freeze):
+    def get_from_pretrained(self, path, n_embed, freeze):
 
         weights = torch.load(path)
         vocab_size, d_ext = weights.shape
@@ -453,10 +453,10 @@ class DomainEmbedding(nn.Module):
         projector.weight.requires_grad = not freeze
 
         # To project onto Delphi embedding space
-        return nn.Sequential([
+        return nn.Sequential(
             projector,
             nn.Linear(d_ext, n_embed, bias=False)
-        ])
+        )
 
 
     @property
@@ -742,7 +742,7 @@ class MaskedSelfAttention(nn.Module):
             ),
         )
 
-    def forward(self, x, attn_mask):
+    def forward(self, x, attn_mask=None):
 
         B, T, C = x.size()
         # batch size, sequence length, embedding dimensionality (n_embd)
@@ -757,7 +757,9 @@ class MaskedSelfAttention(nn.Module):
         # manual implementation of attention
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = att.masked_fill(attn_mask == 0, float("-inf"))
+        if attn_mask is not None:
+            att = att.masked_fill(attn_mask == 0, float("-inf"))
+
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -1005,7 +1007,7 @@ class Delphi(torch.nn.Module):
         
         tokens_flat   = torch.cat(all_tokens)
         ages_flat     = torch.cat(all_ages)
-        embeddings_flat   = torch.cat(all_embeddings)
+        embeddings_flat = torch.cat(all_embeddings)
         domains_flat  = torch.cat(all_domains)
         subjects_flat = torch.cat(all_subjects)
     
@@ -1078,7 +1080,6 @@ class Delphi(torch.nn.Module):
         
         domain2id = { k: i for i, k in enumerate(x) }
         
-        # x = deepcopy(x)
         emb = self.transformer.embed(x)
         x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb, subject_ids)
         
@@ -1089,9 +1090,7 @@ class Delphi(torch.nn.Module):
         emb     = emb.squeeze(1)
         domains = domains.squeeze(1)
         
-        print("emb.requires_grad:", emb.requires_grad)
-        self._trace = dict(domains=domains, tokens=x, emb=emb, ages=ages)
-        print("emb.requires_grad:", emb.requires_grad)
+        self._trace = dict(domains=domains.detach(), tokens=x.detach(), emb=emb.detach(), ages=ages.detach())
         
         # for domain in ages:
         emb += self.transformer.age_embedding(ages)

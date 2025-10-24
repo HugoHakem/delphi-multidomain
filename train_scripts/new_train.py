@@ -104,13 +104,14 @@ class TrainBaseConfig:
 
 class Trainer():
 
-    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer):
+    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler):
 
         self.model           = model
         self.training_loader = training_loader
         self.valid_loader    = valid_loader
         self.test_loader     = test_loader
         self.optimizer       = optimizer
+        self.scheduler       = scheduler
 
     # ——————————————————————————————————————————————————————————————————————————————
    
@@ -118,8 +119,7 @@ class Trainer():
         self.transformer.embed.domain_embed[domain_name].weight.shape[0]
 
 
-    def train(self):
-        
+    def train(self):        
 
         for batch in tqdm(self.training_loader):
             
@@ -139,8 +139,8 @@ class Trainer():
             
             domains     = model._trace['domains']
             targets     = model._trace['tokens'][:,1:]
-            target_ages = model._trace['ages'][:,1:]
             input_ages  = model._trace['ages'][:,:-1]
+            target_ages = model._trace['ages'][:,1:]
             target_domains = domains[:,1:];
             
             predict_mask = torch.isin(target_domains, predicted_domains_int.to(DEVICE))
@@ -154,25 +154,19 @@ class Trainer():
             
             offsets = offsets_per_domain[f_domains]
             global_ids = offsets + local_ids
-                        
-            loss_ce = model.cross_entropy_loss(f_logits, global_ids)
-            loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
-            print(loss_ce_per_disease)
-
-            # loss = torch.nn.functional.cross_entropy(f_logits, global_ids)
-
-            before = model.transformer.embed.domain_embed['diseases'].weight.clone()
-            loss_ce.backward(retain_graph=True)
-            print(f"{loss_ce=}")
-            
-            embed_param = model.transformer.embed.domain_embed['diseases'].weight
 
             if os.environ.get("DEBUG", False):
                 import ipdb; ipdb.set_trace()
 
-            self.optimizer.step()
-            print(torch.mean((model.transformer.embed.domain_embed['diseases'].weight - before).abs()))
+            loss_ce = model.cross_entropy_loss(f_logits, global_ids)
+            loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
+            loss_ce.backward()
 
+            print(f"{loss_ce=}")            
+
+            self.optimizer.step()
+            self.scheduler.step()
+            
 
         # from torch.profiler import profile, record_function, ProfilerActivity    
         # for batch in tqdm(self.training_loader):
@@ -333,7 +327,7 @@ train_dataset, valid_dataset = random_split(
     generator=torch.Generator().manual_seed(42)
 )
 dataloaders = [ 
-    DelphiDataloader(d, batch_size=4) 
+    DelphiDataloader(d, batch_size=32) 
     for d in [train_dataset, valid_dataset, test_dataset] 
 ]
 
@@ -345,37 +339,8 @@ model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
-
-# x = EasyDict()
-# ages = EasyDict()
-# pp = EasyDict()
-# 
-# for batch in tqdm(dataloaders[0]):  
-#     for dname in model.transformer.embed.domain_embed:   
-# 
-#         domain_data = batch.get(dname, [])
-#     
-#         if len(domain_data) == 0:
-#             continue
-#             
-#         x[dname] = domain_data[:,2].int() # torch.tensor(domain_data.token_id.cat.codes.values).type(torch.int32).to(DEVICE)
-#         ages[dname] = domain_data[:,1] # torch.tensor(domain_data.age.values).type(torch.int32).to(DEVICE)
-#         
-#         # print(domain_data[:,0])
-#         # print(f"{x=}")
-#         # print(f"{dname}: {ages[dname]}")
-#     
-#         x_embed   = model.transformer.embed.domain_embed[dname].projector(x[dname])
-#         age_embed = model.transformer.embed.age_encoding(ages[dname].unsqueeze(1))
-#         pp[dname] = x_embed + age_embed
-
-
-
-
-
-trainer = Trainer(model, *dataloaders, optimizer)
+trainer = Trainer(model, *dataloaders, optimizer, scheduler)
 trainer.train()  
-
 
 # %%
 predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
@@ -407,11 +372,7 @@ offsets_per_domain = get_offset_per_domain(model, domains_of_interest=predicted_
 
 offsets = offsets_per_domain[f_domains]
 global_ids = offsets + local_ids
-global_ids
 
-f_logits.shape
-
-torch.nn.functional.cross_entropy(f_logits, global_ids)
 
 # %%
 def local_to_global_ids(local_ids):
