@@ -112,6 +112,8 @@ class Trainer():
         self.test_loader     = test_loader
         self.optimizer       = optimizer
         self.scheduler       = scheduler
+        
+        self.current_epoch   = 0
 
     # ——————————————————————————————————————————————————————————————————————————————
    
@@ -119,7 +121,14 @@ class Trainer():
         self.transformer.embed.domain_embed[domain_name].weight.shape[0]
 
 
-    def train(self):        
+    def train(self, max_epochs=1000):
+        
+        for epoch in range(self.current_epoch, max_epochs):
+            self.current_epoch = epoch
+            self.train_epoch()
+
+    
+    def train_epoch(self):
 
         pbar = tqdm(self.training_loader)
 
@@ -165,21 +174,13 @@ class Trainer():
             loss_ce.backward()
 
             pbar.set_postfix({"loss": f"{loss_ce.item():.4f}"})
-            # pbar.set_postfix({ "per_disease": loss_ce_per_disease }) # f"{loss_ce_per_disease}")
-            # pbar.set_description(f"loss {loss_ce.item():.4f}")
 
-            self.optimizer.step()
-            self.scheduler.step()
+            self.optimizer.step(); self.scheduler.step()
             
 
-        # from torch.profiler import profile, record_function, ProfilerActivity    
-        # for batch in tqdm(self.training_loader):
-        #     tokens, ages, subject_ids = self.get_tensors_from_batch(batch)
-        #     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        #         with record_function("forward_delphi"):
-        #             # output = model(batch)
-        #             logits, _ = model(tokens, ages, subject_ids, validation_loss_mode=True)
-        #     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    def mlflow_logging(self):
+
+        pass
 
     # ——————————————————————————————————————————————————————————————————————————————
     def get_tensors_from_batch(self, batch):
@@ -221,39 +222,6 @@ class Trainer():
     
         return x, ages, subject_ids
 
-    
-    def get_token_domains_from_dict(self, x, ages, subjects_flat):
-
-        all_domains = []
-        for domain_idx, dname in enumerate(x.keys()):
-            t = x[dname]
-            n = t.shape[0]
-            # domain ids (move it from dict keys to a separate tensor)
-            d = torch.full((n,), domain_idx, dtype=torch.long, device=t.device)
-            all_domains.append(d)
-        
-        domains_flat  = torch.cat(all_domains)
-        unique_subjects = subjects_flat.unique(sorted=True)
-        batch_domains = []
-        for subj in unique_subjects:
-            mask = subjects_flat == subj
-            d_subj = domains_flat[mask]
-            # sort by age
-            order = torch.argsort(a_subj)
-            t_subj = t_subj[order]
-            a_subj = a_subj[order]
-            d_subj = d_subj[order]
-    
-            batch_tokens.append(t_subj.unsqueeze(0))
-            batch_ages.append(a_subj.unsqueeze(0))
-            batch_domains.append(d_subj.unsqueeze(0))
-    
-        batch_tokens = torch.stack(batch_tokens)
-        batch_ages   = torch.stack(batch_ages)
-        batch_domains = torch.stack(batch_domains)
-    
-        return batch_tokens, batch_ages, unique_subjects, batch_domains
-        return domains_flat
 
     # ——————————————————————————————————————————————————————————————————————————————        
     def evaluate(self):
@@ -291,7 +259,6 @@ def get_offset_per_domain(model, domains_of_interest):
     offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
     return offsets_per_domain
 
-
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
 domain_config = {
@@ -303,13 +270,8 @@ domain_config = {
   "padding":     EmbedConfig(projector="embed")    
 }
 
-ATTENTION_SCHEME = 12 * [ "[hla_alleles, sex]:bidirectional,[sex,disease,lifestyle,death]:causal(mask_ties=True)" ]
-
-cfg = DelphiConfig(    
-    token_dropout=0.1,
-    domains=domain_config,
-    attention_scheme=ATTENTION_SCHEME
-)
+ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
+config = DelphiConfig(token_dropout=0.1, domains=domain_config, attention_scheme=ATTENTION_SCHEME)
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 
@@ -338,45 +300,44 @@ dataloaders = [
 delphi = importlib.reload(delphi)
 Delphi = delphi.model.transformer.Delphi
 
-config = DelphiConfig(n_embd=120, domains=domain_config)
+# config = DelphiConfig(n_embd=120, domains=domain_config)
 model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
 trainer = Trainer(model, *dataloaders, optimizer, scheduler)
-trainer.train()  
+trainer.train(max_epochs=1000)  
 
 # %%
-predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
-predicted_domains_int = torch.tensor([ domain_to_int[dname] for dname in predicted_domains])
-
-batch = next(iter(dataloaders[0]))
-x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
-max_ages = model.get_max_ages_per_subject(ages, subject_ids)
-x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
-x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
-
-logits, att = model(x, ages, subject_ids)
-
-domains     = model._trace['domains']
-targets     = model._trace['tokens'][:,1:];
-target_ages = model._trace['ages'][:,1:];
-input_ages  = model._trace['ages'][:,:-1];
-target_domains = domains[:,1:];
-
-predict_mask = torch.isin(target_domains, predicted_domains_int.to(DEVICE))
-
-logits    = torch.cat([logits[dname] for dname in predicted_domains], axis=-1)
-f_logits  = logits[predict_mask]
-f_domains = target_domains[predict_mask]
-local_ids = targets[predict_mask]
-
-offsets_per_domain = get_offset_per_domain(model, domains_of_interest=predicted_domains)
-
-offsets = offsets_per_domain[f_domains]
-global_ids = offsets + local_ids
-
+# predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
+# predicted_domains_int = torch.tensor([ domain_to_int[dname] for dname in predicted_domains])
+# 
+# batch = next(iter(dataloaders[0]))
+# x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
+# max_ages = model.get_max_ages_per_subject(ages, subject_ids)
+# x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
+# x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+# x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
+# 
+# logits, att = model(x, ages, subject_ids)
+# 
+# domains     = model._trace['domains']
+# targets     = model._trace['tokens'][:,1:];
+# target_ages = model._trace['ages'][:,1:];
+# input_ages  = model._trace['ages'][:,:-1];
+# target_domains = domains[:,1:];
+# 
+# predict_mask = torch.isin(target_domains, predicted_domains_int.to(DEVICE))
+# 
+# logits    = torch.cat([logits[dname] for dname in predicted_domains], axis=-1)
+# f_logits  = logits[predict_mask]
+# f_domains = target_domains[predict_mask]
+# local_ids = targets[predict_mask]
+# 
+# offsets_per_domain = get_offset_per_domain(model, domains_of_interest=predicted_domains)
+# 
+# offsets = offsets_per_domain[f_domains]
+# global_ids = offsets + local_ids
 
 # %%
 def local_to_global_ids(local_ids):
