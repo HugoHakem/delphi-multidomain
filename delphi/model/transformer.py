@@ -409,8 +409,7 @@ class DomainEmbedding(nn.Module):
             self.NO_EVENT_TOKEN = 1
             return
 
-        if config.projector.lower() == "linear":
-            self.projector = nn.Linear(config.input_size, n_embed, bias=False)
+        # ————————————————————————————————————————————————————————————————————————————————————
 
         if config.input_size is None and config.projector.lower() != "pretrained":            
             tokenizer_file = Path(config.path) / "tokenizer.yaml"
@@ -421,33 +420,55 @@ class DomainEmbedding(nn.Module):
             weights = torch.load(config.pretrained_path)  # Tensor [vocab_size, d_ext]
             self.config.input_size, d_ext = weights.shape
 
-        if config.projector.lower() == "linear":
+        # ————————————————————————————————————————————————————————————————————————————————————
+
+        if config.projector.lower() == "embed":
+            print(f"DomainEmbedding: Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
+            self.projector = nn.Embedding(config.input_size, n_embed)
+
+        elif config.projector.lower() == "linear":
             self.projector = nn.Linear(config.input_size, n_embed, bias=False)
 
         elif config.projector.lower() == "mlp":
-            self.projector = self.build_mlp_projector(config)
-            
-        elif config.projector.lower() == "embed":
-            print(f"DomainEmbedding: Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
-            self.projector = nn.Embedding(self.config.input_size, n_embed, padding_idx=0)
+            self.projector = self.build_mlp_projector(config)                    
 
         elif config.projector.lower() == "pretrained":
-            weights = torch.load(config.pretrained_path)  # Tensor [vocab_size, d_ext]
-            vocab_size, d_ext = weights.shape
-            logger.info(f"Loading pretrained embedding: vocab_size={vocab_size}, d_ext={d_ext}")
-            self.projector = nn.Embedding(vocab_size, d_ext, padding_idx=0)
-            self.projector.weight.data.copy_(weights)
-            self.projector.weight.requires_grad = not config.freeze
-
-            # To project onto Delphi embedding space
-            self.projector = nn.Linear(d_ext, n_embed, bias=False)
+            assert hasattr(config, "pretrained_path"), f"You need to provide pretrained_path in the config if using config.projector == 'pretrained'"
+            self.projector = self.get_from_pretrained(config.pretrained_path, config.freeze)
 
         else:
             raise ValueError(f"unknown projector type: {config.projector}")
+        
+        # ————————————————————————————————————————————————————————————————————————————————————
+    
+    def get_from_pretrained(self, path, freeze):
+
+        weights = torch.load(path)
+        vocab_size, d_ext = weights.shape
+
+        logger.info(f"Loading pretrained embedding: vocab_size={vocab_size}, d_ext={d_ext}")
+
+        projector = nn.Embedding(vocab_size, d_ext) #, padding_idx=0)
+        projector.weight.data.copy_(weights)
+        projector.weight.requires_grad = not freeze
+
+        # To project onto Delphi embedding space
+        return nn.Sequential([
+            projector,
+            nn.Linear(d_ext, n_embed, bias=False)
+        ])
+
 
     @property
     def weight(self):
         return self.projector.weight
+
+
+    @property
+    def vocab_len(self):
+        # if self.config.lower() == "pretrained":
+        return self.projector.weight.shape[0]
+
 
     def build_mlp_projector(self, config):
 
@@ -882,7 +903,7 @@ class Delphi(torch.nn.Module):
     #     return attn_mask
     
 
-    def cross_entropy_loss(self, logits, targets, pass_tokens, agg=None):
+    def cross_entropy_loss(self, logits, targets, agg=None): #, pass_tokens, agg=None):
         '''
         Cross entropy loss for the next token prediction.
         Arguments:
@@ -894,21 +915,21 @@ class Delphi(torch.nn.Module):
 
         n_classes = logits.size(-1)            
         if agg == "per_token":
-            log_softmax = F.log_softmax(logits.view(-1, n_classes)[pass_tokens], dim=-1)
-            loss_ce_per_token = log_softmax[torch.arange(log_softmax.size(0)), targets.view(-1)[pass_tokens]]
+            log_softmax = F.log_softmax(logits.view(-1, n_classes), dim=-1)
+            loss_ce_per_token = log_softmax[torch.arange(log_softmax.size(0)), targets.view(-1)]
             return loss_ce_per_token
         if agg == "per_disease":
-            loss_ce_per_token = self.cross_entropy_loss(logits, targets, pass_tokens, agg="per_token")
-            loss_ce_agg_per_disease = pd.DataFrame([loss_ce_per_token, targets.view(-1)[pass_tokens].cpu().numpy()]).T.\
+            loss_ce_per_token = self.cross_entropy_loss(logits, targets, agg="per_token")
+            loss_ce_agg_per_disease = pd.DataFrame([loss_ce_per_token, targets.view(-1).cpu().numpy()]).T.\
                 set_axis(["log_p", "token_id"], axis=1).\
                 astype({"token_id": int}).\
                 groupby("token_id").sum().\
                 log_p.apply(lambda x: x.item())
-            return loss_ce_agg_per_disease / pass_tokens.sum().item()
+            return loss_ce_agg_per_disease / len(logits) # pass_tokens.sum().item()
         elif agg is None:
             loss_ce = F.cross_entropy(
-                logits.reshape(-1, n_classes)[pass_tokens], 
-                targets.reshape(-1)[pass_tokens], 
+                logits.reshape(-1, n_classes), 
+                targets.reshape(-1), 
                 ignore_index=-1
             )
         else:
@@ -1068,7 +1089,9 @@ class Delphi(torch.nn.Module):
         emb     = emb.squeeze(1)
         domains = domains.squeeze(1)
         
+        print("emb.requires_grad:", emb.requires_grad)
         self._trace = dict(domains=domains, tokens=x, emb=emb, ages=ages)
+        print("emb.requires_grad:", emb.requires_grad)
         
         # for domain in ages:
         emb += self.transformer.age_embedding(ages)
@@ -1088,7 +1111,7 @@ class Delphi(torch.nn.Module):
 
         h = self.transformer.ln_f(h)        
         logits = self.embedding_to_logits(h)
-
+        
         return logits, att
 
         # self.lm_head(

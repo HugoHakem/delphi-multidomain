@@ -19,6 +19,7 @@ import mlflow
 from mlflow.tracking import MlflowClient
 from mlflow.entities import Metric
 
+from tqdm import tqdm
 from dataclasses import asdict, dataclass, field
 
 from omegaconf import OmegaConf
@@ -101,8 +102,6 @@ class TrainBaseConfig:
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
-from tqdm import tqdm 
-
 class Trainer():
 
     def __init__(self, model, training_loader, valid_loader, test_loader, optimizer):
@@ -118,40 +117,61 @@ class Trainer():
     def get_vocab_len(self, domain_name):
         self.transformer.embed.domain_embed[domain_name].weight.shape[0]
 
+
     def train(self):
+        
 
         for batch in tqdm(self.training_loader):
             
-            x, ages, subject_ids = self.get_tensors_from_batch(batch)            
-
+            self.optimizer.zero_grad()
+            
+            domain_to_int = { k: i for i, k in enumerate(self.model.transformer.embed.domain_embed.keys()) }
+            predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
+            predicted_domains_int = torch.tensor([ domain_to_int[dname] for dname in predicted_domains])
+            
+            x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
             max_ages = model.get_max_ages_per_subject(ages, subject_ids)
-            x, ages, subject_ids = self.model.insert_no_event_tokens(x, ages, subject_ids)
-            x, ages, subject_ids = self.model.mask_tokens_after_age(x, ages, subject_ids, max_ages)
-            x, ages, subject_ids = self.pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
+            x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
+            x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+            x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
             
             logits, att = model(x, ages, subject_ids)
             
-            #TODO: this is a workaround to keep track which domain each token belongs to
-            domains = model._trace['domains']
-
-            domains_to_predict = ['diseases', 'death']
-
-            logits = torch.cat([logits[dname] for dname in domains_to_predict], axis=-1)                        
-            
-            targets     = model._trace['tokens'][:,1:];
-            target_ages = model._trace['ages'][:,1:];
-            input_ages  = model._trace['ages'][:,:-1];
+            domains     = model._trace['domains']
+            targets     = model._trace['tokens'][:,1:]
+            target_ages = model._trace['ages'][:,1:]
+            input_ages  = model._trace['ages'][:,:-1]
             target_domains = domains[:,1:];
             
-            domain_to_int = { k: i for i, k in enumerate(x.keys()) }
+            predict_mask = torch.isin(target_domains, predicted_domains_int.to('cuda'))
             
-            import ipdb; ipdb.set_trace()
+            logits    = torch.cat([logits[dname] for dname in predicted_domains], axis=-1)
+            f_logits  = logits[predict_mask]
+            f_domains = target_domains[predict_mask]
+            local_ids = targets[predict_mask]
+            
+            offsets_per_domain = get_offset_per_domain(model, domains_of_interest=predicted_domains)
+            
+            offsets = offsets_per_domain[f_domains]
+            global_ids = offsets + local_ids
+                        
+            loss_ce = model.cross_entropy_loss(f_logits, global_ids)
+            loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
+            print(loss_ce_per_disease)
 
-            logits_flat = logits.reshape(-1, logits.shape[-1])
+            # loss = torch.nn.functional.cross_entropy(f_logits, global_ids)
 
+            before = model.transformer.embed.domain_embed['diseases'].weight.clone()
+            loss_ce.backward(retain_graph=True)
+            print(f"{loss_ce=}")
+            
+            embed_param = model.transformer.embed.domain_embed['diseases'].weight
 
-            for dname in ['diseases', 'death']:
-                loss = model.compute_loss(logits, tokens[dname][:,1:], ages[dname][:,1:])
+            if os.environ.get("DEBUG", False):
+                import ipdb; ipdb.set_trace()
+
+            self.optimizer.step()
+            print(torch.mean((model.transformer.embed.domain_embed['diseases'].weight - before).abs()))
 
 
         # from torch.profiler import profile, record_function, ProfilerActivity    
@@ -264,6 +284,16 @@ class Trainer():
         model.train()   
         return out
 
+
+def get_offset_per_domain(model, domains_of_interest):
+    
+    domain_to_int = { k: i for i, k in enumerate(model.transformer.embed.domain_embed.keys()) } 
+    vocab_lens = { domain_to_int[k]: v.vocab_len for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest }
+    offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
+    offsets_per_domain = torch.tensor(offsets_per_domain).to('cuda')
+    return offsets_per_domain
+
+
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
 domain_config = {
@@ -275,7 +305,7 @@ domain_config = {
   "padding":     EmbedConfig(projector="embed")    
 }
 
-ATTENTION_SCHEME = 12 * [ "[hla_alleles]:bidirectional,[sex,disease,lifestyle,death]:causal(mask_ties=True)" ]
+ATTENTION_SCHEME = 12 * [ "[hla_alleles, sex]:bidirectional,[sex,disease,lifestyle,death]:causal(mask_ties=True)" ]
 
 cfg = DelphiConfig(    
     token_dropout=0.1,
@@ -340,22 +370,62 @@ optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), devi
 #         pp[dname] = x_embed + age_embed
 
 
+
+
+
 trainer = Trainer(model, *dataloaders, optimizer)
 trainer.train()  
 
+
 # %%
+predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
+predicted_domains_int = torch.tensor([ domain_to_int[dname] for dname in predicted_domains])
+
 batch = next(iter(dataloaders[0]))
 x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
-
 max_ages = model.get_max_ages_per_subject(ages, subject_ids)
-
 x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
 x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-x, ages, subject_ids = pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
+x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
 
 logits, att = model(x, ages, subject_ids)
 
-# %%
-logits
-# %%
+domains     = model._trace['domains']
+targets     = model._trace['tokens'][:,1:];
+target_ages = model._trace['ages'][:,1:];
+input_ages  = model._trace['ages'][:,:-1];
+target_domains = domains[:,1:];
 
+predict_mask = torch.isin(target_domains, predicted_domains_int.to('cuda'))
+
+logits    = torch.cat([logits[dname] for dname in predicted_domains], axis=-1)
+f_logits  = logits[predict_mask]
+f_domains = target_domains[predict_mask]
+local_ids = targets[predict_mask]
+
+offsets_per_domain = get_offset_per_domain(model, domains_of_interest=predicted_domains)
+
+offsets = offsets_per_domain[f_domains]
+global_ids = offsets + local_ids
+global_ids
+
+f_logits.shape
+
+torch.nn.functional.cross_entropy(f_logits, global_ids)
+
+# %%
+def local_to_global_ids(local_ids):
+
+    vocab_lens = { domain_to_int[k]: v.vocab_len for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest }
+    offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
+    offsets_per_domain = torch.tensor(offsets_per_domain).to('cuda')
+    local_ids = targets[torch.isin(target_domains, domains_of_interest_int.to('cuda'))]
+    f_domains = target_domains[mask]
+    offsets = offsets_per_domain[f_domains]
+    global_ids = offsets + local_ids
+    return global_ids
+
+# for dname in ['diseases', 'death']:
+    # loss = model.compute_loss(logits, tokens[dname][:,1:], ages[dname][:,1:])
+
+# %%
