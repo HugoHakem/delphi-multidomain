@@ -143,7 +143,7 @@ class Trainer():
             input_ages  = model._trace['ages'][:,:-1]
             target_domains = domains[:,1:];
             
-            predict_mask = torch.isin(target_domains, predicted_domains_int.to('cuda'))
+            predict_mask = torch.isin(target_domains, predicted_domains_int.to(DEVICE))
             
             logits    = torch.cat([logits[dname] for dname in predicted_domains], axis=-1)
             f_logits  = logits[predict_mask]
@@ -290,7 +290,7 @@ def get_offset_per_domain(model, domains_of_interest):
     domain_to_int = { k: i for i, k in enumerate(model.transformer.embed.domain_embed.keys()) } 
     vocab_lens = { domain_to_int[k]: v.vocab_len for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest }
     offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
-    offsets_per_domain = torch.tensor(offsets_per_domain).to('cuda')
+    offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
     return offsets_per_domain
 
 
@@ -333,7 +333,7 @@ train_dataset, valid_dataset = random_split(
     generator=torch.Generator().manual_seed(42)
 )
 dataloaders = [ 
-    DelphiDataloader(d, batch_size=32) 
+    DelphiDataloader(d, batch_size=4) 
     for d in [train_dataset, valid_dataset, test_dataset] 
 ]
 
@@ -396,7 +396,7 @@ target_ages = model._trace['ages'][:,1:];
 input_ages  = model._trace['ages'][:,:-1];
 target_domains = domains[:,1:];
 
-predict_mask = torch.isin(target_domains, predicted_domains_int.to('cuda'))
+predict_mask = torch.isin(target_domains, predicted_domains_int.to(DEVICE))
 
 logits    = torch.cat([logits[dname] for dname in predicted_domains], axis=-1)
 f_logits  = logits[predict_mask]
@@ -418,8 +418,8 @@ def local_to_global_ids(local_ids):
 
     vocab_lens = { domain_to_int[k]: v.vocab_len for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest }
     offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
-    offsets_per_domain = torch.tensor(offsets_per_domain).to('cuda')
-    local_ids = targets[torch.isin(target_domains, domains_of_interest_int.to('cuda'))]
+    offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
+    local_ids = targets[torch.isin(target_domains, domains_of_interest_int.to(DEVICE))]
     f_domains = target_domains[mask]
     offsets = offsets_per_domain[f_domains]
     global_ids = offsets + local_ids
