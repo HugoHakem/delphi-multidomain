@@ -112,8 +112,14 @@ class Trainer():
         self.test_loader     = test_loader
         self.optimizer       = optimizer
         self.scheduler       = scheduler
-        
+                
         self.current_epoch   = 0
+
+        self.domain_to_int = { k: i for i, k in enumerate(self.model.transformer.embed.domain_embed.keys()) }
+        self.predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
+        self.predicted_domains_int = torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(DEVICE)
+
+        self.outputs = []
 
     # ——————————————————————————————————————————————————————————————————————————————
    
@@ -124,70 +130,153 @@ class Trainer():
     def train(self, max_epochs=1000):
         
         for epoch in range(self.current_epoch, max_epochs):
-            self.current_epoch = epoch
+            
+            self.current_epoch = epoch            
             self.train_epoch()
+            self.valid_epoch()
 
-    
+
+    def shared_step(self, batch, batch_idx, epoch):
+
+        model = self.model
+        x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
+        max_ages = model.get_max_ages_per_subject(ages, subject_ids)
+        x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
+        x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+        x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=160)
+        
+        logits, att = model(x, ages, subject_ids)
+        
+        domains     = model._trace['domains']
+        targets     = model._trace['tokens'][:,1:]
+        input_ages  = model._trace['ages'][:,:-1]
+        target_ages = model._trace['ages'][:,1:]
+        target_domains = domains[:,1:];
+        
+        predict_mask = torch.isin(target_domains, self.predicted_domains_int)
+        
+        logits    = torch.cat([logits[dname] for dname in self.predicted_domains], axis=-1)
+        f_logits  = logits[predict_mask]
+        f_domains = target_domains[predict_mask]
+        local_ids = targets[predict_mask]
+        age_diff = (target_ages - input_ages)[predict_mask]
+        
+        offsets_per_domain = get_offset_per_domain(model, domains_of_interest=self.predicted_domains)
+        
+        offsets = offsets_per_domain[f_domains]
+        global_ids = offsets + local_ids
+
+        if os.environ.get("DEBUG", False):
+            import ipdb; ipdb.set_trace()
+
+        loss_ce = model.cross_entropy_loss(f_logits, global_ids)            
+        time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=1e-1, agg='mean')
+        # time_loss = (1e-5) * time_loss
+
+        loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease").to_frame().assign(epoch=epoch)
+
+        loss = {                
+            'ce_loss': loss_ce,            
+            'time_loss': time_loss,
+            'ce_ema_loss': torch.lerp(self.outputs[-1]['ce_ema_loss'], loss_ce, weight=0.01) if self.outputs else loss_ce,
+            'time_ema_loss': torch.lerp(self.outputs[-1]['time_ema_loss'], time_loss, weight=0.01) if self.outputs else time_loss,
+            'total': loss_ce + time_loss,
+            'ce_loss_per_disease': loss_ce_per_disease,
+        }
+
+        return loss
+
+
+
     def train_epoch(self):
 
         pbar = tqdm(self.training_loader)
 
-        for batch in pbar:
+        for i, batch in enumerate(pbar):
             
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad()                     
+            loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch)
+            self.outputs.append(loss)
             
-            domain_to_int = { k: i for i, k in enumerate(self.model.transformer.embed.domain_embed.keys()) }
-            predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
-            predicted_domains_int = torch.tensor([ domain_to_int[dname] for dname in predicted_domains])
+            loss['total'].backward()
+            self.optimizer.step() 
+            self.scheduler.step()
             
-            x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
-            max_ages = model.get_max_ages_per_subject(ages, subject_ids)
-            x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
-            x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-            x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=160)
-            
-            logits, att = model(x, ages, subject_ids)
-            
-            domains     = model._trace['domains']
-            targets     = model._trace['tokens'][:,1:]
-            input_ages  = model._trace['ages'][:,:-1]
-            target_ages = model._trace['ages'][:,1:]
-            target_domains = domains[:,1:];
-            
-            predict_mask = torch.isin(target_domains, predicted_domains_int.to(DEVICE))
-            
-            logits    = torch.cat([logits[dname] for dname in predicted_domains], axis=-1)
-            f_logits  = logits[predict_mask]
-            f_domains = target_domains[predict_mask]
-            local_ids = targets[predict_mask]
-            age_diff = (target_ages - input_ages)[predict_mask]
-            
-            offsets_per_domain = get_offset_per_domain(model, domains_of_interest=predicted_domains)
-            
-            offsets = offsets_per_domain[f_domains]
-            global_ids = offsets + local_ids
+            pbar.set_postfix({
+                "ce_loss": f"{loss['ce_loss'].item():.4f}", 
+                "time_loss": f"{loss['time_loss'].item():.4f}",
+                "loss_sm": f"{loss['ce_ema_loss'].item():.4f}", 
+                "time_loss_sm": f"{loss['time_ema_loss'].item():.4f}",
 
-            if os.environ.get("DEBUG", False):
-                import ipdb; ipdb.set_trace()
-
-            loss_ce = model.cross_entropy_loss(f_logits, global_ids)            
-            time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=0, agg='mean')
-            time_loss = (1e-5) * time_loss
-
-            loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
-
-            loss = {                
-                'ce_loss': loss_ce,
-                'time_loss': time_loss,
-                'total': loss_ce + time_loss
-            }
-
-            loss['ce_loss'].backward()
-
-            pbar.set_postfix({"loss": f"{loss_ce.item():.4f}", "time_loss": f"{time_loss.item()}"})
-
-            self.optimizer.step(); self.scheduler.step()
+            })
             
+            # domain_to_int = { k: i for i, k in enumerate(self.model.transformer.embed.domain_embed.keys()) }
+            # predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
+            # predicted_domains_int = torch.tensor([ domain_to_int[dname] for dname in predicted_domains])
+            
+            # model = self.model
+            # x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
+            # max_ages = model.get_max_ages_per_subject(ages, subject_ids)
+            # x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
+            # x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+            # x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=160)
+            # 
+            # logits, att = model(x, ages, subject_ids)
+            # 
+            # domains     = model._trace['domains']
+            # targets     = model._trace['tokens'][:,1:]
+            # input_ages  = model._trace['ages'][:,:-1]
+            # target_ages = model._trace['ages'][:,1:]
+            # target_domains = domains[:,1:];
+            # 
+            # predict_mask = torch.isin(target_domains, self.predicted_domains_int)
+            # 
+            # logits    = torch.cat([logits[dname] for dname in self.predicted_domains], axis=-1)
+            # f_logits  = logits[predict_mask]
+            # f_domains = target_domains[predict_mask]
+            # local_ids = targets[predict_mask]
+            # age_diff = (target_ages - input_ages)[predict_mask]
+            # 
+            # offsets_per_domain = get_offset_per_domain(model, domains_of_interest=self.predicted_domains)
+            # 
+            # offsets = offsets_per_domain[f_domains]
+            # global_ids = offsets + local_ids
+            
+            # if os.environ.get("DEBUG", False):
+            #     import ipdb; ipdb.set_trace()
+
+            # loss_ce = model.cross_entropy_loss(f_logits, global_ids)            
+            # time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=1e-1, agg='mean')
+            # # time_loss = (1e-5) * time_loss
+
+            # loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
+
+            # loss = {                
+            #     'ce_loss': loss_ce,
+            #     'time_loss': time_loss,
+            #     'total': loss_ce + time_loss
+            # }
+
+            # loss['total'].backward()
+
+            # pbar.set_postfix({"loss": f"{loss_ce.item():.4f}", "time_loss": f"{time_loss.item():.4f}"})
+
+            # self.optimizer.step(); self.scheduler.step()
+            
+
+    def valid_epoch(self):
+        
+        pbar = tqdm(self.valid_loader)
+
+        with torch.no_grad():
+            loss_outputs = []
+            for i, batch in enumerate(pbar):
+                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch)
+                loss_outputs.append(loss)
+        
+        import ipdb; ipdb.set_trace()            
+                
+
 
     def mlflow_logging(self):
 
@@ -288,6 +377,8 @@ domain_config = {
 }
 
 ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
+ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
+
 config = DelphiConfig(token_dropout=0.1, domains=domain_config, attention_scheme=ATTENTION_SCHEME)
 
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]

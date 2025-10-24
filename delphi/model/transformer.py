@@ -835,7 +835,7 @@ class Delphi(torch.nn.Module):
         self.build_model(config)
         initialize_weights(self, config=config)
         
-        self.max_seq_len = 128
+        # self.max_seq_len = 128
         
         self.PAD_TOKEN_ID = 0
         self.PAD_DOMAIN_ID = 0 
@@ -874,8 +874,8 @@ class Delphi(torch.nn.Module):
         return pass_tokens
 
 
-    def set_max_seq_len(self, max_seq_len):
-        self.max_seq_len = max_seq_len
+    # def set_max_seq_len(self, max_seq_len):
+        # self.max_seq_len = max_seq_len
 
 
     def set_valid_loss_mode(self, validation_loss_mode):
@@ -927,7 +927,7 @@ class Delphi(torch.nn.Module):
                 astype({"token_id": int}).\
                 groupby("token_id").sum().\
                 log_p.apply(lambda x: x.item())
-            return loss_ce_agg_per_disease / len(logits) # pass_tokens.sum().item()
+            return loss_ce_agg_per_disease / len(logits)
         elif agg is None:
             loss_ce = F.cross_entropy(
                 logits.reshape(-1, n_classes), 
@@ -940,7 +940,7 @@ class Delphi(torch.nn.Module):
         return loss_ce
 
 
-    def time_to_event_loss(self, logits, time_to_next, t_min, agg=None): # , pass_tokens, attn_mask, mask_ties):       
+    def time_to_event_loss(self, logits, time_to_next, t_min, agg=None):
         '''
         '''
         
@@ -950,7 +950,7 @@ class Delphi(torch.nn.Module):
         log_dt = - torch.log(dt + t_min).view(-1) 
         loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - log_dt.reshape(-1))) 
     
-        if agg is None:
+        if agg is None: 
             pass
         elif agg == "mean":
             loss_dt = loss_dt.mean()
