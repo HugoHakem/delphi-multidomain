@@ -144,7 +144,7 @@ class Trainer():
             max_ages = model.get_max_ages_per_subject(ages, subject_ids)
             x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
             x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-            x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=128)
+            x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=160)
             
             logits, att = model(x, ages, subject_ids)
             
@@ -160,6 +160,7 @@ class Trainer():
             f_logits  = logits[predict_mask]
             f_domains = target_domains[predict_mask]
             local_ids = targets[predict_mask]
+            age_diff = (target_ages - input_ages)[predict_mask]
             
             offsets_per_domain = get_offset_per_domain(model, domains_of_interest=predicted_domains)
             
@@ -169,11 +170,21 @@ class Trainer():
             if os.environ.get("DEBUG", False):
                 import ipdb; ipdb.set_trace()
 
-            loss_ce = model.cross_entropy_loss(f_logits, global_ids)
-            loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
-            loss_ce.backward()
+            loss_ce = model.cross_entropy_loss(f_logits, global_ids)            
+            time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=0, agg='mean')
+            time_loss = (1e-5) * time_loss
 
-            pbar.set_postfix({"loss": f"{loss_ce.item():.4f}"})
+            loss_ce_per_disease = model.cross_entropy_loss(f_logits, global_ids, agg="per_disease")
+
+            loss = {                
+                'ce_loss': loss_ce,
+                'time_loss': time_loss,
+                'total': loss_ce + time_loss
+            }
+
+            loss['ce_loss'].backward()
+
+            pbar.set_postfix({"loss": f"{loss_ce.item():.4f}", "time_loss": f"{time_loss.item()}"})
 
             self.optimizer.step(); self.scheduler.step()
             
@@ -254,16 +265,22 @@ class Trainer():
 def get_offset_per_domain(model, domains_of_interest):
     
     domain_to_int = { k: i for i, k in enumerate(model.transformer.embed.domain_embed.keys()) } 
-    vocab_lens = { domain_to_int[k]: v.vocab_len for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest }
+    vocab_lens = { 
+        domain_to_int[k]: v.vocab_len 
+        for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest 
+    }
     offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
     offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
     return offsets_per_domain
 
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
+from delphi.model.transformer import Delphi
+from data.dataset import DelphiDataset, DelphiDataloader
+
 domain_config = {
-  'diseases':    EmbedConfig(projector="embed", path=root_path / 'diseases', predict=True),
-  'death':       EmbedConfig(projector="embed", path=root_path / 'death', predict=True),
+  'diseases':    EmbedConfig(projector="embed", path=root_path / 'diseases',  predict=True),
+  'death':       EmbedConfig(projector="embed", path=root_path / 'death',     predict=True),
   'lifestyle':   EmbedConfig(projector="embed", path=root_path / 'lifestyle', age_jitter=True),
   "hla_alleles": EmbedConfig(projector="embed", path=root_path / 'hla_alleles'),
   "sex":         EmbedConfig(projector="embed", path=root_path / 'sex'),
@@ -272,13 +289,6 @@ domain_config = {
 
 ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
 config = DelphiConfig(token_dropout=0.1, domains=domain_config, attention_scheme=ATTENTION_SCHEME)
-
-# ——————————————————————————————————————————————————————————————————————————————————————
-
-import data.dataset
-data.dataset = importlib.reload(data.dataset)
-DelphiDataset = data.dataset.DelphiDataset
-DelphiDataloader = data.dataset.DelphiDataloader
 
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
 test_fold, dev_folds = [folds.pop(0)], folds
@@ -297,10 +307,6 @@ dataloaders = [
     for d in [train_dataset, valid_dataset, test_dataset] 
 ]
 
-delphi = importlib.reload(delphi)
-Delphi = delphi.model.transformer.Delphi
-
-# config = DelphiConfig(n_embd=120, domains=domain_config)
 model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
@@ -353,5 +359,3 @@ def local_to_global_ids(local_ids):
 
 # for dname in ['diseases', 'death']:
     # loss = model.compute_loss(logits, tokens[dname][:,1:], ages[dname][:,1:])
-
-# %%
