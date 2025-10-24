@@ -940,38 +940,42 @@ class Delphi(torch.nn.Module):
         return loss_ce
 
 
-    def time_to_event_loss(self, logits, time_to_next, pass_tokens, attn_mask, mask_ties, t_min, agg=None):       
+    def time_to_event_loss(self, logits, time_to_next, t_min, agg=None): # , pass_tokens, attn_mask, mask_ties):       
         '''
         '''
         
         lse = torch.logsumexp(logits,-1) ## More forgiving than using torch.max() for the most likely next event
         lse = - torch.log(torch.exp(-lse) + t_min)
-
         dt  = torch.clamp(time_to_next, min=1.0)
-        dd = dict(device=logits.device, dtype=torch.float32)
-        block_size = attn_mask.size(-1)
-
-        if mask_ties:
-            # Use time from last untied token
-            dt = torch.gather(
-                dt, -1, (attn_mask * torch.arange(0, block_size, **dd).view(1, 1, 1, -1)).max(-1).indices.squeeze((1, 2))
-            )  
-
-        log_dt = - torch.log(dt + t_min).view(-1)        
-
-        ## Exponential log-likelihood (real statistics, TM)
+        log_dt = - torch.log(dt + t_min).view(-1) 
         loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - log_dt.reshape(-1))) 
-
+    
         if agg is None:
             pass
         elif agg == "mean":
-            loss_dt = (loss_dt[pass_tokens]).mean()
+            loss_dt = loss_dt.mean()
         elif agg == "sum":
-            loss_dt = (loss_dt[pass_tokens]).sum()
+            loss_dt = loss_dt.sum()
         elif agg == "per_disease":
             raise NotImplementedError
           
         return loss_dt
+    
+        # dd = dict(device=logits.device, dtype=torch.float32)
+        # block_size = attn_mask.size(-1)
+
+        # if mask_ties:
+            # Use time from last untied token
+            # dt = torch.gather(
+                # dt, -1, (attn_mask * torch.arange(0, block_size, **dd).view(1, 1, 1, -1)).max(-1).indices.squeeze((1, 2))
+            # )  
+
+        # log_dt = - torch.log(dt + t_min).view(-1)        
+
+        ## Exponential log-likelihood (real statistics, TM)
+        # loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - log_dt.reshape(-1))) 
+
+        
 
     
     def blackout_ignored(self, logits, ignore_tokens):
