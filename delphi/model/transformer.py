@@ -530,6 +530,7 @@ class DelphiEmbedding(nn.Module):
         self.token_drop   = nn.Dropout(config.token_dropout)        
         
         self.domain_embed = nn.ModuleDict()
+        
         if len(config.domains) > 0:            
             for domain_name, domain_cfg in config.domains.items():
                 self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, domain_name=domain_name, n_embed=config.n_embd)
@@ -636,45 +637,6 @@ class CompetingExpHead(nn.Module):
 
 
 # ———————————————————— MASKS ————————————————————————————————————————————————————————————————
-
-# def causal_attention_mask(
-#     pad: torch.Tensor,
-#     mask_ties: bool = False,
-#     t0: Optional[torch.Tensor] = None,
-#     t1: Optional[torch.Tensor] = None,
-# ) -> torch.Tensor:
-# 
-#     b, l = pad.shape
-#     device = pad.device
-#     dd = {"device": device}
-# 
-#     lower_tri_mask = torch.tril(torch.ones((l, l), **dd))
-#     lower_tri_mask = lower_tri_mask.view(1, l, l)
-#     pad_mask = pad.view(b, 1, l).to(torch.int)
-#     attn_mask = pad_mask * lower_tri_mask
-# 
-#     if mask_ties:
-#         assert t0 is not None
-#         if t1 is not None:
-#             ties_mask = (t1.view(b, l, 1) != t0.view(b, 1, l)).to(torch.int)
-#             attn_mask *= ties_mask
-# 
-#     attn_mask += (attn_mask.sum(-1, keepdim=True) == 0) * torch.diag(
-#         torch.ones(l, **dd)
-#     ) > 0
-# 
-#     return attn_mask.unsqueeze(1)
-
-
-def target_mask(x1: torch.Tensor, ignore_tokens: list[int]) -> torch.Tensor:
-
-    is_valid_target = x1 != 0
-    
-    for k in ignore_tokens:
-        is_valid_target *= x1 != k
-
-    return is_valid_target
-
 
 # TODO: make sure that this is not needed anymore.
 def ties_adjusted_delta_t(t0, t1, attn_mask, mask_ties: bool, eps: float = 1.0) -> torch.Tensor:
@@ -833,6 +795,7 @@ class Delphi(torch.nn.Module):
             self.config.attention_scheme = self.config.n_layer * self.config.attention_scheme
 
         self.build_model(config)
+        
         initialize_weights(self, config=config)
         
         # self.max_seq_len = 128
@@ -882,37 +845,14 @@ class Delphi(torch.nn.Module):
         self.validation_loss_mode = validation_loss_mode
    
 
-    # def build_attention_mask(self, idx, age, targets, targets_age, mask_ties):
-    # 
-    # 
-    #     # causal self-attention mask, to ensure that attention is only applied to the left in the input sequence
-    #     dd = dict(device=idx.device)
-    #     # Do not attend to padded positions
-    #     attn_mask = (idx>0).view(idx.size(0), 1, 1, idx.size(1)) * (idx>0).view(idx.size(0), 1, idx.size(1), 1)  
-    #     
-    #     attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), **dd))[None,None,:,:] > 0
-    #     
-    #     # if targets is not None and self.config.mask_ties:
-    #     if targets is not None and mask_ties:
-    #         # Mask co-occuring tokens
-    #         attn_mask *= ((age.view(idx.size(0),1,1,idx.size(1)) != targets_age.view(idx.size(0),1,idx.size(1),1))) 
-    #         attn_mask += (attn_mask.sum(-1, keepdim=True)==0) * torch.diag(torch.ones(idx.size(1), **dd)) > 0
-    #     
-    #     # Except for padding
-    #     attn_mask = attn_mask + (idx==0).view(idx.size(0), 1, 1, idx.size(1)) * torch.diag(torch.ones(idx.size(1), **dd)) > 0 
-    #     attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), **dd))[None,None,:,:] > 0
-    #     
-    #     return attn_mask
-    
-
-    def cross_entropy_loss(self, logits, targets, agg=None): #, pass_tokens, agg=None):
+    def cross_entropy_loss(self, logits, targets, agg=None):
         '''
         Cross entropy loss for the next token prediction.
         Arguments:
             logits: Tensor, shape [batch_size, sequence_length, vocab_size]
             targets: Tensor, shape [batch_size, sequence_length]
             pass_tokens: Tensor of bools, batch_size * sequence_length
-            agg: one of None, "mean" or "sum"
+            agg: one of None, "per_token" or "per_disease"
         '''
 
         n_classes = logits.size(-1)            
@@ -941,6 +881,7 @@ class Delphi(torch.nn.Module):
 
 
     def time_to_event_loss(self, logits, time_to_next, t_min, agg=None):
+
         '''
         '''
         
@@ -976,17 +917,6 @@ class Delphi(torch.nn.Module):
         # loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - log_dt.reshape(-1))) 
 
         
-
-    
-    def blackout_ignored(self, logits, ignore_tokens):
-
-        if self.validation_loss_mode:
-            ignore_tokens += [1]
-            logits[..., ignore_tokens] = -torch.inf
-
-        return logits
-
-
     def to_tensor(self, x, ages, embeddings, subject_ids):
 
         all_tokens, all_embeddings, all_ages, all_domains, all_subjects = [], [], [], [], []
@@ -1027,12 +957,6 @@ class Delphi(torch.nn.Module):
             e_subj = embeddings_flat[mask][order]
             d_subj = domains_flat[mask][order]
             
-            # sort by age
-            # t_subj = t_subj[order]
-            # a_subj = a_subj[order]
-            # e_subj = e_subj[order]
-            # d_subj = d_subj[order]
-    
             batch_tokens.append(t_subj.unsqueeze(0))
             batch_ages.append(a_subj.unsqueeze(0))
             batch_embeddings.append(e_subj.unsqueeze(0))
@@ -1050,43 +974,10 @@ class Delphi(torch.nn.Module):
         validation_loss_mode: bool = False,
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], torch.Tensor]:
 
-        '''
-        # self.set_valid_loss_mode(validation_loss_mode)
-        
-        max_ages = self.get_max_ages_per_subject(age, subject_ids)
-        
-        # get tokens with additional no-event tokens interleaved for the domains that need it (typically 'diseases')        
-        x, age, subject_ids = self.insert_no_event_tokens(x, age, subject_ids)
-        x, age, subject_ids = self.mask_tokens_after_age (x, age, subject_ids, max_ages)
-                
-        x = self.transformer.embed(x=x) 
-        
-        for domain in age:
-            age_emb = self.transformer.age_embedding(age[domain])
-            x[domain] += age_emb
-
-        # mask tokens in a domain-wise manner                
-        # x = self.transformer.drop(x)
-
-        x, age, domains = self.build_seq_for_transformer(x, age, subject_ids)
-        # input, target = x[:, :-1], x[:, 1:]
-        # input_age, target_age = age[:, :-1], age[:, 1:]
-
-        # attn_masks = self.build_attention_mask(x[:-1], input_age, x[1:], target_age, domains, True)#self.attention_scheme)
-        # attn_masks = self.build_attention_mask(x[:,:-1], input_age, x[:,1:], target_age, True) #self.attention_scheme)
-
-        # attn_mask = causal_attention_mask(
-        #     pad=self.is_not_padding(idx), 
-        #     t1=target_age, t0=input_age, 
-        #     mask_ties=self.config.mask_ties
-        # )                
-        '''
-        
         domain2id = { k: i for i, k in enumerate(x) }
         
         emb = self.transformer.embed(x)
         x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb, subject_ids)
-        
         
         # TODO: remove the need for these squeeze's
         ages    = ages.int().squeeze(1)
@@ -1124,12 +1015,12 @@ class Delphi(torch.nn.Module):
 
     def compute_loss(self, logits, targets, targets_age):
 
-        loss = {
+        loss = EasyDict({
            "loss_ce": self.cross_entropy_loss(targets),
            "loss_dt": self.time_to_event_loss(targets, targets_age), 
            "loss": loss_ce * self.config.ce_beta + loss_dt * self.config.dt_beta
            # or "ce", "dt", "total"
-        }
+        })
 
         return loss
 
@@ -1254,3 +1145,7 @@ class Delphi(torch.nn.Module):
         model = model.to(device)
 
         return model
+
+    
+    def add_token_domain(self, new_token_domain):
+        raise NotImplementedError("add_token_domain method not yet implemented.")
