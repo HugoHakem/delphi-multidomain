@@ -38,8 +38,14 @@ from delphi.model.transformer import (
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
-# ————————————————————————————————————————————————————————————————————————————————————————————
+RUN_NAME = os.getenv("RUN_NAME", "default")
 
+odir = f"output/{RUN_NAME}"
+
+os.makedirs(odir)
+
+# ————————————————————————————————————————————————————————————————————————————————————————————
+'''
 @dataclass
 class TrainBaseConfig:
 
@@ -68,8 +74,10 @@ class TrainBaseConfig:
     model: dict = field(default_factory=dict)
     optim: OptimConfig = field(default_factory=OptimConfig)
     # log: TrainLogConfig = field(default_factory=TrainLogConfig)
-
+'''
 # ————————————————————————————————————————————————————————————————————————————————————————————
+
+EACH_VAL = 3200
 
 def local_to_global_ids(local_ids):
 
@@ -105,6 +113,8 @@ class Trainer():
 
         self.train_outputs = []
         self.valid_outputs = []
+        self.test_outputs = []
+        self._valid_counter = 0
         
 
     # ——————————————————————————————————————————————————————————————————————————————
@@ -115,13 +125,13 @@ class Trainer():
 
     def train(self, max_epochs=1000):
         
-        self.valid_epoch()
+        self.valid_epoch(n_batches=100)
 
         for epoch in range(self.current_epoch, max_epochs):
             
             self.current_epoch = epoch            
             self.train_epoch()
-            self.valid_epoch()
+            # self.valid_epoch(n_batches=100)
 
 
     def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training"):
@@ -187,7 +197,21 @@ class Trainer():
             return loss
 
 
-    def train_epoch(self):
+    def valid_epoch_end(self, loss_outputs):
+        import pandas as pd
+        
+        self._valid_counter += 1        
+
+        return pd.concat([x['ce_loss_per_disease'] for x in loss_outputs]).\
+            reset_index().\
+            pivot(index="token_id", columns="batch_idx", values="log_p").\
+            fillna(0).\
+            sum(axis=1).\
+            sort_values()
+    
+    
+
+    def train_epoch(self, n_batches=None):
 
         pbar = tqdm(self.training_loader)
 
@@ -195,9 +219,12 @@ class Trainer():
             
             self.optimizer.zero_grad()                     
             loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training")
-            self.outputs.append(loss)
+            self.train_outputs.append(loss)
             
             loss['total'].backward()
+
+            if (i % EACH_VAL) == 0:
+                self.valid_epoch(n_batches=1000)
 
             pbar.set_postfix({
                 "ce_loss":      f"{loss['ce_loss'].item():.4f}", 
@@ -209,11 +236,12 @@ class Trainer():
             self.optimizer.step() 
             self.scheduler.step()
 
-            if self.n_train_batches is not None and i == n_batches:
+            if n_batches is not None and i == n_batches:
                 break
 
 
     def epoch_end(self):
+
         self.train_outputs = []
         self.valid_outputs = []
 
@@ -235,10 +263,12 @@ class Trainer():
                     "time_loss_sm": f"{loss['time_ema_loss'].item():.4f}",
                 })
             
-                if self.n_val_batches is not None and i == n_batches:
+                if n_batches is not None and i == n_batches:
                     break
         
-        import ipdb; ipdb.set_trace()                            
+        loss_outputs = self.valid_epoch_end(loss_outputs).reset_index()
+        loss_outputs.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
+        # import ipdb; ipdb.set_trace()                 
 
 
     def mlflow_logging(self):
@@ -248,17 +278,22 @@ class Trainer():
 
     # ——————————————————————————————————————————————————————————————————————————————
     def get_tensors_from_batch(self, batch):
-
-        SUBJECT_ID_COLUMN, AGE_COLUMN, TOKEN_COLUMN = 0, 1, 2
+        
         tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
         
-        for dname in batch:   
+        for dname in batch:               
+            SUBJECT_ID_COLUMN, AGE_COLUMN, TOKEN_COLUMN = 0, 1, 2
             domain_data = batch.get(dname, [])  
             if len(domain_data) == 0:
                 domain_data = domain_data.view(0, 3)
-            tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
-            ages[dname] = domain_data[:, AGE_COLUMN]
-            subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
+            if dname == "genetic_pcs":
+                tokens[dname] = domain_data[:, 1:-1].float()
+                ages[dname] = domain_data[:, -1]
+                subject_ids[dname] = domain_data[:, 0]
+            else:    
+                tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
+                ages[dname] = domain_data[:, AGE_COLUMN]
+                subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
 
         return tokens, ages, subject_ids
 
@@ -301,25 +336,29 @@ class Trainer():
 
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
+tokens_path = root_path / 'tokens'
 domain_config = {
-  'diseases':    EmbedConfig(projector="embed", path=root_path / 'diseases',  predict=True),
-  'death':       EmbedConfig(projector="embed", path=root_path / 'death',     predict=True),
-  'lifestyle':   EmbedConfig(projector="embed", path=root_path / 'lifestyle', age_jitter=True),
-#   "hla_alleles": EmbedConfig(projector="embed", path=root_path / 'hla_alleles'),
-  "sex":         EmbedConfig(projector="embed", path=root_path / 'sex'),
+#  'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
+  'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',  predict=True),
+  'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',     predict=True),
+  'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle', age_jitter=True),  
+  "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
+  "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex', at_birth=True),
   "padding":     EmbedConfig(projector="embed")    
 }
 
 ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
-ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
+# ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
 ATTENTION_SCHEME = 12 * [ "[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
+# ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,genetic_pcs,death]:causal(mask_ties=True)" ]
+ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
 
 config = DelphiConfig(token_dropout=0.1, domains=domain_config, attention_scheme=ATTENTION_SCHEME)
 
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
 test_fold, dev_folds = [folds.pop(0)], folds
 
-dataset_config = dict(root="../data/transforms", domains=domain_config, exclusions=[]) # "subject_lists/genetic_white_ids.txt"])
+dataset_config = dict(root=root_path, domains=domain_config, exclusions=[]) # "subject_lists/genetic_white_ids.txt"])
 dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config).to(DEVICE)
 test_dataset = DelphiDataset(subjects=test_fold, **dataset_config)
 
@@ -336,5 +375,9 @@ torch.compile(model)
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
 trainer = Trainer(model, *dataloaders, optimizer, scheduler, n_train_batches=1000, n_val_batches=1000)
 trainer.train(max_epochs=1000)  
+
+# %%
+
+
 
 # %%

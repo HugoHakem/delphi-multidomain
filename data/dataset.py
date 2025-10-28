@@ -28,7 +28,7 @@ from torch.utils.data import Dataset, DataLoader
 from delphi.model.components import DelphiConfig
 from delphi.model.transformer import Delphi
 from delphi.optim import OptimConfig, configure_optimizers
-from typing import Union
+from typing import Union, Callable
 
 DAYS_PER_YEAR = 365.25
 DEVICE = os.getenv("DEVICE", 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -40,39 +40,61 @@ class TokenDomain:
     '''
     '''
 
-    def __init__(self, path: str, predict: bool, age_jitter: bool, subjects: Union[None, set]=None):
+    def __init__(self, path: str, predict: bool, age_jitter: bool, type: str, subjects: Union[None, set]=None, at_birth=False, aggregation_strategy: Union[None, Callable]=None):
+        
         """
         Load a single domain: tokenizer.yaml + tokens.csv
         """
         self.path = path
         self.predict = predict
         self.age_jitter = age_jitter
-        self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))
+        self.type = type
+        self.at_birth = at_birth
+
+        assert type in ["categorical", "continuous"], f"Domain type must be either 'categorical' or 'continuous', got {type}"
+
+        self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))        
+        self.tokens = self._load_tokens(os.path.join(path, "tokens.csv"), subjects=subjects)
         
-        self.tokens = self._load_tokens(os.path.join(path, "tokens.csv"), subjects=subjects)                
+        self.aggregation_strategy = aggregation_strategy
+        
+        if self.aggregation_strategy is not None:
+            raise NotImplementedError
+
 
     def _load_tokenizer(self, path: str) -> Dict:
         with open(path, "r") as f:
             tokenizer = yaml.safe_load(f)        
         return { idx: token for idx, token in enumerate(tokenizer) }  
 
+
     def _load_tokens(self, path: str, subjects) -> pd.DataFrame:
+                
         if not os.path.exists(path):
             assert False, f"Tokens file {path} does not exist"
-            return pd.DataFrame(columns=["subject_id", "token_id", "age"])
+            if self.type == "categorical":
+                return pd.DataFrame(columns=["subject_id", "token_id", "age"])
+            elif self.type == "continuous":
+                return pd.DataFrame(columns=["subject_id", "values", "age"])
+        
         df = pd.read_csv(path)
         
-        # enforce schema
-        if "subject_id" not in df.columns or "token_id" not in df.columns:
-            raise ValueError(f"Invalid tokens file {path}, must contain subject_id and token_id")
+        # enforce schema        
+        if "subject_id" not in df.columns:
+            raise ValueError(f"Invalid tokens file {path}, must contain subject_id")
+        if self.type == "categorical" and "token_id" not in df.columns:
+            raise ValueError(f"Invalid tokens file {path}, must contain token_id since type==categorical")
+            
         if "age" not in df.columns:
-            df["age"] = None
+            if self.at_birth:
+                df["age"] = 0
+            else:
+                df["age"] = None
 
         if subjects is not None:
             df = df.query("subject_id in @subjects")
-        # see if I need to return also the offsets for each subject
 
-        self._as_dataframe = df 
+        self._as_dataframe = df
 
         return torch.tensor(df.values) 
     
@@ -130,10 +152,10 @@ class DelphiDataset:
         # Load the data        
         self.domains = EasyDict()
         for dname, dinfo in domains.items():
-            datafile = self.root / dname
             if dname == "padding":
                 continue
-            self.domains[dname] = TokenDomain(datafile, predict=dinfo.predict, age_jitter=dinfo.age_jitter) 
+            datafile = self.root / "tokens" / dname
+            self.domains[dname] = TokenDomain(datafile, predict=dinfo.predict, age_jitter=dinfo.age_jitter, type=dinfo.type, at_birth=dinfo.at_birth) 
 
         # ——————————————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
         self.included_subjects = pd.concat([
@@ -569,7 +591,7 @@ def get_domain_id(domain_name):
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 def collate_fn_domains(batch):
-
+    
     domains_dict = {}
     for item in batch:
         for dname, arr in item.items():

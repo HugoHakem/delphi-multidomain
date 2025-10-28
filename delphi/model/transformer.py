@@ -309,10 +309,12 @@ class EmbedConfig:
     n_hidden:   Optional[int] = None
     input_size: Optional[int] = None
     pretrained_path: Optional[str] = None  # path to .pt/.npy/.pkl with lookup table
-    freeze: bool = False                    # if previous lookup table is to be left fixed
+    freeze: bool = False                   # if previous lookup table is to be left fixed
     path: Optional[str] = None
     predict: bool = False
     age_jitter: bool = False
+    type: str = "categorical"
+    at_birth: bool = False
 
 @dataclass
 class DelphiConfig:
@@ -1041,7 +1043,11 @@ class Delphi(torch.nn.Module):
     def mask_tokens_after_age(self, tokens, ages, subject_ids, max_ages):
  
         for dname in tokens:
+            if dname == "genetic_pcs":
+                continue
+            
             for subj, max_age in max_ages.items():
+
                 tokens[dname] = tokens[dname].masked_fill(
                     (subject_ids[dname] == subj) & (ages[dname] > max_ages[subj]),
                     self.transformer.embed['padding'].PADDING_TOKEN
