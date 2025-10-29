@@ -77,7 +77,7 @@ class TrainBaseConfig:
 '''
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
-EACH_VAL = 3236
+EVERY_VAL = 3236
 
 def local_to_global_ids(local_ids):
 
@@ -178,7 +178,8 @@ class Trainer():
         for epoch in range(self.current_epoch, max_epochs):
             
             self.current_epoch = epoch            
-            self.train_epoch(n_batches=10, eval_every=EACH_VAL)
+            # self.train_epoch(n_batches=10, eval_every=EVERY_VAL)
+            self.train_epoch(eval_every=EVERY_VAL)
             
             if self.early_stopper.step(self.mean_val_loss, model=self.model):
                 print(f"Early stopping triggered at epoch {self.current_epoch}")
@@ -223,24 +224,25 @@ class Trainer():
         time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=1e-1, agg='mean')
 
         outputs = getattr(self, stage[:5] + "_outputs")
+        
+        prefix = "" if add_prefix is None else add_prefix + "_"
 
         loss = EasyDict({                
-            'ce_loss': loss_ce,            
-            'time_loss': time_loss,
-            'ce_ema_loss': torch.lerp(outputs[-1]['ce_ema_loss'], loss_ce, weight=0.002) if outputs else loss_ce,
-            'time_ema_loss': torch.lerp(outputs[-1]['time_ema_loss'], time_loss, weight=0.002) if outputs else time_loss,
-            'total': loss_ce + time_loss,            
+            f'{prefix}ce_loss': loss_ce,            
+            f'{prefix}time_loss': time_loss,
+            f'{prefix}ce_ema_loss': torch.lerp(outputs[-1][f'{prefix}ce_ema_loss'], loss_ce, weight=0.002) if outputs else loss_ce,
+            f'{prefix}time_ema_loss': torch.lerp(outputs[-1][f'{prefix}time_ema_loss'], time_loss, weight=0.002) if outputs else time_loss,
+            f'{prefix}total': loss_ce + time_loss,            
         })
 
-        if add_prefix is not None:
-            loss = { f"{add_prefix}_{k}": v for k, v in loss.items() }
 
         if log_per_disease:
             loss_ce_per_disease = model.cross_entropy_loss(
                 f_logits, global_ids, agg="per_disease"
             ).to_frame().assign(batch_idx=batch_idx)
 
-            loss['ce_loss_per_disease'] = loss_ce_per_disease
+            loss[f'{prefix}ce_loss_per_disease'] = loss_ce_per_disease
+
 
         if return_att and return_logits: return loss, logits, att 
         elif return_logits:              return loss, logits
@@ -252,7 +254,7 @@ class Trainer():
         
         self._valid_counter += 1        
 
-        return pd.concat([x['ce_loss_per_disease'] for x in loss_outputs]).\
+        return pd.concat([x['val_ce_loss_per_disease'] for x in loss_outputs]).\
             reset_index().\
             pivot(index="token_id", columns="batch_idx", values="log_p").\
             fillna(0).\
@@ -273,13 +275,13 @@ class Trainer():
             loss['train_total'].backward()
 
             if eval_every is not None and (i % eval_every) == 0:
-                self.mean_val_loss = self.valid_epoch()                        
+                self.mean_val_loss = self.valid_epoch(n_batches=1000)                        
 
             pbar.set_postfix({
-                "ce_loss":      f"{loss['ce_loss'].item():.4f}", 
-                "time_loss":    f"{loss['time_loss'].item():.4f}",
-                "loss_sm":      f"{loss['ce_ema_loss'].item():.4f}", 
-                "time_loss_sm": f"{loss['time_ema_loss'].item():.4f}",
+                "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
+                "time_loss":    f"{loss['train_time_loss'].item():.4f}",
+                "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
+                "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
             })
 
             self.optimizer.step() 
@@ -318,7 +320,7 @@ class Trainer():
         loss_per_disease_df = self.valid_epoch_end(loss_outputs).reset_index()
         loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
 
-        loss = torch.stack([loss['ce_loss'] for loss in loss_outputs]).mean()
+        loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
 
         return loss
 
@@ -430,8 +432,8 @@ dataset_config = dict(
 )
 
 train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
-valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config)
-test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config)
+valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
+test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
 
 dataloaders = [ DelphiDataloader(d, batch_size=args.batch_size) for d in [train_dataset, valid_dataset, test_dataset] ]
 
