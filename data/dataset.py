@@ -158,13 +158,29 @@ class DelphiDataset:
             self.domains[dname] = TokenDomain(datafile, predict=dinfo.predict, age_jitter=dinfo.age_jitter, type=dinfo.type, at_birth=dinfo.at_birth) 
 
         # ——————————————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
-        self.included_subjects = pd.concat([
-            pd.read_csv(self.root / subj_file, names=["subject_id"]) for subj_file in subjects
-        ])
-                
+        if subjects is None:
+            raise ValueError("You must provide either subject IDs or paths to subject lists.")
+
+        # detect if subjects are files or IDs
+        if isinstance(subjects, (str, Path)):
+            subjects = [subjects]
+
+        if all(isinstance(s, (str, Path)) and os.path.exists(s) for s in subjects):
+            # subjects are file paths
+            included_subjects = pd.concat([
+                pd.read_csv(self.root / subj_file, names=["subject_id"]) for subj_file in subjects
+            ])
+        else:
+            # assume it's a list/array of IDs
+            included_subjects = pd.DataFrame({"subject_id": subjects})
+
+        self.included_subjects = included_subjects                
         self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
 
-        self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
+        self._subjects = self.included_subjects[
+            ~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)
+        ]
+
         self._subjects = self.filter_subj_for_required_domains(self._subjects, required_domains)        
 
         if n_samples is not None:

@@ -125,3 +125,21 @@ def generate_splits(
         splits.append(split)
 
     return splits
+
+
+def get_data_partitions(folder, fold):
+
+    '''
+    datafile: numpy file containing three columns (subject_id, time, token_id)
+    '''
+
+    fold_ids = load_fold_ids(folder, num_folds=10)
+
+    splits = generate_splits(fold_ids, n_train_folds=7, n_val_folds=1, n_test_folds=2, val_as_last=True)  
+    split_idx = fold - 1
+    
+    train_ids = splits[split_idx]["train"]
+    val_ids   = splits[split_idx]["valid"]
+    test_ids  = splits[split_idx]["test"]
+
+    return train_ids, val_ids, test_ids

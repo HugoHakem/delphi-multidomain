@@ -88,19 +88,16 @@ def local_to_global_ids(local_ids):
     return global_ids
 
 
-import torch
-import numpy as np
-import os
-
 class EarlyStopping:
-    def __init__(self, patience=10, min_delta=0.0, mode='min', ckpt_path=None):
+
+    def __init__(self, patience=10, min_delta=0.0, mode='min', ckpt_dir="checkpoints"):
         """
         mode: 'min' for losses, 'max' for metrics like AUROC
         """
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
-        self.ckpt_path = ckpt_path
+        self.ckpt_dir = ckpt_dir
         self.best_score = None
         self.counter = 0
         self.should_stop = False
@@ -125,11 +122,17 @@ class EarlyStopping:
         
         return self.should_stop
 
-    def _save_model(self, model):
-        os.makedirs(os.path.dirname(self.ckpt_path), exist_ok=True)
-        torch.save(model.state_dict(), self.ckpt_path)
-        print(f"Saved checkpoint to {self.ckpt_path}")
+    def _save_model(self, model, metadata=None):
+        
+        if metadata is None:
+            metadata = {}
 
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = Path(self.ckpt_dir) / f"best_model_{timestamp}.pt"
+        torch.save(model.state_dict() | metadata, path)
+        print(f"Saved checkpoint at {path}")
+        return path
 
 
 class Trainer():
@@ -142,9 +145,7 @@ class Trainer():
         self.test_loader     = test_loader
         self.optimizer       = optimizer
         self.scheduler       = scheduler
-        self.early_stopper   = EarlyStopping(patience=args.patience, min_delta=0.001, mode='min', ckpt_path=f"{odir}/best_model.pt")
-                
-        self.current_epoch   = 0
+        self.early_stopper   = EarlyStopping(patience=args.patience, min_delta=0.001, mode='min')                        
 
         self.domain_to_int = { k: i for i, k in enumerate(self.model.transformer.embed.domain_embed.keys()) }
         self.predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
@@ -156,6 +157,8 @@ class Trainer():
         self.train_outputs = []
         self.valid_outputs = []
         self.test_outputs  = []
+
+        self.current_epoch   = 0
         self._valid_counter = 0
         
 
@@ -254,8 +257,7 @@ class Trainer():
             fillna(0).\
             sum(axis=1).\
             sort_values()
-    
-    
+        
 
     def train_epoch(self, n_batches=None, eval_every=None):
 
@@ -316,7 +318,7 @@ class Trainer():
         loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
 
         loss = torch.stack([loss['ce_loss'] for loss in loss_outputs]).mean()
-        print(f"{loss=}")
+
         return loss
 
 
@@ -386,22 +388,26 @@ class Trainer():
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
 
-import argparse
+# import argparse
+# 
+# parser = argparse.ArgumentParser()
+# parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
+# parser.add_argument("--n_layers",         default=12)
+# parser.add_argument("--test_fold")
+# parser.add_argument("--domains", default=)
+# 
+# args = parser.parse_args()
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--attention_scheme", default=)
-parser.add_argument("--n_layers",         default=12)
-parser.add_argument("--test_fold")
-parser.add_argument("--domains", default=)
-parser.add_argument("--", default=)
-parser.add_argument("--", default=)
-
-args = parser.parse_args()
+args = EasyDict({
+    "attention_scheme": "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)",
+    "n_layers": 12,
+    "test_fold": 3
+})
 
 tokens_path = root_path / 'tokens'
 
 domain_config = {
-#  'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
+  # 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
   'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',  predict=True),
   'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',     predict=True),
   'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle', age_jitter=True),  
@@ -410,21 +416,18 @@ domain_config = {
   "padding":     EmbedConfig(projector="embed")    
 }
 
-ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
-ATTENTION_SCHEME = "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)"
-ATTENTION_SCHEME = "[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
-ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,genetic_pcs,death]:causal(mask_ties=True)"
-ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-ATTENTION_SCHEME = "[h,s]:bidirectional,[s,dis,l,de]:causal(mask_ties=True)"
+from utils.cv_utils import get_data_partitions, generate_splits, load_fold_ids
+# args.test_fold = 
 
+train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
 
-if isinstance(ATTENTION_SCHEME, str):
-    ATTENTION_SCHEME = config.n_layer * [ ATTENTION_SCHEME ]
+# %%
+len(train_ids), len(val_ids), len(test_ids)
+# %%
 
-config = DelphiConfig(token_dropout=0.1, domains=domain_config, attention_scheme=ATTENTION_SCHEME)
-
-args.n_fold = 
+# generate_splits()
 
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
 test_fold, dev_folds = [folds.pop(0)], folds
@@ -440,10 +443,33 @@ train_dataset, valid_dataset = random_split(
 )
 dataloaders = [ DelphiDataloader(d, batch_size=32) for d in [train_dataset, valid_dataset, test_dataset] ]
 
+# %%
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,genetic_pcs,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[h,s]:bidirectional,[s,dis,l,de]:causal(mask_ties=True)"
+
+assert len(args.attention_scheme) in {1, args.n_layers}, f"--attention_scheme should be either 1 or args.n_layers (={args.n_layers})"
+
+if len(args.attention_scheme) == 1:
+    attention_scheme = args.n_layers * args.attention_scheme
+elif args.n_layers == len(args.attention_scheme):
+    attention_scheme = args.attention_scheme
+
+config = DelphiConfig(n_layers=args.n_layers, token_dropout=0.1, domains=domain_config, attention_scheme=attention_scheme)
+
 model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
 trainer = Trainer(model, *dataloaders, optimizer, scheduler, n_train_batches=1000, n_val_batches=1000)
 trainer.train(max_epochs=1000)
 
