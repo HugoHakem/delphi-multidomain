@@ -7,6 +7,8 @@ from pathlib import Path
 root_path = Path("../data/transforms")
 
 import numpy as np
+import pandas as pd
+
 import torch
 from torch.utils.data import Dataset, random_split, DataLoader
 
@@ -28,6 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 import delphi
 from data.dataset import DelphiDataset, DelphiDataloader
+from utils.cv_utils import get_data_partitions
 
 from delphi.optim import OptimConfig, configure_optimizers
 from delphi.model.transformer import (
@@ -170,23 +173,23 @@ class Trainer():
 
     def train(self, max_epochs=1000):
 
-        self.valid_epoch(n_batches=10)
+        # self.valid_epoch(n_batches=10)
 
         for epoch in range(self.current_epoch, max_epochs):
             
             self.current_epoch = epoch            
             self.train_epoch(n_batches=10, eval_every=EACH_VAL)
-            # self.valid_epoch(n_batches=10)
             
             if self.early_stopper.step(self.mean_val_loss, model=self.model):
                 print(f"Early stopping triggered at epoch {self.current_epoch}")
                 break
 
 
-    def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training"):
+    def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training", add_prefix=None):
 
         model = self.model
-        x, ages, subject_ids = trainer.get_tensors_from_batch(batch)            
+        x, ages, subject_ids = trainer.get_tensors_from_batch(batch)
+
         max_ages = model.get_max_ages_per_subject(ages, subject_ids)
         x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
         x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
@@ -229,6 +232,9 @@ class Trainer():
             'total': loss_ce + time_loss,            
         })
 
+        if add_prefix is not None:
+            loss = { f"{add_prefix}_{k}": v for k, v in loss.items() }
+
         if log_per_disease:
             loss_ce_per_disease = model.cross_entropy_loss(
                 f_logits, global_ids, agg="per_disease"
@@ -236,18 +242,13 @@ class Trainer():
 
             loss['ce_loss_per_disease'] = loss_ce_per_disease
 
-        if return_att and return_logits:
-            return loss, logits, att 
-        elif return_logits:
-            return loss, logits
-        elif return_att:
-            return loss, att
-        else:
-            return loss
+        if return_att and return_logits: return loss, logits, att 
+        elif return_logits:              return loss, logits
+        elif return_att:                 return loss, att
+        else:                            return loss
 
 
-    def valid_epoch_end(self, loss_outputs):
-        import pandas as pd
+    def valid_epoch_end(self, loss_outputs):        
         
         self._valid_counter += 1        
 
@@ -265,11 +266,11 @@ class Trainer():
 
         for i, batch in enumerate(pbar):
             
-            self.optimizer.zero_grad()                     
-            loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training")
+            self.optimizer.zero_grad()
+            loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
             self.train_outputs.append(loss)
             
-            loss['total'].backward()
+            loss['train_total'].backward()
 
             if eval_every is not None and (i % eval_every) == 0:
                 self.mean_val_loss = self.valid_epoch()                        
@@ -284,7 +285,7 @@ class Trainer():
             self.optimizer.step() 
             self.scheduler.step()
 
-            if n_batches is not None and i == n_batches:
+            if (n_batches is not None) and (i == n_batches):
                 break
 
 
@@ -301,14 +302,14 @@ class Trainer():
         with torch.no_grad():
             loss_outputs = []
             for i, batch in enumerate(pbar):
-                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_per_disease=True, stage="validation")
+                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_per_disease=True, stage="validation", add_prefix="val")
                 loss_outputs.append(loss)
             
                 pbar.set_postfix({
-                    "ce_loss":      f"{loss['ce_loss'].item():.4f}", 
-                    "time_loss":    f"{loss['time_loss'].item():.4f}",
-                    "loss_sm":      f"{loss['ce_ema_loss'].item():.4f}", 
-                    "time_loss_sm": f"{loss['time_ema_loss'].item():.4f}",
+                    "ce_loss":      f"{loss['val_ce_loss'].item():.4f}", 
+                    "time_loss":    f"{loss['val_time_loss'].item():.4f}",
+                    "loss_sm":      f"{loss['val_ce_ema_loss'].item():.4f}", 
+                    "time_loss_sm": f"{loss['val_time_ema_loss'].item():.4f}",
                 })
             
                 if n_batches is not None and i == n_batches:
@@ -392,16 +393,18 @@ class Trainer():
 # 
 # parser = argparse.ArgumentParser()
 # parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
-# parser.add_argument("--n_layers",         default=12)
+# parser.add_argument("--n_layer",         default=12)
 # parser.add_argument("--test_fold")
 # parser.add_argument("--domains", default=)
 # 
 # args = parser.parse_args()
 
 args = EasyDict({
-    "attention_scheme": "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)",
-    "n_layers": 12,
-    "test_fold": 3
+    "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"],
+    "n_layer": 12,
+    "test_fold": 3,
+    "patience": 2,
+    "batch_size": 4
 })
 
 tokens_path = root_path / 'tokens'
@@ -418,32 +421,19 @@ domain_config = {
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-from utils.cv_utils import get_data_partitions, generate_splits, load_fold_ids
-# args.test_fold = 
-
 train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
 
-# %%
-len(train_ids), len(val_ids), len(test_ids)
-# %%
-
-# generate_splits()
-
-folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
-test_fold, dev_folds = [folds.pop(0)], folds
-
-dataset_config = dict(root=root_path, domains=domain_config, exclusions=[]) # "subject_lists/genetic_white_ids.txt"])
-dev_dataset  = DelphiDataset(subjects=dev_folds, **dataset_config).to(DEVICE)
-test_dataset = DelphiDataset(subjects=test_fold, **dataset_config)
-
-n_valid      = len(dev_dataset) - (n_train := int(0.8*len(dev_dataset)))
-train_dataset, valid_dataset = random_split(
-    dev_dataset, [ n_train, n_valid ],
-    generator=torch.Generator().manual_seed(42)
+dataset_config = dict(
+  root=root_path, 
+  domains=domain_config, 
+  exclusions=[]
 )
-dataloaders = [ DelphiDataloader(d, batch_size=32) for d in [train_dataset, valid_dataset, test_dataset] ]
 
-# %%
+train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
+valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config)
+test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config)
+
+dataloaders = [ DelphiDataloader(d, batch_size=args.batch_size) for d in [train_dataset, valid_dataset, test_dataset] ]
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -454,19 +444,27 @@ dataloaders = [ DelphiDataloader(d, batch_size=32) for d in [train_dataset, vali
 # ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
 # ATTENTION_SCHEME = "[h,s]:bidirectional,[s,dis,l,de]:causal(mask_ties=True)"
 
-assert len(args.attention_scheme) in {1, args.n_layers}, f"--attention_scheme should be either 1 or args.n_layers (={args.n_layers})"
+assert len(args.attention_scheme) in {1, args.n_layer}, f"len of the --attention_scheme argument should be either 1 or args.n_layer (={args.n_layer})"
 
 if len(args.attention_scheme) == 1:
-    attention_scheme = args.n_layers * args.attention_scheme
-elif args.n_layers == len(args.attention_scheme):
+    attention_scheme = args.n_layer * args.attention_scheme
+elif args.n_layer == len(args.attention_scheme):
     attention_scheme = args.attention_scheme
 
-config = DelphiConfig(n_layers=args.n_layers, token_dropout=0.1, domains=domain_config, attention_scheme=attention_scheme)
+
+config = DelphiConfig(
+    n_layer=args.n_layer, 
+    token_dropout=0.1, 
+    domains=domain_config, 
+    attention_scheme=attention_scheme
+)
 
 model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
-optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
+optim_config = OptimConfig()
+
+optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 

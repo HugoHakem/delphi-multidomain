@@ -40,11 +40,20 @@ class TokenDomain:
     '''
     '''
 
-    def __init__(self, path: str, predict: bool, age_jitter: bool, type: str, subjects: Union[None, set]=None, at_birth=False, aggregation_strategy: Union[None, Callable]=None):
+    def __init__(self, 
+            path: str, 
+            predict: bool, 
+            age_jitter: bool, 
+            type: str, 
+            subjects: Union[None, set]=None, 
+            at_birth=False, 
+            aggregation_strategy: Union[None, Callable]=None
+        ):
         
         """
         Load a single domain: tokenizer.yaml + tokens.csv
         """
+
         self.path = path
         self.predict = predict
         self.age_jitter = age_jitter
@@ -53,12 +62,12 @@ class TokenDomain:
 
         assert type in ["categorical", "continuous"], f"Domain type must be either 'categorical' or 'continuous', got {type}"
 
+        self.tokens    = self._load_tokens(os.path.join(path, "tokens.csv"), subjects=subjects)
         self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))        
-        self.tokens = self._load_tokens(os.path.join(path, "tokens.csv"), subjects=subjects)
         
         self.aggregation_strategy = aggregation_strategy
-        
-        if self.aggregation_strategy is not None:
+
+        if aggregation_strategy is not None:
             raise NotImplementedError
 
 
@@ -113,12 +122,20 @@ class TokenDomain:
     def subject_ids(self):
         return self.tokens[:, 0].cpu().numpy()
 
+   
+    def __len__(self):
+        return len(self._as_dataframe)
+
 
     def as_dataframe(self):
 
         return self._as_data_frame.assign(
             token_id=lambda df: pd.Categorical(df["token_id"].map(self.tokenizer), categories=self.tokenizer.values())
         )
+
+
+    def __repr__(self):
+        return str(self._as_dataframe)
 
 
     def _repr_html_(self):
@@ -174,13 +191,9 @@ class DelphiDataset:
             # assume it's a list/array of IDs
             included_subjects = pd.DataFrame({"subject_id": subjects})
 
-        self.included_subjects = included_subjects                
+        self.included_subjects = included_subjects
         self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
-
-        self._subjects = self.included_subjects[
-            ~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)
-        ]
-
+        self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
         self._subjects = self.filter_subj_for_required_domains(self._subjects, required_domains)        
 
         if n_samples is not None:
@@ -189,10 +202,22 @@ class DelphiDataset:
         self._subjects = set(self._subjects.subject_id.to_list())
 
         # —————————————————————————————————————————————————————————————————————————————
-        
+
         # Now we filter each domain for the final list of allowed subjects
         for dname in self.domains:
-            self.domains[dname] = self.domains[dname].filter_subjects(self.subjects)
+            filtered_domain = self.domains[dname].filter_subjects(self.subjects)            
+            
+            assert len(filtered_domain) != 0, f"""\n{'—'*80}
+Error: Domain '{dname}' has no tokens. 
+Here are a few original subjects and a few allowed subjects to help you troubleshoot:
+{self.subjects[:10]}
+and
+{self.domains[dname]}
+{'—'*80}
+"""
+            self.domains[dname] = filtered_domain
+
+        # —————————————————————————————————————————————————————————————————————————————
 
         # "re-index" categories (not the default behaviour, 
         # which consists in keeping the tokens for each namespace separate):
