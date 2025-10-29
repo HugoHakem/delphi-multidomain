@@ -402,7 +402,6 @@ class DomainEmbedding(nn.Module):
 
         super().__init__()
         self.config = config
-        # assert config.input_size is not None, "input_size must be specified"
 
         if domain_name == "padding":
             self.projector = nn.Embedding(2, n_embed)
@@ -989,7 +988,6 @@ class Delphi(torch.nn.Module):
         
         self._trace = dict(domains=domains.detach(), tokens=x.detach(), emb=emb.detach(), ages=ages.detach())
         
-        # for domain in ages:
         emb += self.transformer.age_embedding(ages)
 
         #TODO: passing domain2id on every call doesn't seem right. Try to pass it in the constructor if possible.
