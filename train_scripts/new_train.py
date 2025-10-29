@@ -37,12 +37,9 @@ from delphi.model.transformer import (
 )
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-
 RUN_NAME = os.getenv("RUN_NAME", "default")
-
 odir = f"output/{RUN_NAME}"
-
-os.makedirs(odir)
+os.makedirs(odir, exist_ok=True)
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
 '''
@@ -77,7 +74,7 @@ class TrainBaseConfig:
 '''
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
-EACH_VAL = 3200
+EACH_VAL = 3236
 
 def local_to_global_ids(local_ids):
 
@@ -91,6 +88,50 @@ def local_to_global_ids(local_ids):
     return global_ids
 
 
+import torch
+import numpy as np
+import os
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.0, mode='min', ckpt_path=None):
+        """
+        mode: 'min' for losses, 'max' for metrics like AUROC
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.ckpt_path = ckpt_path
+        self.best_score = None
+        self.counter = 0
+        self.should_stop = False
+
+    def step(self, current_score, model=None):
+        # Adjust sign depending on mode
+        score = -current_score if self.mode == 'min' else current_score
+        
+        if self.best_score is None:
+            self.best_score = score
+            if model and self.ckpt_path:
+                self._save_model(model)
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+            if model and self.ckpt_path:
+                self._save_model(model)
+        
+        return self.should_stop
+
+    def _save_model(self, model):
+        os.makedirs(os.path.dirname(self.ckpt_path), exist_ok=True)
+        torch.save(model.state_dict(), self.ckpt_path)
+        print(f"Saved checkpoint to {self.ckpt_path}")
+
+
+
 class Trainer():
 
     def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler, n_train_batches=None, n_val_batches=None):
@@ -101,6 +142,7 @@ class Trainer():
         self.test_loader     = test_loader
         self.optimizer       = optimizer
         self.scheduler       = scheduler
+        self.early_stopper   = EarlyStopping(patience=args.patience, min_delta=0.001, mode='min', ckpt_path=f"{odir}/best_model.pt")
                 
         self.current_epoch   = 0
 
@@ -113,7 +155,7 @@ class Trainer():
 
         self.train_outputs = []
         self.valid_outputs = []
-        self.test_outputs = []
+        self.test_outputs  = []
         self._valid_counter = 0
         
 
@@ -124,14 +166,18 @@ class Trainer():
 
 
     def train(self, max_epochs=1000):
-        
-        self.valid_epoch(n_batches=100)
+
+        self.valid_epoch(n_batches=10)
 
         for epoch in range(self.current_epoch, max_epochs):
             
             self.current_epoch = epoch            
-            self.train_epoch()
-            # self.valid_epoch(n_batches=100)
+            self.train_epoch(n_batches=10, eval_every=EACH_VAL)
+            # self.valid_epoch(n_batches=10)
+            
+            if self.early_stopper.step(self.mean_val_loss, model=self.model):
+                print(f"Early stopping triggered at epoch {self.current_epoch}")
+                break
 
 
     def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training"):
@@ -211,7 +257,7 @@ class Trainer():
     
     
 
-    def train_epoch(self, n_batches=None):
+    def train_epoch(self, n_batches=None, eval_every=None):
 
         pbar = tqdm(self.training_loader)
 
@@ -223,8 +269,8 @@ class Trainer():
             
             loss['total'].backward()
 
-            if (i % EACH_VAL) == 0:
-                self.valid_epoch(n_batches=1000)
+            if eval_every is not None and (i % eval_every) == 0:
+                self.mean_val_loss = self.valid_epoch()                        
 
             pbar.set_postfix({
                 "ce_loss":      f"{loss['ce_loss'].item():.4f}", 
@@ -266,9 +312,12 @@ class Trainer():
                 if n_batches is not None and i == n_batches:
                     break
         
-        loss_outputs = self.valid_epoch_end(loss_outputs).reset_index()
-        loss_outputs.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
-        # import ipdb; ipdb.set_trace()                 
+        loss_per_disease_df = self.valid_epoch_end(loss_outputs).reset_index()
+        loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
+
+        loss = torch.stack([loss['ce_loss'] for loss in loss_outputs]).mean()
+        print(f"{loss=}")
+        return loss
 
 
     def mlflow_logging(self):
@@ -336,7 +385,21 @@ class Trainer():
 
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--attention_scheme", default=)
+parser.add_argument("--n_layers",         default=12)
+parser.add_argument("--test_fold")
+parser.add_argument("--domains", default=)
+parser.add_argument("--", default=)
+parser.add_argument("--", default=)
+
+args = parser.parse_args()
+
 tokens_path = root_path / 'tokens'
+
 domain_config = {
 #  'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
   'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',  predict=True),
@@ -347,13 +410,21 @@ domain_config = {
   "padding":     EmbedConfig(projector="embed")    
 }
 
-ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
-# ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
-ATTENTION_SCHEME = 12 * [ "[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
-# ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,genetic_pcs,death]:causal(mask_ties=True)" ]
-ATTENTION_SCHEME = 12 * [ "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)" ]
+ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+ATTENTION_SCHEME = "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+ATTENTION_SCHEME = "[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,genetic_pcs,death]:causal(mask_ties=True)"
+ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+
+ATTENTION_SCHEME = "[h,s]:bidirectional,[s,dis,l,de]:causal(mask_ties=True)"
+
+
+if isinstance(ATTENTION_SCHEME, str):
+    ATTENTION_SCHEME = config.n_layer * [ ATTENTION_SCHEME ]
 
 config = DelphiConfig(token_dropout=0.1, domains=domain_config, attention_scheme=ATTENTION_SCHEME)
+
+args.n_fold = 
 
 folds = [ f"subject_lists/subset{i}of5.csv" for i in range(1, 6) ]
 test_fold, dev_folds = [folds.pop(0)], folds
@@ -374,10 +445,6 @@ torch.compile(model)
 
 optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)
 trainer = Trainer(model, *dataloaders, optimizer, scheduler, n_train_batches=1000, n_val_batches=1000)
-trainer.train(max_epochs=1000)  
-
-# %%
-
-
+trainer.train(max_epochs=1000)
 
 # %%
