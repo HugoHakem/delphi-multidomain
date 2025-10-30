@@ -12,25 +12,16 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, random_split, DataLoader
 
-from ast import literal_eval
-import importlib
-
 from easydict import EasyDict
 
 import mlflow
-from mlflow.tracking import MlflowClient
-from mlflow.entities import Metric
 
 from tqdm import tqdm
-from dataclasses import asdict, dataclass, field
-
-from omegaconf import OmegaConf
 import logging, time
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 from collections import defaultdict
 
-import delphi
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
 
@@ -40,6 +31,8 @@ from delphi.model.transformer import (
     EmbedConfig,
     DelphiConfig,
 )
+
+from copy import deepcopy
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 RUN_NAME = os.getenv("RUN_NAME", "default")
@@ -94,98 +87,187 @@ def local_to_global_ids(local_ids):
 
 
 class EarlyStopping:
-
-    def __init__(self, patience=10, min_delta=0.0, mode='min', ckpt_dir="checkpoints"):
+    def __init__(self, patience=10, min_delta=0.0, mode='min'):
         """
-        mode: 'min' for losses, 'max' for metrics like AUROC
+        mode: 'min' for losses, 'max' for metrics like AUROC.
+        This class only decides when to stop; it doesn't handle checkpointing.
         """
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
-        self.ckpt_dir = ckpt_dir
         self.best_score = None
         self.counter = 0
         self.should_stop = False
+        self.is_improvement = False
 
-    def step(self, current_score, model=None):
-        # Adjust sign depending on mode
+    def step(self, current_score):
+        """
+        Update the early stopping state given a new validation score.
+
+        Returns
+        -------
+        should_stop : bool
+            Whether training should stop.
+        is_improvement : bool
+            Whether the current score improved over the best one.
+        """
         score = -current_score if self.mode == 'min' else current_score
-        
+
         if self.best_score is None:
             self.best_score = score
-            if model and self.ckpt_path:
-                self._save_model(model)
-        elif score < self.best_score + self.min_delta:
+            self.is_improvement = True
+            return False, True
+
+        if score < self.best_score + self.min_delta:
+            # No improvement
             self.counter += 1
+            self.is_improvement = False
             if self.counter >= self.patience:
                 self.should_stop = True
         else:
+            # Improvement found
             self.best_score = score
             self.counter = 0
-            if model and self.ckpt_path:
-                self._save_model(model)
-        
-        return self.should_stop
+            self.is_improvement = True
 
-    def _save_model(self, model, metadata=None):
-        
-        if metadata is None:
-            metadata = {}
+        return self.should_stop, self.is_improvement
 
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = Path(self.ckpt_dir) / f"best_model_{timestamp}.pt"
-        torch.save(model.state_dict() | metadata, path)
-        print(f"Saved checkpoint at {path}")
-        return path
+
+
+class NullLogger:
+
+    def log_params(self, params):
+        pass
+
+    def log_metrics(self, metrics, step=None):
+        pass
+
+    def log_artifact(self, path, artifact_path=None):
+        pass
+
+    def log_model(self, model, artifact_path="model"):
+        pass
+    
+
+class MLFlowLogger:
+
+    def __init__(self, run_name=None, autostart=True, nested=False):
+        self.run_name = run_name
+        self.active_run = None
+        if autostart:
+            self.start(nested=nested)
+
+    def start(self, nested=False):
+        if self.active_run is None:
+            self.active_run = mlflow.start_run(run_name=self.run_name, nested=nested)
+        return self.active_run
+
+    def end(self):
+        if self.active_run:
+            mlflow.end_run()
+            self.active_run = None
+
+    def log_params(self, params):
+        mlflow.log_params(params)
+
+    def log_metrics(self, metrics, step=None):
+        mlflow.log_metrics(metrics, step=step)
+
+    def log_artifact(self, path, artifact_path=None):
+        mlflow.log_artifact(path, artifact_path=artifact_path)
+
 
 
 class Trainer():
 
-    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler, n_train_batches=None, n_val_batches=None):
+    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler, patience=3, n_train_batches=None, n_val_batches=None, logger=NullLogger()):
 
-        self.model           = model
-        self.training_loader = training_loader
-        self.valid_loader    = valid_loader
-        self.test_loader     = test_loader
+        self.model           = model        
+        
         self.optimizer       = optimizer
-        self.scheduler       = scheduler
-        self.early_stopper   = EarlyStopping(patience=args.patience, min_delta=0.001, mode='min')                        
+        self.scheduler       = scheduler        
+        self.early_stopper   = EarlyStopping(patience=patience, min_delta=0.001, mode='min')                        
 
-        self.domain_to_int = { k: i for i, k in enumerate(self.model.transformer.embed.domain_embed.keys()) }
-        self.predicted_domains = [ dname for dname, config in domain_config.items() if config.predict ]
-        self.predicted_domains_int = torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(DEVICE)
+        self.training_loader, self.valid_loader, self.test_loader = training_loader, valid_loader, test_loader
 
-        self.n_train_batches = n_train_batches
-        self.n_val_batches = n_val_batches
+        self.n_train_batches, self.n_val_batches = n_train_batches, n_val_batches
+        self.train_outputs, self.valid_outputs, self.test_outputs = [], [], []            
 
-        self.train_outputs = []
-        self.valid_outputs = []
-        self.test_outputs  = []
-
-        self.current_epoch   = 0
+        self.current_epoch  = 0
         self._valid_counter = 0
+        
+        self.logger = logger
         
 
     # ——————————————————————————————————————————————————————————————————————————————
    
+    @property
+    def predicted_domains(self):
+        return [ dname for dname, config in self.model.config.domains.items() if config.predict ]
+
+    @property
+    def predicted_domains_as_int(self):
+        return torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(DEVICE)
+
+    @property
+    def domain_to_int(self):
+        return { dname: i for i, dname in enumerate(self.model.transformer.embed.domain_embed.keys()) }
+
+
+    @property
+    def vocab_lens(self):
+        return { 
+            dname: self.model.transformer.embed.domain_embed[dname].weight.shape[0]
+            for dname in self.model.transformer.embed.domain_embed
+        }
+
+
+    def get_model_metadata(self):
+
+        metadata = { 
+            "train_ids": sorted(self.training_loader.dataset.subjects),
+            "valid_ids": sorted(self.valid_loader.dataset.subjects),
+            "test_ids":  sorted(self.test_loader.dataset.subjects),
+        }
+        return metadata
+
+
     def get_vocab_len(self, domain_name):
         self.transformer.embed.domain_embed[domain_name].weight.shape[0]
 
 
     def train(self, max_epochs=1000):
 
-        # self.valid_epoch(n_batches=10)
+        self.logger.log_params(self.model.config)
+        # self.logger.log_params(self.optimizer.config)
+        # self.logger.log_params(self.scheduler.config)
 
         for epoch in range(self.current_epoch, max_epochs):
             
             self.current_epoch = epoch            
-            # self.train_epoch(n_batches=10, eval_every=EVERY_VAL)
-            self.train_epoch(eval_every=EVERY_VAL)
-            
-            if self.early_stopper.step(self.mean_val_loss, model=self.model):
+            train_loss = self.train_epoch(eval_every=EVERY_VAL)
+
+            metrics = {"train_loss": train_loss}
+             
+            if val_loss is not None:
+                metrics["val_loss"] = val_loss
+
+            self.logger.log_metrics(metrics, step=epoch)            
+            # self.logger.log_model(self.model)
+
+            should_stop, improved = self.early_stopper.step(self.mean_val_loss)
+
+            if improved:                
+                ckpt_dir = Path("checkpoints")
+                ckpt_dir.mkdir(exist_ok=True)
+                self.best_epoch = epoch
+                ckpt_path = ckpt_dir / f"best_model_epoch{epoch}_valloss{self.mean_val_loss:.4f}.ckpt"
+                torch.save(self.model.state_dict(), ckpt_path)
+                print(f"New best model saved → {ckpt_path}")
+ 
+            if should_stop:
                 print(f"Early stopping triggered at epoch {self.current_epoch}")
-                break
+            
 
 
     def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training", add_prefix=None):
@@ -199,8 +281,6 @@ class Trainer():
         x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
         x, ages, subject_ids = trainer.adjust_to_seqlen(x, ages, subject_ids, seqlen:=96)
         
-        # import ipdb; ipdb.set_trace()
-
         logits, att = model(x, ages, subject_ids)
         
         domains     = model._trace['domains']
@@ -209,7 +289,7 @@ class Trainer():
         target_ages = model._trace['ages'][:,1:]
         target_domains = domains[:,1:];
         
-        predict_mask = torch.isin(target_domains, self.predicted_domains_int)
+        predict_mask = torch.isin(target_domains, self.predicted_domains_as_int)
         
         logits    = torch.cat([logits[dname] for dname in self.predicted_domains], axis=-1)
         f_logits  = logits[predict_mask]
@@ -220,9 +300,6 @@ class Trainer():
         
         offsets = offsets_per_domain[f_domains]
         global_ids = offsets + local_ids
-
-        if os.environ.get("DEBUG", False):
-            import ipdb; ipdb.set_trace()
 
         loss_ce = model.cross_entropy_loss(f_logits, global_ids)
 
@@ -240,7 +317,6 @@ class Trainer():
             f'{prefix}time_ema_loss': torch.lerp(outputs[-1][f'{prefix}time_ema_loss'], time_loss, weight=0.002) if outputs else time_loss,
             f'{prefix}total': loss_ce + time_loss,            
         })
-
 
         if log_per_disease:
             loss_ce_per_disease = model.cross_entropy_loss(
@@ -482,8 +558,7 @@ class Trainer():
         Main orchestrator: ensures all subjects have exactly `seqlen` tokens in total,
         truncating by age when too long, padding otherwise.
         """
-        
-        from copy import deepcopy
+                
         x  = deepcopy(x)
         ages  = deepcopy(ages)
         subject_ids  = deepcopy(subject_ids)
@@ -532,46 +607,57 @@ class Trainer():
 
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
+def get_cli_args():
 
-# import argparse
-# 
-# parser = argparse.ArgumentParser()
-# parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
-# parser.add_argument("--n_layer",         default=12)
-# parser.add_argument("--test_fold")
-# parser.add_argument("--domains", default=)
-# 
-# args = parser.parse_args()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
+    parser.add_argument("--n_layer",          default=12)
+    parser.add_argument("--test_fold",        default=1)
+    parser.add_argument("--domains",          default=["diseases", "death", "lifestyle", "hla_alleles", "sex", "padding"])
+    parser.add_argument("--run_name",         default="default")
+    parser.add_argument("--batch_size",       default=4)
+    args = parser.parse_args()
 
-args = EasyDict({
-    "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"],
-    "n_layer": 12,
-    "test_fold": 3,
-    "patience": 2,
-    "batch_size": 4
-})
+    return args
+
+if __name__ == "__main__":    
+    args =  get_cli_args()
+else:
+    args = EasyDict({
+        "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"],
+        "n_layer": 12,
+        "test_fold": 3,
+        "patience": 2,
+        "batch_size": 4,
+        "run_name": os.getenv("RUN_NAME", "default2"),
+    })
+
+if isinstance(args.attention_scheme, str):
+    args.attention_scheme = [args.attention_scheme]
 
 tokens_path = root_path / 'tokens'
 
-domain_config = {
-  # 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
-  'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',  predict=True),
-  'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',     predict=True),
-  'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle', age_jitter=True),  
+default_cfg_per_domain = {
+# 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
+  'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
+  'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
+  'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
   "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
-  "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex', at_birth=True),
+  "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
   "padding":     EmbedConfig(projector="embed")    
 }
+
+# k, v doesn't work for some reason!
+domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in args.domains }
+
+assert all([k in default_cfg_per_domain for k in args.domains])
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
 
-dataset_config = dict(
-  root=root_path, 
-  domains=domain_config, 
-  exclusions=[]
-)
+dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[])
 
 train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
 valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
@@ -595,11 +681,12 @@ if len(args.attention_scheme) == 1:
 elif args.n_layer == len(args.attention_scheme):
     attention_scheme = args.attention_scheme
 
+print(domain_cfg)
 
 config = DelphiConfig(
     n_layer=args.n_layer, 
     token_dropout=0.1, 
-    domains=domain_config, 
+    domains=domain_cfg, 
     attention_scheme=attention_scheme
 )
 
@@ -607,12 +694,17 @@ model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
 optim_config = OptimConfig()
-
 optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
+# %%
 
+
+# %%
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-trainer = Trainer(model, *dataloaders, optimizer, scheduler, n_train_batches=1000, n_val_batches=1000)
+assert args.run_name != 'default', f"You are using the 'default' value for run_name."
+logger = MLFlowLogger(run_name=args.run_name)
+
+trainer = Trainer(model, *dataloaders, optimizer, scheduler, logger=logger)
 trainer.train(max_epochs=1000)
 
 # %%

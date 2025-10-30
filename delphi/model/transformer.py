@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from dataclasses import fields, is_dataclass, dataclass, field
+from dataclasses import fields, is_dataclass, dataclass, field, asdict
+
 from typing import Optional, List, Tuple, Union
-from copy import deepcopy
 
 import inspect
 
@@ -20,6 +20,8 @@ from pathlib import Path
 
 DAYS_PER_YEAR = 365.25
 
+# —————————————————————————————————————————————————————————————————————————————————————————————————————
+
 class AttentionMaskBuilder(nn.Module):
     """
     Parses and builds attention masks from a string like:
@@ -32,7 +34,7 @@ class AttentionMaskBuilder(nn.Module):
         super().__init__()
         self.scheme = self._parse_scheme(scheme_str)
 
-    # --------------------------------------------------
+    # —-—-—-—-—-—-—-—-—-—-—-—
     def _split_top_level(self, s: str, sep: str = ","):
         """
         Splits a string by sep but ignores separators inside [] or ().
@@ -57,7 +59,7 @@ class AttentionMaskBuilder(nn.Module):
             parts.append(buf.strip())
         return parts
 
-    # --------------------------------------------------
+    # —-—-—-—-—-—-—-—-—-—-—-—
     def _parse_scheme(self, scheme_str: str):
         scheme = {}
         parts = self._split_top_level(scheme_str)
@@ -88,7 +90,7 @@ class AttentionMaskBuilder(nn.Module):
 
         return scheme
 
-    # --------------------------------------------------
+    # —-—-—-—-—-—-—-—-—-—-—-—
     def build_slow(self, ages: torch.Tensor, domains: torch.Tensor, domain2id: dict):
         B, L = ages.shape
         dd = { "device": ages.device }
@@ -118,7 +120,9 @@ class AttentionMaskBuilder(nn.Module):
 
         B, L = ages.shape
         dd = { "device": ages.device }
-        mask = torch.ones(B, L, L, **dd) # All True
+
+        # 1 == True
+        mask = torch.ones(B, L, L, **dd)
 
         for dom_names, cfg in self.scheme.items():
             
@@ -135,7 +139,6 @@ class AttentionMaskBuilder(nn.Module):
             age_i, age_j = ages.unsqueeze(2), ages.unsqueeze(1)
     
             causal = (age_i < age_j) | ((cfg["mask_ties"]) & (age_i == age_j))
-            # mask = mask.masked_fill(both & causal, float("-inf"))
             mask = mask.masked_fill(both & causal, FALSE := 0)
     
         # Finally, let's remove the last line of input and the first line of output.
@@ -147,6 +150,7 @@ class AttentionMaskBuilder(nn.Module):
     def forward(self, ages, domains, domain2id):
         return self.build(ages, domains, domain2id)
 
+# —————————————————————————————————————————————————————————————————————————————————————————————————————
 
 def check_config(cls, args):
     """
@@ -316,13 +320,16 @@ class EmbedConfig:
     type: str = "categorical"
     at_birth: bool = False
 
+
 @dataclass
 class DelphiConfig:
     # vocab_size: Optional[int] = None
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 120
-    attention_scheme:Union[str, List] = field(default_factory=lambda: "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)")
+    attention_scheme:Union[str, List] = field(
+        default_factory=lambda: "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+    )
     resid_pdrop: float = 0.1
     embd_pdrop: float = 0.1
     attn_pdrop: float = 0.1
@@ -337,7 +344,10 @@ class DelphiConfig:
     # ce_beta: float = 1.0
     # dt_beta: float = 1.0
     zero_inflate: bool = False
-    zero_inflate_projector: str = "linear"    
+    zero_inflate_projector: str = "linear"
+
+    def items(self):        
+        return asdict(self).items()
     
 
 # ———————————————————— VALIDATE CONFIGS ——————————————————————————————————————————————————————————
@@ -394,7 +404,7 @@ def parse_token_list(token_list: list[str]) -> list:
 
     return parsed
 
-# ———————————————————— EMBEDDINGS ————————————————————————————————————————————————————————————————
+# ———————————————————— Embedding layer for a single domain —————————————————————————————————————————————
 
 class DomainEmbedding(nn.Module):
 
@@ -413,6 +423,7 @@ class DomainEmbedding(nn.Module):
         # ————————————————————————————————————————————————————————————————————————————————————
 
         if config.input_size is None and config.projector.lower() != "pretrained":            
+            print(domain_name)
             tokenizer_file = Path(config.path) / "tokenizer.yaml"
             with open(tokenizer_file, "r") as f:
                 self.config.input_size = len(yaml.load(f, Loader=yaml.FullLoader))
@@ -507,6 +518,7 @@ class DomainEmbedding(nn.Module):
         logger.debug(f"After projector: {tuple(out.shape)}")
         return out
 
+# ———————————————————— Final embedding to logits ——————————————————————————————————————————————————
 
 class DomainwiseTiedLinear(nn.Module):
     
@@ -521,8 +533,9 @@ class DomainwiseTiedLinear(nn.Module):
           for dname, embedding_layer in self.embedding_layer_dict if dname != "padding"
         }
 
+# ———————————————————— Embedding layer for all domain ————————————————————————————————————————————————————————————————
 
-class DelphiEmbedding(nn.Module):
+class MultiDomainEmbedding(nn.Module):
 
     def __init__(self, config: DelphiConfig) -> None:
         
@@ -640,26 +653,26 @@ class CompetingExpHead(nn.Module):
 # ———————————————————— MASKS ————————————————————————————————————————————————————————————————
 
 # TODO: make sure that this is not needed anymore.
-def ties_adjusted_delta_t(t0, t1, attn_mask, mask_ties: bool, eps: float = 1.0) -> torch.Tensor:
-
-    delta_t = torch.clamp(t1-t0, min=eps)
-
-    dd = dict(device=t0.device, dtype=torch.float32)
-    
-    if mask_ties:
-        idx = ( attn_mask * torch.arange(0, t0.size(1), **dd).view(1, 1, 1, -1) ).max(-1).indices.squeeze((1, 2))
-        delta_t = torch.gather(delta_t, -1, idx)
-
-   #  if mask_ties:
-   #      delta_t = torch.gather(delta_t, -1, (attn_mask * torch.arange(
-   #                  0, t0.size(1), 
-   #              ).view(1, 1, 1, -1)
-   #          )
-   #          .max(-1)
-   #          .indices.squeeze((1, 2)),
-   #      )
-
-    return delta_t
+# def ties_adjusted_delta_t(t0, t1, attn_mask, mask_ties: bool, eps: float = 1.0) -> torch.Tensor:
+# 
+#     delta_t = torch.clamp(t1-t0, min=eps)
+# 
+#     dd = dict(device=t0.device, dtype=torch.float32)
+#     
+#     if mask_ties:
+#         idx = ( attn_mask * torch.arange(0, t0.size(1), **dd).view(1, 1, 1, -1) ).max(-1).indices.squeeze((1, 2))
+#         delta_t = torch.gather(delta_t, -1, idx)
+# 
+#    #  if mask_ties:
+#    #      delta_t = torch.gather(delta_t, -1, (attn_mask * torch.arange(
+#    #                  0, t0.size(1), 
+#    #              ).view(1, 1, 1, -1)
+#    #          )
+#    #          .max(-1)
+#    #          .indices.squeeze((1, 2)),
+#    #      )
+# 
+#     return delta_t
 
 
 class LayerNorm(nn.Module):
@@ -809,7 +822,7 @@ class Delphi(torch.nn.Module):
     def build_model(self, config: DelphiConfig):
 
         self.transformer = nn.ModuleDict(dict(
-            embed=DelphiEmbedding(config),
+            embed=MultiDomainEmbedding(config),
             age_embedding=AgeEncoding(n_embd=config.n_embd),
             drop=nn.Dropout(config.dropout),
             attn_mask_builder=nn.ModuleList([AttentionMaskBuilder(config.attention_scheme[i]) for i in range(config.n_layer)]),
@@ -819,27 +832,13 @@ class Delphi(torch.nn.Module):
 
         self.embedding_to_logits = DomainwiseTiedLinear(self.transformer.embed)
 
-        self.ce_head = CrossEntropyHead()
+        # self.ce_head = CrossEntropyHead()
         
-        self.dt_head = CompetingExpHead(
-            n_input=config.n_embd, 
-            zero_inflate=config.zero_inflate, 
-            pi_head=config.zero_inflate_projector
-        )
-
-
-    def get_allowed_tokens_mask(self, targets, ignore_tokens):
-
-        targets = targets.reshape(-1)
-        pass_tokens = targets != -1 
-        for k in ignore_tokens: # and gender
-            pass_tokens *= targets != k
-
-        return pass_tokens
-
-
-    # def set_max_seq_len(self, max_seq_len):
-        # self.max_seq_len = max_seq_len
+        # self.dt_head = CompetingExpHead(
+            # n_input=config.n_embd, 
+            # zero_inflate=config.zero_inflate, 
+            # pi_head=config.zero_inflate_projector
+        # )
 
 
     def set_valid_loss_mode(self, validation_loss_mode):
@@ -903,20 +902,6 @@ class Delphi(torch.nn.Module):
           
         return loss_dt
     
-        # dd = dict(device=logits.device, dtype=torch.float32)
-        # block_size = attn_mask.size(-1)
-
-        # if mask_ties:
-            # Use time from last untied token
-            # dt = torch.gather(
-                # dt, -1, (attn_mask * torch.arange(0, block_size, **dd).view(1, 1, 1, -1)).max(-1).indices.squeeze((1, 2))
-            # )  
-
-        # log_dt = - torch.log(dt + t_min).view(-1)        
-
-        ## Exponential log-likelihood (real statistics, TM)
-        # loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - log_dt.reshape(-1))) 
-
         
     def to_tensor(self, x, ages, embeddings, subject_ids):
 
@@ -968,7 +953,12 @@ class Delphi(torch.nn.Module):
         batch_ages   = torch.stack(batch_ages)
         batch_domains = torch.stack(batch_domains)
     
-        return batch_tokens, batch_ages, batch_embeddings, unique_subjects, batch_domains
+        return \
+            batch_tokens.int().squeeze(1),\
+            batch_ages.squeeze(1),\
+            batch_embeddings.squeeze(1),\
+            unique_subjects,\
+            batch_domains.squeeze(1)
 
 
     def forward(self, x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor,
@@ -979,12 +969,6 @@ class Delphi(torch.nn.Module):
         
         emb = self.transformer.embed(x)
         x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb, subject_ids)
-        
-        # TODO: remove the need for these squeeze's
-        ages    = ages.int().squeeze(1)
-        x       = x.squeeze(1)
-        emb     = emb.squeeze(1)
-        domains = domains.squeeze(1)
         
         self._trace = dict(domains=domains.detach(), tokens=x.detach(), emb=emb.detach(), ages=ages.detach())
         
