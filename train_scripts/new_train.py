@@ -346,31 +346,43 @@ class Trainer():
 
     def train_epoch(self, n_batches=None, eval_every=None):
 
-        pbar = tqdm(self.training_loader)
+        import torch.profiler as profiler
+        
+        with profiler.profile(
+            activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
+            schedule=profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=profiler.tensorboard_trace_handler("./logdir"),
+            record_shapes=True,
+            with_stack=True
+        ) as prof:
 
-        for i, batch in enumerate(pbar):
-            
-            self.optimizer.zero_grad()
-            loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
-            self.train_outputs.append(loss)
-            
-            loss['train_total'].backward()
-
-            if eval_every is not None and (i % eval_every) == 0:
-                self.mean_val_loss = self.valid_epoch(n_batches=1000)                        
-
-            pbar.set_postfix({
-                "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
-                "time_loss":    f"{loss['train_time_loss'].item():.4f}",
-                "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
-                "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
-            })
-
-            self.optimizer.step() 
-            self.scheduler.step()
-
-            if (n_batches is not None) and (i == n_batches):
-                break
+            pbar = tqdm(self.training_loader)
+    
+            for i, batch in enumerate(pbar):
+                
+                self.optimizer.zero_grad()
+                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
+                self.train_outputs.append(loss)
+                
+                loss['train_total'].backward()
+    
+                if eval_every is not None and (i % eval_every) == 0 and i > 0:
+                    self.mean_val_loss = self.valid_epoch(n_batches=1000)                        
+    
+                pbar.set_postfix({
+                    "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
+                    "time_loss":    f"{loss['train_time_loss'].item():.4f}",
+                    "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
+                    "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
+                })
+    
+                self.optimizer.step() 
+                self.scheduler.step()
+                
+                prof.step()
+    
+                if (n_batches is not None) and (i == n_batches):
+                    break
 
 
     def epoch_end(self):
@@ -617,6 +629,7 @@ def get_cli_args():
     parser.add_argument("--domains",          default=["diseases", "death", "lifestyle", "hla_alleles", "sex", "padding"])
     parser.add_argument("--run_name",         default="default")
     parser.add_argument("--batch_size",       default=4)
+    parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4)
     args = parser.parse_args()
 
     return args
@@ -630,6 +643,7 @@ else:
         "test_fold": 3,
         "patience": 2,
         "batch_size": 4,
+        "lr": 1e-4,
         "run_name": os.getenv("RUN_NAME", "default2"),
     })
 
@@ -693,12 +707,9 @@ config = DelphiConfig(
 model  = Delphi(config).to(DEVICE)
 torch.compile(model)
 
-optim_config = OptimConfig()
+optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
 optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
-# %%
 
-
-# %%
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 assert args.run_name != 'default', f"You are using the 'default' value for run_name."
