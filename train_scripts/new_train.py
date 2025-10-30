@@ -28,6 +28,8 @@ from omegaconf import OmegaConf
 import logging, time
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+from collections import defaultdict
+
 import delphi
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
@@ -189,13 +191,16 @@ class Trainer():
     def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training", add_prefix=None):
 
         model = self.model
+
         x, ages, subject_ids = trainer.get_tensors_from_batch(batch)
 
         max_ages = model.get_max_ages_per_subject(ages, subject_ids)
         x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
         x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-        x, ages, subject_ids = trainer.pad_to_seqlen(x, ages, subject_ids, seqlen:=160)
+        x, ages, subject_ids = trainer.adjust_to_seqlen(x, ages, subject_ids, seqlen:=96)
         
+        # import ipdb; ipdb.set_trace()
+
         logits, att = model(x, ages, subject_ids)
         
         domains     = model._trace['domains']
@@ -210,7 +215,6 @@ class Trainer():
         f_logits  = logits[predict_mask]
         f_domains = target_domains[predict_mask]
         local_ids = targets[predict_mask]
-        age_diff = (target_ages - input_ages)[predict_mask]
         
         offsets_per_domain = self.get_offset_per_domain(model, domains_of_interest=self.predicted_domains)
         
@@ -220,7 +224,9 @@ class Trainer():
         if os.environ.get("DEBUG", False):
             import ipdb; ipdb.set_trace()
 
-        loss_ce = model.cross_entropy_loss(f_logits, global_ids)            
+        loss_ce = model.cross_entropy_loss(f_logits, global_ids)
+
+        age_diff = (target_ages - input_ages)[predict_mask]
         time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=1e-1, agg='mean')
 
         outputs = getattr(self, stage[:5] + "_outputs")
@@ -352,30 +358,166 @@ class Trainer():
         return tokens, ages, subject_ids
 
 
-    def pad_to_seqlen(self, x, ages, subject_ids, seqlen, PADDING_TOKEN=0, PAD_AGE=-10000):
+    def lengths_by_subject(self, subject_ids, ignore=None):
+        out = {}
+        for d, sids in subject_ids.items():
+            if ignore is not None and d in ignore: 
+                continue
+            for sid in torch.unique(sids):
+                out.setdefault(int(sid.item()), 0)
+                out[int(sid.item())] += int((sids == sid).sum().item())
+        return out
+    
 
-        device = subject_ids['diseases'].device
+    def truncate_subjects_by_age(self,
+        x: dict[str, torch.Tensor],
+        ages: dict[str, torch.Tensor],
+        subject_ids: dict[str, torch.Tensor],
+        total_per_subject: dict[int, int],
+        seqlen: int,
+        trim_domains: set[str],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """
+        Truncate subjects with more than `seqlen` tokens, globally across trim_domains.
     
-        subject_ids_uniq, token_count = np.unique(
-            torch.concat(list(subject_ids.values())).cpu().int().numpy(), 
-            return_counts=True
-        )
-        
-        necessary_padding_tokens = { 
-            k: seqlen - v for k, v in dict(zip(subject_ids_uniq, token_count)).items() 
-        }    
-        
-        x_pad  = torch.cat([ torch.full((v,), PADDING_TOKEN) for _, v in necessary_padding_tokens.items() ]).to(device)
-        a_pad  = torch.cat([ torch.full((v,), PAD_AGE) for _, v in necessary_padding_tokens.items() ]).to(device)
-        t_subj = torch.cat([ torch.full((v,), k) for k, v in necessary_padding_tokens.items() ]).to(device)
+        Drops the most recent (highest age) events until each subject has exactly `seqlen` tokens total.
+        Returns updated dicts with tokens removed.
+        """
+        device = next(iter(subject_ids.values())).device
     
-        x['padding'] = torch.cat([x['padding'], x_pad])
-        ages['padding'] = torch.cat([ages['padding'], a_pad])
-        subject_ids['padding'] = torch.cat([subject_ids['padding'], t_subj])
+        # Accumulate indices to drop per domain
+        to_drop_by_domain: dict[str, list[int]] = defaultdict(list)
+    
+        for subj_id, tot in total_per_subject.items():
+            diff = seqlen - tot
+            if diff >= 0:
+                continue  # nothing to drop
+    
+            R = -diff  # number of tokens to remove
+    
+            # Collect all candidate (age, domain, idx) from trim_domains
+            candidates = []
+            for d in trim_domains:
+                if d not in subject_ids:
+                    continue
+                sids_d, ages_d = subject_ids[d], ages[d]
+                idx = (sids_d == subj_id).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                for j in idx.tolist():
+                    candidates.append((float(ages_d[j].item()), d, j))
+    
+            if not candidates:
+                # No eligible domains for trimming
+                continue
+    
+            # Sort by age (ascending) and remove the R most recent
+            candidates.sort(key=lambda t: t[0])
+            drop = candidates[-min(R, len(candidates)):]
+            for _, d, j in drop:
+                to_drop_by_domain[d].append(j)
+    
+        # Apply drops per domain
+        for d, drop_list in to_drop_by_domain.items():
+            if not drop_list:
+                continue
+            mask = torch.ones(len(subject_ids[d]), dtype=torch.bool, device=device)
+            mask[torch.tensor(sorted(set(drop_list)), device=device)] = False
+            x[d] = x[d][mask]
+            ages[d] = ages[d][mask]
+            subject_ids[d] = subject_ids[d][mask]
     
         return x, ages, subject_ids
 
 
+    def pad_subjects(self,
+        x: dict[str, torch.Tensor],
+        ages: dict[str, torch.Tensor],
+        subject_ids: dict[str, torch.Tensor],
+        total_per_subject: dict[int, int],
+        seqlen: int,
+        pad_domain: str,
+        PADDING_TOKEN: int,
+        PAD_AGE: float,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """
+        Pad subjects with fewer than `seqlen` tokens by appending padding tokens
+        in the specified `pad_domain`.
+        """
+        device = next(iter(subject_ids.values())).device
+        dtype_x = next(iter(x.values())).dtype
+        dtype_age = next(iter(ages.values())).dtype
+        dtype_sid = next(iter(subject_ids.values())).dtype
+    
+        pad_x, pad_a, pad_sid = [], [], []
+    
+        for subj_id, tot in total_per_subject.items():
+            diff = seqlen - tot
+            if diff <= 0:
+                continue
+            pad_x.append(torch.full((diff,), PADDING_TOKEN, device=device, dtype=dtype_x))
+            pad_a.append(torch.full((diff,), PAD_AGE, device=device, dtype=dtype_age))
+            pad_sid.append(torch.full((diff,), subj_id, device=device, dtype=dtype_sid))
+    
+        if pad_x:
+            x[pad_domain] = torch.cat([x[pad_domain], torch.cat(pad_x)])
+            ages[pad_domain] = torch.cat([ages[pad_domain], torch.cat(pad_a)])
+            subject_ids[pad_domain] = torch.cat([subject_ids[pad_domain], torch.cat(pad_sid)])
+    
+        return x, ages, subject_ids
+
+
+    def adjust_to_seqlen(self,
+        x: dict[str, torch.Tensor],
+        ages: dict[str, torch.Tensor],
+        subject_ids: dict[str, torch.Tensor],
+        seqlen: int,
+        *,
+        pad_domain: str = "padding",
+        trim_domains: set[str] = frozenset({"diseases"}),
+        PADDING_TOKEN: int = 0,
+        PAD_AGE: float = -10000.0,
+    ):
+        """
+        Main orchestrator: ensures all subjects have exactly `seqlen` tokens in total,
+        truncating by age when too long, padding otherwise.
+        """
+        
+        from copy import deepcopy
+        x  = deepcopy(x)
+        ages  = deepcopy(ages)
+        subject_ids  = deepcopy(subject_ids)
+     
+        # Domains to consider for counting (exclude pad domain)
+        domains = [d for d in subject_ids.keys() if d != pad_domain]
+    
+        # Count total tokens per subject (excluding padding)
+        if domains:
+            all_sids = torch.cat([subject_ids[d] for d in domains])
+            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
+            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
+        else:
+            total_per_subject = {}
+    
+        # Step 1: truncate subjects with too many tokens
+        x, ages, subject_ids = self.truncate_subjects_by_age(
+            x, ages, subject_ids, total_per_subject, seqlen, trim_domains
+        )
+    
+        # Step 2: recompute totals (after truncation)
+        if domains:
+            all_sids = torch.cat([subject_ids[d] for d in domains])
+            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
+            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
+    
+        # Step 3: pad subjects that are still short
+        x, ages, subject_ids = self.pad_subjects(
+            x, ages, subject_ids, total_per_subject, seqlen, pad_domain, PADDING_TOKEN, PAD_AGE
+        )
+    
+        return x, ages, subject_ids
+    
+    
     def get_offset_per_domain(self, model, domains_of_interest):
         
         domain_to_int = { k: i for i, k in enumerate(model.transformer.embed.domain_embed.keys()) } 
