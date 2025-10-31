@@ -631,6 +631,7 @@ def get_domain_id(domain_name):
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
+'''
 def collate_fn_domains(batch):
     
     domains_dict = {}
@@ -651,6 +652,23 @@ def collate_fn_domains(batch):
         out["padding"] = torch.empty((0, 3), dtype=torch.long, device=sample_device)
     
     return out
+'''
+
+from collections import defaultdict
+
+def collate_fn_domains(batch):
+    domains = defaultdict(list)
+    for item in batch:
+        for d, arr in item.items():
+            domains[d].append(arr)
+
+    sample_device = next(iter(batch[0].values())).device
+    out = {d: torch.cat(lst, dim=0) for d, lst in domains.items()}
+
+    if "padding" not in out:
+        out["padding"] = torch.empty((0, 3), dtype=torch.long, device=sample_device)
+    return out
+
 
 
 class DelphiDataloader(DataLoader):

@@ -39,6 +39,60 @@ RUN_NAME = os.getenv("RUN_NAME", "default")
 odir = f"output/{RUN_NAME}"
 os.makedirs(odir, exist_ok=True)
 
+import torch.profiler as profiler
+
+def profile_and_print(step_fn, dataloader, optimizer, n_steps=2, top_k=20):
+    """
+    Runs a short profiling session and prints the top CUDA-heavy ops
+    with their call stacks (filtered to skip PyTorch internals).
+    """
+    with profiler.profile(
+      activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
+      record_shapes=True,
+      with_stack=True,
+      profile_memory=True,
+      with_flops=True,
+      experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True)
+    ) as prof:
+        for step, batch in enumerate(dataloader):
+            step_fn(batch, step, 0)
+            prof.step()
+            if step >= n_steps:
+                break
+
+    #events = prof.key_averages()
+    # events = sorted(events, key=lambda e: getattr(e, "cuda_time_total", 0), reverse=True)
+
+    events = [e for e in prof.events() if hasattr(e, "cuda_time_total")]
+    events = sorted(events, key=lambda e: getattr(e, "cuda_time_total", 0), reverse=True)
+
+    print(f"\nTop {top_k} individual CUDA events with call sites:\n")
+    for evt in events[:top_k]:
+        print(f"=== {evt.name} | CUDA time: {evt.cuda_time/1e3:.2f} ms ===")
+        try:
+            for frame in evt.stack():
+                fname, line, fn = frame
+                if "site-packages" in fname:
+                    continue  # skip library internals
+                print(f"  {fname}:{line} in {fn}")
+        except Exception:
+            pass
+        print()
+    return
+    print(f"\nTop {top_k} CUDA ops with stack traces:\n")
+    for evt in events[:top_k]:
+        print(f"=== {evt.key} | CUDA total: {getattr(evt, 'cuda_time_total', 0)/1e3:.2f} ms ===")
+        try:
+            for frame in evt.stack():
+                fname, line, fn = frame
+                if "site-packages" in fname:
+                    continue  # skip library internals
+                print(f"  {fname}:{line} in {fn}")
+        except Exception:
+            continue
+        print()  # blank line between ops
+
+
 # ————————————————————————————————————————————————————————————————————————————————————————————
 '''
 @dataclass
@@ -72,7 +126,7 @@ class TrainBaseConfig:
 '''
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
-EVERY_VAL = 3236
+VAL_EVERY_NSAMPLES = 100000
 
 def local_to_global_ids(local_ids):
 
@@ -151,13 +205,15 @@ class NullLogger:
 
 class MLFlowLogger:
 
-    def __init__(self, run_name=None, autostart=True, nested=False):
+    def __init__(self, experiment_name, run_name=None, autostart=True, nested=False):
+        self.experiment_name = experiment_name
         self.run_name = run_name
         self.active_run = None
         if autostart:
             self.start(nested=nested)
 
     def start(self, nested=False):
+        mlflow.set_experiment(self.experiment_name)
         if self.active_run is None:
             self.active_run = mlflow.start_run(run_name=self.run_name, nested=nested)
         return self.active_run
@@ -197,6 +253,7 @@ class Trainer():
         self._valid_counter = 0
         
         self.logger = logger
+        self.val_loss = None
         
 
     # ——————————————————————————————————————————————————————————————————————————————
@@ -239,27 +296,29 @@ class Trainer():
     def train(self, max_epochs=1000):
 
         self.logger.log_params(self.model.config)
+
         # self.logger.log_params(self.optimizer.config)
         # self.logger.log_params(self.scheduler.config)
+        # profile_and_print(self.shared_step, self.training_loader, self.optimizer, n_steps=2, top_k=20) 
 
         for epoch in range(self.current_epoch, max_epochs):
             
             self.current_epoch = epoch            
-            train_loss = self.train_epoch(eval_every=EVERY_VAL)
+            train_loss = self.train_epoch(eval_every=VAL_EVERY_NSAMPLES//args.batch_size)
 
-            metrics = {"train_loss": train_loss}
+            metrics = { "train_loss": train_loss }
              
-            if val_loss is not None:
-                metrics["val_loss"] = val_loss
+            if self.val_loss is not None:
+                metrics["val_loss"] = self.val_loss
+                val_loss_per_disease = metrics["val_loss"].pop("val_ce_loss_per_disease")
 
-            self.logger.log_metrics(metrics, step=epoch)            
-            # self.logger.log_model(self.model)
+            self.logger.log_metrics(metrics['val_loss'], step=epoch)            
+            self.logger.log_metrics(metrics['train_loss'], step=epoch)            
 
             should_stop, improved = self.early_stopper.step(self.mean_val_loss)
 
             if improved:                
-                ckpt_dir = Path("checkpoints")
-                ckpt_dir.mkdir(exist_ok=True)
+                (ckpt_dir := Path("checkpoints")).mkdir(exist_ok=True)
                 self.best_epoch = epoch
                 ckpt_path = ckpt_dir / f"best_model_epoch{epoch}_valloss{self.mean_val_loss:.4f}.ckpt"
                 torch.save(self.model.state_dict(), ckpt_path)
@@ -343,47 +402,39 @@ class Trainer():
             sum(axis=1).\
             sort_values()
         
+    def compute_mean(self, list_of_dicts):
+        return {k: torch.stack([d[k] for d in list_of_dicts]).mean() for k in list_of_dicts[0]}
+        
 
     def train_epoch(self, n_batches=None, eval_every=None):
 
-        import torch.profiler as profiler
-        
-        with profiler.profile(
-            activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
-            schedule=profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-            on_trace_ready=profiler.tensorboard_trace_handler("./logdir"),
-            record_shapes=True,
-            with_stack=True
-        ) as prof:
-
-            pbar = tqdm(self.training_loader)
+           pbar = tqdm(self.training_loader)
     
-            for i, batch in enumerate(pbar):
-                
-                self.optimizer.zero_grad()
-                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
-                self.train_outputs.append(loss)
-                
-                loss['train_total'].backward()
+           for i, batch in enumerate(pbar):
+               
+               self.optimizer.zero_grad()
+               loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
+               self.train_outputs.append(loss)
+               
+               loss['train_total'].backward()
     
-                if eval_every is not None and (i % eval_every) == 0 and i > 0:
-                    self.mean_val_loss = self.valid_epoch(n_batches=1000)                        
+               if eval_every is not None and (i % eval_every) == 0:
+                   self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=1000)                        
     
-                pbar.set_postfix({
-                    "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
-                    "time_loss":    f"{loss['train_time_loss'].item():.4f}",
-                    "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
-                    "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
-                })
+               pbar.set_postfix({
+                   "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
+                   "time_loss":    f"{loss['train_time_loss'].item():.4f}",
+                   "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
+                   "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
+               })
     
-                self.optimizer.step() 
-                self.scheduler.step()
-                
-                prof.step()
-    
-                if (n_batches is not None) and (i == n_batches):
-                    break
-
+               self.optimizer.step() 
+               self.scheduler.step()
+               
+               if (n_batches is not None) and (i == n_batches):
+                   break
+           return self.compute_mean(self.train_outputs)
+            
 
     def epoch_end(self):
 
@@ -414,9 +465,9 @@ class Trainer():
         loss_per_disease_df = self.valid_epoch_end(loss_outputs).reset_index()
         loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
 
-        loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
+        mean_loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
 
-        return loss
+        return loss, mean_loss
 
 
     def mlflow_logging(self):
@@ -625,11 +676,14 @@ def get_cli_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
     parser.add_argument("--n_layer",          default=12)
-    parser.add_argument("--test_fold",        default=1)
+    parser.add_argument("--n_head",           default=10)
+    parser.add_argument("--n_embd",           default=120)
+    parser.add_argument("--test_fold",        default=1, type=int)
     parser.add_argument("--domains",          default=["diseases", "death", "lifestyle", "hla_alleles", "sex", "padding"])
-    parser.add_argument("--run_name",         default="default")
-    parser.add_argument("--batch_size",       default=4)
-    parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4)
+    parser.add_argument("--experiment_name",  default="default")
+    parser.add_argument("--run_name",         default=None)
+    parser.add_argument("--batch_size",       default=4, type=int)
+    parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
     args = parser.parse_args()
 
     return args
@@ -677,7 +731,7 @@ train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
 valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
 test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
 
-dataloaders = [ DelphiDataloader(d, batch_size=args.batch_size) for d in [train_dataset, valid_dataset, test_dataset] ]
+dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, 2048, 2048][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -713,7 +767,7 @@ optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, devic
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 assert args.run_name != 'default', f"You are using the 'default' value for run_name."
-logger = MLFlowLogger(run_name=args.run_name)
+logger = MLFlowLogger(experiment_name=, run_name=args.run_name)
 
 trainer = Trainer(model, *dataloaders, optimizer, scheduler, logger=logger)
 trainer.train(max_epochs=1000)
