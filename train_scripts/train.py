@@ -1,311 +1,775 @@
-import os
-import time
-import math
-import pickle
-from contextlib import nullcontext
+# %%
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
+os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
+from pathlib import Path
+root_path = Path("../data/transforms")
 
 import numpy as np
+import pandas as pd
+
 import torch
+from torch.utils.data import Dataset, random_split, DataLoader
 
-from model import Delphi, DelphiConfig
-from utils import get_p2i, get_batch
+from easydict import EasyDict
 
+import mlflow
 
-out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
-eval_iters = 200
-eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = False  # if True, always save a checkpoint after each eval
-init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
-seed = 42
+from tqdm import tqdm
+import logging, time
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# wandb logging
-wandb_log = False  # disabled by default
-wandb_project = 'delphi'
-wandb_run_name = 'run' + str(time.time())
+from collections import defaultdict
 
-# data
-dataset = 'ukb_simulated_data'
-gradient_accumulation_steps = 1  # used to simulate larger batch sizes
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 24
+from data.dataset import DelphiDataset, DelphiDataloader
+from utils.cv_utils import get_data_partitions
 
-# model
-n_layer = 12
-n_head = 10
-n_embd = 120
-dropout = 0.2  # for pretraining 0 is good, for finetuning try 0.1+
-bias = False  # do we use bias inside LayerNorm and Linear layers?
-vocab_size = 1270
+from delphi.optim import OptimConfig, configure_optimizers
+from delphi.model.transformer import (
+    Delphi,
+    EmbedConfig,
+    DelphiConfig,
+)
 
-# adamw optimizer
-learning_rate = 6e-4  # max learning rate
-max_iters = 10000  # total number of training iterations
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
+from copy import deepcopy
 
-# learning rate decay settings
-decay_lr = True  # whether to decay the learning rate
-warmup_iters = 2000  # how many steps to warm up for
-lr_decay_iters = 10000  # should be ~= max_iters per Chinchilla
-min_lr = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+RUN_NAME = os.getenv("RUN_NAME", "default")
+odir = f"output/{RUN_NAME}"
+os.makedirs(odir, exist_ok=True)
 
-# system
-device = 'cuda:0'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'float32'  # 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False  # use PyTorch 2.0 to compile the model to be faster
+import torch.profiler as profiler
 
-# delphi training
-token_dropout = 0.0
-t_min = 0.0  # 365.25/12.
-mask_ties = True
-ignore_tokens = [0]
-data_fraction = 1.0
-no_event_token_rate = 5
+def profile_and_print(step_fn, dataloader, optimizer, n_steps=2, top_k=20):
+    """
+    Runs a short profiling session and prints the top CUDA-heavy ops
+    with their call stacks (filtered to skip PyTorch internals).
+    """
+    with profiler.profile(
+      activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
+      record_shapes=True,
+      with_stack=True,
+      profile_memory=True,
+      with_flops=True,
+      experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True)
+    ) as prof:
+        for step, batch in enumerate(dataloader):
+            step_fn(batch, step, 0)
+            prof.step()
+            if step >= n_steps:
+                break
 
-print(f"found vocab_size = {vocab_size}")
+    #events = prof.key_averages()
+    # events = sorted(events, key=lambda e: getattr(e, "cuda_time_total", 0), reverse=True)
 
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=vocab_size, dropout=dropout, token_dropout=token_dropout, t_min=t_min,
-                  mask_ties=mask_ties, ignore_tokens=ignore_tokens)  # start with model_args from command line
+    events = [e for e in prof.events() if hasattr(e, "cuda_time_total")]
+    events = sorted(events, key=lambda e: getattr(e, "cuda_time_total", 0), reverse=True)
 
-# -----------------------------------------------------------------------------
-config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read())  # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys}  # will be useful for logging
-# -----------------------------------------------------------------------------
-
-os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu'  # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': torch.float32, 'float64': torch.float64,
-           'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-
-torch.set_default_dtype(ptdtype)
-
-# poor man's data loader
-data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r').reshape(-1, 3)
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r').reshape(-1, 3)
-
-train_p2i = get_p2i(train_data)
-val_p2i = get_p2i(val_data)
-
-# downsample the data to requested fraction
-if data_fraction < 1.0:
-    train_p2i = train_p2i[:int(data_fraction * len(train_p2i))]
-
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-iter_num = 0
-best_val_loss = 1e9
+    print(f"\nTop {top_k} individual CUDA events with call sites:\n")
+    for evt in events[:top_k]:
+        print(f"=== {evt.name} | CUDA time: {evt.cuda_time/1e3:.2f} ms ===")
+        try:
+            for frame in evt.stack():
+                fname, line, fn = frame
+                if "site-packages" in fname:
+                    continue  # skip library internals
+                print(f"  {fname}:{line} in {fn}")
+        except Exception:
+            pass
+        print()
+    return
+    print(f"\nTop {top_k} CUDA ops with stack traces:\n")
+    for evt in events[:top_k]:
+        print(f"=== {evt.key} | CUDA total: {getattr(evt, 'cuda_time_total', 0)/1e3:.2f} ms ===")
+        try:
+            for frame in evt.stack():
+                fname, line, fn = frame
+                if "site-packages" in fname:
+                    continue  # skip library internals
+                print(f"  {fname}:{line} in {fn}")
+        except Exception:
+            continue
+        print()  # blank line between ops
 
 
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    gptconf = DelphiConfig(**model_args)
-    model = Delphi(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = DelphiConfig(**model_args)
-    model = Delphi(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+# ————————————————————————————————————————————————————————————————————————————————————————————
+'''
+@dataclass
+class TrainBaseConfig:
 
-model.to(device)
+    ckpt_dir: str = "."
+    eval_interval: int = 2000
+    eval_iters: int = 200
+    eval_only: bool = False  # if True, script exits right after the first eval
+    init_from: str = "scratch"
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+    seed: int = 42
+    gradient_accumulation_steps: int = 1  # used to simulate larger batch sizes
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    # if gradient_accumulation_steps > 1, this is the micro-batch size
+    batch_size: int = 128
 
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model)  # requires PyTorch 2.0
+    # system
+    device: str = DEVICE
+    # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+    dtype: str = "float32"
+    # 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+    compile: bool = False  # use PyTorch 2.0 to compile the model to be faster
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
+    train_data: dict = field(default_factory=dict)
+    val_data: dict = field(default_factory=dict)
+
+    model: dict = field(default_factory=dict)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    # log: TrainLogConfig = field(default_factory=TrainLogConfig)
+'''
+# ————————————————————————————————————————————————————————————————————————————————————————————
+
+VAL_EVERY_NSAMPLES = 100000
+
+def local_to_global_ids(local_ids):
+
+    vocab_lens = { domain_to_int[k]: v.vocab_len for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest }
+    offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
+    offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
+    local_ids = targets[torch.isin(target_domains, domains_of_interest_int.to(DEVICE))]
+    f_domains = target_domains[mask]
+    offsets = offsets_per_domain[f_domains]
+    global_ids = offsets + local_ids
+    return global_ids
 
 
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters, 2)
-        data = train_data if split == 'train' else val_data
-        p2i = train_p2i if split == 'train' else val_p2i
-        for k in range(eval_iters):
-            ix = torch.randint(len(p2i), (batch_size,))
-            X, A, Y, B = get_batch(ix, data, p2i, block_size=block_size,
-                                   device=device, select='left',
-                                   no_event_token_rate=no_event_token_rate, 
-                                   cut_batch=True)
-            with ctx:
-                logits, loss, _ = model(X, A, Y, B, validation_loss_mode=True)
-            losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
-        out[split] = losses.mean(0)
-    model.train()
-    return out
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.0, mode='min'):
+        """
+        mode: 'min' for losses, 'max' for metrics like AUROC.
+        This class only decides when to stop; it doesn't handle checkpointing.
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.best_score = None
+        self.counter = 0
+        self.should_stop = False
+        self.is_improvement = False
+
+    def step(self, current_score):
+        """
+        Update the early stopping state given a new validation score.
+
+        Returns
+        -------
+        should_stop : bool
+            Whether training should stop.
+        is_improvement : bool
+            Whether the current score improved over the best one.
+        """
+        score = -current_score if self.mode == 'min' else current_score
+
+        if self.best_score is None:
+            self.best_score = score
+            self.is_improvement = True
+            return False, True
+
+        if score < self.best_score + self.min_delta:
+            # No improvement
+            self.counter += 1
+            self.is_improvement = False
+            if self.counter >= self.patience:
+                self.should_stop = True
+        else:
+            # Improvement found
+            self.best_score = score
+            self.counter = 0
+            self.is_improvement = True
+
+        return self.should_stop, self.is_improvement
 
 
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
+
+class NullLogger:
+
+    def log_params(self, params):
+        pass
+
+    def log_metrics(self, metrics, step=None):
+        pass
+
+    def log_artifact(self, path, artifact_path=None):
+        pass
+
+    def log_model(self, model, artifact_path="model"):
+        pass
+    
+
+class MLFlowLogger:
+
+    def __init__(self, experiment_name, run_name=None, autostart=True, nested=False):
+        self.experiment_name = experiment_name
+        self.run_name = run_name
+        self.active_run = None
+        if autostart:
+            self.start(nested=nested)
+
+    def start(self, nested=False):
+        mlflow.set_experiment(self.experiment_name)
+        if self.active_run is None:
+            self.active_run = mlflow.start_run(run_name=self.run_name, nested=nested)
+        return self.active_run
+
+    def end(self):
+        if self.active_run:
+            mlflow.end_run()
+            self.active_run = None
+
+    def log_params(self, params):
+        mlflow.log_params(params)
+
+    def log_metrics(self, metrics, step=None):
+        mlflow.log_metrics(metrics, step=step)
+
+    def log_artifact(self, path, artifact_path=None):
+        mlflow.log_artifact(path, artifact_path=artifact_path)
 
 
-# logging
-if wandb_log:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-# training loop
-ix = torch.randint(len(train_p2i), (batch_size,))
-X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
-                       padding='random', lifestyle_augmentations=True, select='left',
-                       no_event_token_rate=no_event_token_rate)
-t0 = time.time()
-local_iter_num = 0  # number of iterations in the lifetime of this process
+class Trainer():
 
-val_loss = None
+    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler, patience=3, n_train_batches=None, n_val_batches=None, logger=NullLogger()):
 
-while True:
+        self.model           = model        
+        
+        self.optimizer       = optimizer
+        self.scheduler       = scheduler        
+        self.early_stopper   = EarlyStopping(patience=patience, min_delta=0.001, mode='min')                        
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        self.training_loader, self.valid_loader, self.test_loader = training_loader, valid_loader, test_loader
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and iter_num > 0:
-        losses = estimate_loss()
-        if val_loss is None:
-            val_loss_unpooled = losses['val']
-        val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled  # ie exponential decay
-        val_loss = val_loss_unpooled.sum().item()
-        print(f"step {iter_num}: train loss {losses['train'].sum().item():.4f}, val loss {losses['val'].sum().item():.4f} ({val_loss:.4f})")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/agg_loss": losses['train'].sum().item(),
-                "val/loss":val_loss,
-                "val/loss_ce": val_loss_unpooled[0].item(),
-                "val/loss_dt": val_loss_unpooled[1].item()
-            })
+        self.n_train_batches, self.n_val_batches = n_train_batches, n_val_batches
+        self.train_outputs, self.valid_outputs, self.test_outputs = [], [], []            
 
-        if always_save_checkpoint or val_loss < best_val_loss:
-            best_val_loss = val_loss
-            if iter_num > 0:
-                checkpoint = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        self.current_epoch  = 0
+        self._valid_counter = 0
+        
+        self.logger = logger
+        self.val_loss = None
+        
 
-        if iter_num % 10_000 == 0:
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'best_val_loss': best_val_loss,
-                'config': config,
-            }
-            print(f"saving checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
+    # ——————————————————————————————————————————————————————————————————————————————
+   
+    @property
+    def predicted_domains(self):
+        return [ dname for dname, config in self.model.config.domains.items() if config.predict ]
 
-    if iter_num == 0 and eval_only:
-        break
+    @property
+    def predicted_domains_as_int(self):
+        return torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(DEVICE)
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        with ctx:
-            logits, loss, att = model(X, A, Y, B)
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        ix = torch.randint(len(train_p2i), (batch_size,))
-        X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
-                               padding='random', lifestyle_augmentations=True, select='left',
-                               no_event_token_rate=no_event_token_rate, cut_batch=True)
+    @property
+    def domain_to_int(self):
+        return { dname: i for i, dname in enumerate(self.model.transformer.embed.domain_embed.keys()) }
 
-        # backward pass, with gradient scaling if training in fp16
-        loss = loss['loss_ce'] + loss['loss_dt']
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0:
-        lossf = loss.item()  # loss as float. note: this is a CPU-GPU sync point
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+    @property
+    def vocab_lens(self):
+        return { 
+            dname: self.model.transformer.embed.domain_embed[dname].weight.shape[0]
+            for dname in self.model.transformer.embed.domain_embed
+        }
 
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": loss,
-                "lr": lr,
-                "weights": wandb.Histogram(model.transformer.wte.weight.cpu().detach().numpy()),
-                "logits": wandb.Histogram(logits.cpu().detach().numpy()),
-            })
 
-    iter_num += 1
-    local_iter_num += 1
+    def get_model_metadata(self):
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+        metadata = { 
+            "train_ids": sorted(self.training_loader.dataset.subjects),
+            "valid_ids": sorted(self.valid_loader.dataset.subjects),
+            "test_ids":  sorted(self.test_loader.dataset.subjects),
+        }
+        return metadata
+
+
+    def get_vocab_len(self, domain_name):
+        self.transformer.embed.domain_embed[domain_name].weight.shape[0]
+
+
+    def train(self, max_epochs=1000):
+
+        self.logger.log_params(self.model.config)
+
+        # self.logger.log_params(self.optimizer.config)
+        # self.logger.log_params(self.scheduler.config)
+        # profile_and_print(self.shared_step, self.training_loader, self.optimizer, n_steps=2, top_k=20) 
+
+        for epoch in range(self.current_epoch, max_epochs):
+            
+            self.current_epoch = epoch            
+            train_loss = self.train_epoch(eval_every=VAL_EVERY_NSAMPLES//args.batch_size)
+
+            metrics = { "train_loss": train_loss }
+             
+            if self.val_loss is not None:
+                metrics["val_loss"] = self.val_loss
+                val_loss_per_disease = metrics["val_loss"].pop("val_ce_loss_per_disease")
+
+            self.logger.log_metrics(metrics['val_loss'], step=epoch)            
+            self.logger.log_metrics(metrics['train_loss'], step=epoch)            
+
+            should_stop, improved = self.early_stopper.step(self.mean_val_loss)
+
+            if improved:                
+                (ckpt_dir := Path("checkpoints")).mkdir(exist_ok=True)
+                self.best_epoch = epoch
+                ckpt_path = ckpt_dir / f"best_model_epoch{epoch}_valloss{self.mean_val_loss:.4f}.ckpt"
+                torch.save(self.model.state_dict(), ckpt_path)
+                print(f"New best model saved → {ckpt_path}")
+ 
+            if should_stop:
+                print(f"Early stopping triggered at epoch {self.current_epoch}")
+            
+
+
+    def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training", add_prefix=None):
+
+        model = self.model
+
+        x, ages, subject_ids = trainer.get_tensors_from_batch(batch)
+
+        max_ages = model.get_max_ages_per_subject(ages, subject_ids)
+        x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
+        x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+        x, ages, subject_ids = trainer.adjust_to_seqlen(x, ages, subject_ids, seqlen:=96)
+        
+        logits, att = model(x, ages, subject_ids)
+        
+        domains     = model._trace['domains']
+        targets     = model._trace['tokens'][:,1:]
+        input_ages  = model._trace['ages'][:,:-1]
+        target_ages = model._trace['ages'][:,1:]
+        target_domains = domains[:,1:];
+        
+        predict_mask = torch.isin(target_domains, self.predicted_domains_as_int)
+        
+        logits    = torch.cat([logits[dname] for dname in self.predicted_domains], axis=-1)
+        f_logits  = logits[predict_mask]
+        f_domains = target_domains[predict_mask]
+        local_ids = targets[predict_mask]
+        
+        offsets_per_domain = self.get_offset_per_domain(model, domains_of_interest=self.predicted_domains)
+        
+        offsets = offsets_per_domain[f_domains]
+        global_ids = offsets + local_ids
+
+        loss_ce = model.cross_entropy_loss(f_logits, global_ids)
+
+        age_diff = (target_ages - input_ages)[predict_mask]
+        time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=1e-1, agg='mean')
+
+        outputs = getattr(self, stage[:5] + "_outputs")
+        
+        prefix = "" if add_prefix is None else add_prefix + "_"
+
+        loss = EasyDict({                
+            f'{prefix}ce_loss': loss_ce,            
+            f'{prefix}time_loss': time_loss,
+            f'{prefix}ce_ema_loss': torch.lerp(outputs[-1][f'{prefix}ce_ema_loss'], loss_ce, weight=0.002) if outputs else loss_ce,
+            f'{prefix}time_ema_loss': torch.lerp(outputs[-1][f'{prefix}time_ema_loss'], time_loss, weight=0.002) if outputs else time_loss,
+            f'{prefix}total': loss_ce + time_loss,            
+        })
+
+        if log_per_disease:
+            loss_ce_per_disease = model.cross_entropy_loss(
+                f_logits, global_ids, agg="per_disease"
+            ).to_frame().assign(batch_idx=batch_idx)
+
+            loss[f'{prefix}ce_loss_per_disease'] = loss_ce_per_disease
+
+
+        if return_att and return_logits: return loss, logits, att 
+        elif return_logits:              return loss, logits
+        elif return_att:                 return loss, att
+        else:                            return loss
+
+
+    def valid_epoch_end(self, loss_outputs):        
+        
+        self._valid_counter += 1        
+
+        return pd.concat([x['val_ce_loss_per_disease'] for x in loss_outputs]).\
+            reset_index().\
+            pivot(index="token_id", columns="batch_idx", values="log_p").\
+            fillna(0).\
+            sum(axis=1).\
+            sort_values()
+        
+    def compute_mean(self, list_of_dicts):
+        return {k: torch.stack([d[k] for d in list_of_dicts]).mean() for k in list_of_dicts[0]}
+        
+
+    def train_epoch(self, n_batches=None, eval_every=None):
+
+           pbar = tqdm(self.training_loader)
+    
+           for i, batch in enumerate(pbar):
+               
+               self.optimizer.zero_grad()
+               loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
+               self.train_outputs.append(loss)
+               
+               loss['train_total'].backward()
+    
+               if eval_every is not None and (i % eval_every) == 0:
+                   self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=1000)                        
+    
+               pbar.set_postfix({
+                   "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
+                   "time_loss":    f"{loss['train_time_loss'].item():.4f}",
+                   "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
+                   "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
+               })
+    
+               self.optimizer.step() 
+               self.scheduler.step()
+               
+               if (n_batches is not None) and (i == n_batches):
+                   break
+           return self.compute_mean(self.train_outputs)
+            
+
+    def epoch_end(self):
+
+        self.train_outputs = []
+        self.valid_outputs = []
+
+
+    def valid_epoch(self, n_batches=None):
+        
+        pbar = tqdm(self.valid_loader)
+
+        with torch.no_grad():
+            loss_outputs = []
+            for i, batch in enumerate(pbar):
+                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_per_disease=True, stage="validation", add_prefix="val")
+                loss_outputs.append(loss)
+            
+                pbar.set_postfix({
+                    "ce_loss":      f"{loss['val_ce_loss'].item():.4f}", 
+                    "time_loss":    f"{loss['val_time_loss'].item():.4f}",
+                    "loss_sm":      f"{loss['val_ce_ema_loss'].item():.4f}", 
+                    "time_loss_sm": f"{loss['val_time_ema_loss'].item():.4f}",
+                })
+            
+                if n_batches is not None and i == n_batches:
+                    break
+        
+        loss_per_disease_df = self.valid_epoch_end(loss_outputs).reset_index()
+        loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
+
+        mean_loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
+
+        return loss, mean_loss
+
+
+    def mlflow_logging(self):
+
+        pass
+
+
+    # ——————————————————————————————————————————————————————————————————————————————
+    def get_tensors_from_batch(self, batch):
+        
+        tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
+        
+        for dname in batch:               
+            SUBJECT_ID_COLUMN, AGE_COLUMN, TOKEN_COLUMN = 0, 1, 2
+            domain_data = batch.get(dname, [])  
+            if len(domain_data) == 0:
+                domain_data = domain_data.view(0, 3)
+            if dname == "genetic_pcs":
+                tokens[dname] = domain_data[:, 1:-1].float()
+                ages[dname] = domain_data[:, -1]
+                subject_ids[dname] = domain_data[:, 0]
+            else:    
+                tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
+                ages[dname] = domain_data[:, AGE_COLUMN]
+                subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
+
+        return tokens, ages, subject_ids
+
+
+    def lengths_by_subject(self, subject_ids, ignore=None):
+        out = {}
+        for d, sids in subject_ids.items():
+            if ignore is not None and d in ignore: 
+                continue
+            for sid in torch.unique(sids):
+                out.setdefault(int(sid.item()), 0)
+                out[int(sid.item())] += int((sids == sid).sum().item())
+        return out
+    
+
+    def truncate_subjects_by_age(self,
+        x: dict[str, torch.Tensor],
+        ages: dict[str, torch.Tensor],
+        subject_ids: dict[str, torch.Tensor],
+        total_per_subject: dict[int, int],
+        seqlen: int,
+        trim_domains: set[str],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """
+        Truncate subjects with more than `seqlen` tokens, globally across trim_domains.
+    
+        Drops the most recent (highest age) events until each subject has exactly `seqlen` tokens total.
+        Returns updated dicts with tokens removed.
+        """
+        device = next(iter(subject_ids.values())).device
+    
+        # Accumulate indices to drop per domain
+        to_drop_by_domain: dict[str, list[int]] = defaultdict(list)
+    
+        for subj_id, tot in total_per_subject.items():
+            diff = seqlen - tot
+            if diff >= 0:
+                continue  # nothing to drop
+    
+            R = -diff  # number of tokens to remove
+    
+            # Collect all candidate (age, domain, idx) from trim_domains
+            candidates = []
+            for d in trim_domains:
+                if d not in subject_ids:
+                    continue
+                sids_d, ages_d = subject_ids[d], ages[d]
+                idx = (sids_d == subj_id).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                for j in idx.tolist():
+                    candidates.append((float(ages_d[j].item()), d, j))
+    
+            if not candidates:
+                # No eligible domains for trimming
+                continue
+    
+            # Sort by age (ascending) and remove the R most recent
+            candidates.sort(key=lambda t: t[0])
+            drop = candidates[-min(R, len(candidates)):]
+            for _, d, j in drop:
+                to_drop_by_domain[d].append(j)
+    
+        # Apply drops per domain
+        for d, drop_list in to_drop_by_domain.items():
+            if not drop_list:
+                continue
+            mask = torch.ones(len(subject_ids[d]), dtype=torch.bool, device=device)
+            mask[torch.tensor(sorted(set(drop_list)), device=device)] = False
+            x[d] = x[d][mask]
+            ages[d] = ages[d][mask]
+            subject_ids[d] = subject_ids[d][mask]
+    
+        return x, ages, subject_ids
+
+
+    def pad_subjects(self,
+        x: dict[str, torch.Tensor],
+        ages: dict[str, torch.Tensor],
+        subject_ids: dict[str, torch.Tensor],
+        total_per_subject: dict[int, int],
+        seqlen: int,
+        pad_domain: str,
+        PADDING_TOKEN: int,
+        PAD_AGE: float,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """
+        Pad subjects with fewer than `seqlen` tokens by appending padding tokens
+        in the specified `pad_domain`.
+        """
+        device = next(iter(subject_ids.values())).device
+        dtype_x = next(iter(x.values())).dtype
+        dtype_age = next(iter(ages.values())).dtype
+        dtype_sid = next(iter(subject_ids.values())).dtype
+    
+        pad_x, pad_a, pad_sid = [], [], []
+    
+        for subj_id, tot in total_per_subject.items():
+            diff = seqlen - tot
+            if diff <= 0:
+                continue
+            pad_x.append(torch.full((diff,), PADDING_TOKEN, device=device, dtype=dtype_x))
+            pad_a.append(torch.full((diff,), PAD_AGE, device=device, dtype=dtype_age))
+            pad_sid.append(torch.full((diff,), subj_id, device=device, dtype=dtype_sid))
+    
+        if pad_x:
+            x[pad_domain] = torch.cat([x[pad_domain], torch.cat(pad_x)])
+            ages[pad_domain] = torch.cat([ages[pad_domain], torch.cat(pad_a)])
+            subject_ids[pad_domain] = torch.cat([subject_ids[pad_domain], torch.cat(pad_sid)])
+    
+        return x, ages, subject_ids
+
+
+    def adjust_to_seqlen(self,
+        x: dict[str, torch.Tensor],
+        ages: dict[str, torch.Tensor],
+        subject_ids: dict[str, torch.Tensor],
+        seqlen: int,
+        *,
+        pad_domain: str = "padding",
+        trim_domains: set[str] = frozenset({"diseases"}),
+        PADDING_TOKEN: int = 0,
+        PAD_AGE: float = -10000.0,
+    ):
+        """
+        Main orchestrator: ensures all subjects have exactly `seqlen` tokens in total,
+        truncating by age when too long, padding otherwise.
+        """
+                
+        x  = deepcopy(x)
+        ages  = deepcopy(ages)
+        subject_ids  = deepcopy(subject_ids)
+     
+        # Domains to consider for counting (exclude pad domain)
+        domains = [d for d in subject_ids.keys() if d != pad_domain]
+    
+        # Count total tokens per subject (excluding padding)
+        if domains:
+            all_sids = torch.cat([subject_ids[d] for d in domains])
+            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
+            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
+        else:
+            total_per_subject = {}
+    
+        # Step 1: truncate subjects with too many tokens
+        x, ages, subject_ids = self.truncate_subjects_by_age(
+            x, ages, subject_ids, total_per_subject, seqlen, trim_domains
+        )
+    
+        # Step 2: recompute totals (after truncation)
+        if domains:
+            all_sids = torch.cat([subject_ids[d] for d in domains])
+            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
+            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
+    
+        # Step 3: pad subjects that are still short
+        x, ages, subject_ids = self.pad_subjects(
+            x, ages, subject_ids, total_per_subject, seqlen, pad_domain, PADDING_TOKEN, PAD_AGE
+        )
+    
+        return x, ages, subject_ids
+    
+    
+    def get_offset_per_domain(self, model, domains_of_interest):
+        
+        domain_to_int = { k: i for i, k in enumerate(model.transformer.embed.domain_embed.keys()) } 
+        vocab_lens = { 
+            domain_to_int[k]: v.vocab_len 
+            for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest 
+        }
+        offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
+        offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
+        return offsets_per_domain
+
+
+# ——————————————— CONFIG ———————————————————————————————————————————————————————————————
+
+def get_cli_args():
+
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
+    parser.add_argument("--n_layer",          default=12)
+    parser.add_argument("--n_head",           default=10)
+    parser.add_argument("--n_embd",           default=120)
+    parser.add_argument("--test_fold",        default=1, type=int)
+    parser.add_argument("--domains",          default=["diseases", "death", "lifestyle", "hla_alleles", "sex", "padding"])
+    parser.add_argument("--experiment_name",  default="default")
+    parser.add_argument("--run_name",         default=None)
+    parser.add_argument("--batch_size",       default=4, type=int)
+    parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
+    args = parser.parse_args()
+
+    return args
+
+if __name__ == "__main__":    
+    args =  get_cli_args()
+else:
+    args = EasyDict({
+        "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"],
+        "n_layer": 12,
+        "test_fold": 3,
+        "patience": 2,
+        "batch_size": 4,
+        "lr": 1e-4,
+        "run_name": os.getenv("RUN_NAME", "default2"),
+    })
+
+if isinstance(args.attention_scheme, str):
+    args.attention_scheme = [args.attention_scheme]
+
+tokens_path = root_path / 'tokens'
+
+default_cfg_per_domain = {
+# 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
+  'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
+  'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
+  'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
+  "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
+  "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
+  "padding":     EmbedConfig(projector="embed")    
+}
+
+# k, v doesn't work for some reason!
+domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in args.domains }
+
+assert all([k in default_cfg_per_domain for k in args.domains])
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
+
+dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[])
+
+train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
+valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
+test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
+
+dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, 2048, 2048][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,genetic_pcs,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
+# ATTENTION_SCHEME = "[h,s]:bidirectional,[s,dis,l,de]:causal(mask_ties=True)"
+
+assert len(args.attention_scheme) in {1, args.n_layer}, f"len of the --attention_scheme argument should be either 1 or args.n_layer (={args.n_layer})"
+
+if len(args.attention_scheme) == 1:
+    attention_scheme = args.n_layer * args.attention_scheme
+elif args.n_layer == len(args.attention_scheme):
+    attention_scheme = args.attention_scheme
+
+print(domain_cfg)
+
+config = DelphiConfig(
+    n_layer=args.n_layer, 
+    token_dropout=0.1, 
+    domains=domain_cfg, 
+    attention_scheme=attention_scheme
+)
+
+model  = Delphi(config).to(DEVICE)
+torch.compile(model)
+
+optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
+optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+assert args.run_name != 'default', f"You are using the 'default' value for run_name."
+logger = MLFlowLogger(experiment_name=, run_name=args.run_name)
+
+trainer = Trainer(model, *dataloaders, optimizer, scheduler, logger=logger)
+trainer.train(max_epochs=1000)
+
+# %%
