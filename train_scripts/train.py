@@ -379,6 +379,7 @@ class Trainer():
  
             if should_stop:
                 print(f"Early stopping triggered at epoch {self.current_epoch}")
+                break
             
 
 
