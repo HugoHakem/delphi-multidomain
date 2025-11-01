@@ -24,6 +24,7 @@ from collections import defaultdict
 
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
+from utils.profiling import profile_and_print
 
 from delphi.optim import OptimConfig, configure_optimizers
 from delphi.model.transformer import (
@@ -35,62 +36,11 @@ from delphi.model.transformer import (
 from copy import deepcopy
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+
 RUN_NAME = os.getenv("RUN_NAME", "default")
+
 odir = f"output/{RUN_NAME}"
 os.makedirs(odir, exist_ok=True)
-
-import torch.profiler as profiler
-
-def profile_and_print(step_fn, dataloader, optimizer, n_steps=2, top_k=20):
-    """
-    Runs a short profiling session and prints the top CUDA-heavy ops
-    with their call stacks (filtered to skip PyTorch internals).
-    """
-    with profiler.profile(
-      activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
-      record_shapes=True,
-      with_stack=True,
-      profile_memory=True,
-      with_flops=True,
-      experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True)
-    ) as prof:
-        for step, batch in enumerate(dataloader):
-            step_fn(batch, step, 0)
-            prof.step()
-            if step >= n_steps:
-                break
-
-    #events = prof.key_averages()
-    # events = sorted(events, key=lambda e: getattr(e, "cuda_time_total", 0), reverse=True)
-
-    events = [e for e in prof.events() if hasattr(e, "cuda_time_total")]
-    events = sorted(events, key=lambda e: getattr(e, "cuda_time_total", 0), reverse=True)
-
-    print(f"\nTop {top_k} individual CUDA events with call sites:\n")
-    for evt in events[:top_k]:
-        print(f"=== {evt.name} | CUDA time: {evt.cuda_time/1e3:.2f} ms ===")
-        try:
-            for frame in evt.stack():
-                fname, line, fn = frame
-                if "site-packages" in fname:
-                    continue  # skip library internals
-                print(f"  {fname}:{line} in {fn}")
-        except Exception:
-            pass
-        print()
-    return
-    print(f"\nTop {top_k} CUDA ops with stack traces:\n")
-    for evt in events[:top_k]:
-        print(f"=== {evt.key} | CUDA total: {getattr(evt, 'cuda_time_total', 0)/1e3:.2f} ms ===")
-        try:
-            for frame in evt.stack():
-                fname, line, fn = frame
-                if "site-packages" in fname:
-                    continue  # skip library internals
-                print(f"  {fname}:{line} in {fn}")
-        except Exception:
-            continue
-        print()  # blank line between ops
 
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
@@ -675,11 +625,11 @@ def get_cli_args():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
-    parser.add_argument("--n_layer",          default=12)
-    parser.add_argument("--n_head",           default=10)
-    parser.add_argument("--n_embd",           default=120)
-    parser.add_argument("--test_fold",        default=1, type=int)
-    parser.add_argument("--domains",          default=["diseases", "death", "lifestyle", "hla_alleles", "sex", "padding"])
+    parser.add_argument("--n_layer",          default=12,  type=int)
+    parser.add_argument("--n_head",           default=10,  type=int)
+    parser.add_argument("--n_embd",           default=120, type=int)
+    parser.add_argument("--test_fold",        default=1,   type=int)
+    parser.add_argument("--domains",          default=["diseases", "death", "lifestyle", "hla_alleles", "sex", "padding"], nargs="+")
     parser.add_argument("--experiment_name",  default="default")
     parser.add_argument("--run_name",         default=None)
     parser.add_argument("--batch_size",       default=4, type=int)
@@ -767,7 +717,7 @@ optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, devic
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 assert args.run_name != 'default', f"You are using the 'default' value for run_name."
-logger = MLFlowLogger(experiment_name=, run_name=args.run_name)
+logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
 
 trainer = Trainer(model, *dataloaders, optimizer, scheduler, logger=logger)
 trainer.train(max_epochs=1000)
