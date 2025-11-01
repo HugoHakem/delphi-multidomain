@@ -33,6 +33,9 @@ from delphi.model.transformer import (
     DelphiConfig,
 )
 
+import tempfile
+import shutil
+
 from copy import deepcopy
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -88,6 +91,41 @@ def local_to_global_ids(local_ids):
     offsets = offsets_per_domain[f_domains]
     global_ids = offsets + local_ids
     return global_ids
+
+
+def log_df_as_artifact(df: pd.DataFrame, filename="data.csv", artifact_path=None):
+    """
+    Guarda un DataFrame como CSV temporal y lo loguea como artefacto en MLflow.
+
+    Args:
+        df (pd.DataFrame): el DataFrame a guardar.
+        filename (str): nombre del archivo CSV.
+        artifact_path (str, optional): subdirectorio dentro del run de MLflow.
+    """
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, filename)
+    df.to_csv(tmp_path, index=False)
+
+    try:
+        mlflow.log_artifact(tmp_path, artifact_path=artifact_path)
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def load_df_artifact(run_id: str, artifact_path: str) -> pd.DataFrame:
+    """
+    Descarga y lee un artefacto CSV desde un run de MLflow.
+
+    Args:
+        run_id (str): ID del run de MLflow.
+        artifact_path (str): ruta dentro del run (por ejemplo 'outputs/data.csv').
+
+    Returns:
+        pd.DataFrame: el DataFrame cargado desde el artefacto.
+    """
+    local_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_path)
+    return pd.read_csv(local_path)
+
 
 
 class EarlyStopping:
@@ -152,37 +190,102 @@ class NullLogger:
     def log_model(self, model, artifact_path="model"):
         pass
     
+import os
+import shutil
+import tempfile
+import mlflow
+import pandas as pd
+from urllib.parse import urlparse
+
+from typing import List, Dict
 
 class MLFlowLogger:
+    """
+    Simple MLflow wrapper that manages an active run and
+    provides convenient methods for logging parameters, metrics, and artifacts.
+    """
 
     def __init__(self, experiment_name, run_name=None, autostart=True, nested=False):
         self.experiment_name = experiment_name
         self.run_name = run_name
         self.active_run = None
+        self.tracking_base = None
         if autostart:
             self.start(nested=nested)
 
     def start(self, nested=False):
+        """
+        Start an MLflow run if none is active.
+        """
         mlflow.set_experiment(self.experiment_name)
         if self.active_run is None:
             self.active_run = mlflow.start_run(run_name=self.run_name, nested=nested)
+        # store the tracking base for relative URI resolution
+        self.tracking_base = self._strip_file_prefix(mlflow.get_tracking_uri())
         return self.active_run
 
     def end(self):
+        """
+        End the active MLflow run.
+        """
         if self.active_run:
             mlflow.end_run()
             self.active_run = None
 
     def log_params(self, params):
+        """
+        Log a dictionary of parameters.
+        """
         mlflow.log_params(params)
 
     def log_metrics(self, metrics, step=None):
+        """
+        Log a dictionary of metrics.
+        Optionally specify a global step.
+        """
         mlflow.log_metrics(metrics, step=step)
 
-    def log_artifact(self, path, artifact_path=None):
+
+    def log_artifact(self, path, artifact_path=None, relative_uri=True):
+        """
+        Log a single artifact file and optionally return a relative artifact URI
+        instead of the absolute one (useful for portable runs).
+        """
         mlflow.log_artifact(path, artifact_path=artifact_path)
+        uri = mlflow.get_artifact_uri(artifact_path)
+
+        if relative_uri and self.tracking_base:
+            uri = self._strip_file_prefix(uri)
+            if uri.startswith(self.tracking_base):
+                uri = os.path.relpath(uri, self.tracking_base)
+        return uri
 
 
+    def log_df_as_artifact(self, df: pd.DataFrame, filename="data.csv", artifact_path=None, relative_uri=True):
+        """
+        Save a DataFrame as a temporary CSV, log it as an artifact,
+        and optionally return a relative artifact URI.
+        """
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = os.path.join(tmp_dir, filename)
+        df.to_csv(tmp_path, index=False)
+
+        try:
+            uri = self.log_artifact(tmp_path, artifact_path=artifact_path, relative_uri=relative_uri)
+        finally:
+            shutil.rmtree(tmp_dir)
+        return uri
+
+
+    @staticmethod
+    def _strip_file_prefix(uri: str) -> str:
+        """
+        Remove file:// prefix if present.
+        """
+        return urlparse(uri).path if uri.startswith("file://") else uri
+
+
+# ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 class Trainer():
 
@@ -352,38 +455,43 @@ class Trainer():
             sum(axis=1).\
             sort_values()
         
-    def compute_mean(self, list_of_dicts):
-        return {k: torch.stack([d[k] for d in list_of_dicts]).mean() for k in list_of_dicts[0]}
+
+    def compute_mean(self, outputs: List[Dict]):
+        return {k: torch.stack([d[k] for d in outputs]).mean() for k in outputs[0]}
         
 
     def train_epoch(self, n_batches=None, eval_every=None):
 
-           pbar = tqdm(self.training_loader)
+        pbar = tqdm(self.training_loader)
+
+        self.val_step = 0
+
+        for i, batch in enumerate(pbar):
+            
+            self.optimizer.zero_grad()
+            loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
+            self.train_outputs.append(loss)
+            
+            loss['train_total'].backward()
     
-           for i, batch in enumerate(pbar):
-               
-               self.optimizer.zero_grad()
-               loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
-               self.train_outputs.append(loss)
-               
-               loss['train_total'].backward()
+            if eval_every is not None and (i % eval_every) == 0:
+                self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches='all')
+                self.val_step += 1                        
     
-               if eval_every is not None and (i % eval_every) == 0:
-                   self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=1000)                        
+            pbar.set_postfix({
+                "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
+                "time_loss":    f"{loss['train_time_loss'].item():.4f}",
+                "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
+                "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
+            })
     
-               pbar.set_postfix({
-                   "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
-                   "time_loss":    f"{loss['train_time_loss'].item():.4f}",
-                   "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
-                   "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
-               })
-    
-               self.optimizer.step() 
-               self.scheduler.step()
-               
-               if (n_batches is not None) and (i == n_batches):
-                   break
-           return self.compute_mean(self.train_outputs)
+            self.optimizer.step() 
+            self.scheduler.step()
+            
+            if (n_batches is not None) and (i == n_batches):
+                break
+            
+        return self.compute_mean(self.train_outputs)
             
 
     def epoch_end(self):
@@ -392,7 +500,7 @@ class Trainer():
         self.valid_outputs = []
 
 
-    def valid_epoch(self, n_batches=None):
+    def valid_epoch(self, n_batches='all'):
         
         pbar = tqdm(self.valid_loader)
 
@@ -409,15 +517,16 @@ class Trainer():
                     "time_loss_sm": f"{loss['val_time_ema_loss'].item():.4f}",
                 })
             
-                if n_batches is not None and i == n_batches:
+                if n_batches != "all" and i == n_batches:
                     break
         
         loss_per_disease_df = self.valid_epoch_end(loss_outputs).reset_index()
+        self.logger.log_df_as_artifact(df=loss_per_disease_df, filename=f"losses_epoch{self.current_epoch}_{self.val_step}.csv", artifact_path="val_loss_per_disease")
         loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
 
         mean_loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
 
-        return loss, mean_loss
+        return loss, mean_loss,
 
 
     def mlflow_logging(self):
