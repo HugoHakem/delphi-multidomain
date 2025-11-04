@@ -6,6 +6,8 @@ os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoi
 from pathlib import Path
 root_path = Path("../data/transforms")
 
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 
@@ -35,6 +37,10 @@ from delphi.model.transformer import (
 
 import tempfile
 import shutil
+
+from urllib.parse import urlparse
+
+from typing import List, Dict
 
 from copy import deepcopy
 
@@ -91,41 +97,6 @@ def local_to_global_ids(local_ids):
     offsets = offsets_per_domain[f_domains]
     global_ids = offsets + local_ids
     return global_ids
-
-
-def log_df_as_artifact(df: pd.DataFrame, filename="data.csv", artifact_path=None):
-    """
-    Guarda un DataFrame como CSV temporal y lo loguea como artefacto en MLflow.
-
-    Args:
-        df (pd.DataFrame): el DataFrame a guardar.
-        filename (str): nombre del archivo CSV.
-        artifact_path (str, optional): subdirectorio dentro del run de MLflow.
-    """
-    tmp_dir = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, filename)
-    df.to_csv(tmp_path, index=False)
-
-    try:
-        mlflow.log_artifact(tmp_path, artifact_path=artifact_path)
-    finally:
-        shutil.rmtree(tmp_dir)
-
-
-def load_df_artifact(run_id: str, artifact_path: str) -> pd.DataFrame:
-    """
-    Descarga y lee un artefacto CSV desde un run de MLflow.
-
-    Args:
-        run_id (str): ID del run de MLflow.
-        artifact_path (str): ruta dentro del run (por ejemplo 'outputs/data.csv').
-
-    Returns:
-        pd.DataFrame: el DataFrame cargado desde el artefacto.
-    """
-    local_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_path)
-    return pd.read_csv(local_path)
-
 
 
 class EarlyStopping:
@@ -190,14 +161,6 @@ class NullLogger:
     def log_model(self, model, artifact_path="model"):
         pass
     
-import os
-import shutil
-import tempfile
-import mlflow
-import pandas as pd
-from urllib.parse import urlparse
-
-from typing import List, Dict
 
 class MLFlowLogger:
     """
@@ -285,11 +248,52 @@ class MLFlowLogger:
         return urlparse(uri).path if uri.startswith("file://") else uri
 
 
+    def save_model(self, model, optimizer, scheduler=None, metadata=None, filename=None):
+        """
+        Save a model checkpoint inside the current MLflow run's artifact directory.
+    
+        Args:
+            model: The PyTorch model (nn.Module).
+            metadata: Optional dict with extra info (epoch, val_loss, etc.).
+            filename: Optional filename for the checkpoint.
+        """
+        from datetime import datetime
+        import torch
+        from pathlib import Path
+    
+        if metadata is None:
+            metadata = {}
+    
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = filename or f"best_model_{timestamp}.pt"
+    
+        # Create a temporary checkpoint
+        tmp_dir = tempfile.mkdtemp()
+        tmp_path = Path(tmp_dir) / filename
+        torch.save({
+            "state_dict": model.state_dict(), 
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler else None,
+            "metadata": metadata
+            }, 
+            tmp_path
+        )
+    
+        # Log to MLflow artifacts
+        artifact_path = "checkpoints"
+        mlflow.log_artifact(str(tmp_path), artifact_path=artifact_path)
+        shutil.rmtree(tmp_dir)
+    
+        uri = mlflow.get_artifact_uri(artifact_path)
+        print(f"Saved checkpoint at {uri}/{filename}")
+        return Path(uri) / filename
+
+
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 class Trainer():
 
-    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler, patience=3, n_train_batches=None, n_val_batches=None, logger=NullLogger()):
+    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler, patience=3, n_train_batches=None, n_val_batches=None, logger=NullLogger(), mlflow_params=dict()):
 
         self.model           = model        
         
@@ -300,7 +304,7 @@ class Trainer():
         self.training_loader, self.valid_loader, self.test_loader = training_loader, valid_loader, test_loader
 
         self.n_train_batches, self.n_val_batches = n_train_batches, n_val_batches
-        self.train_outputs, self.valid_outputs, self.test_outputs = [], [], []            
+        self.train_outputs,   self.valid_outputs, self.test_outputs = [], [], []            
 
         self.current_epoch  = 0
         self._valid_counter = 0
@@ -308,6 +312,9 @@ class Trainer():
         self.logger = logger
         self.val_loss = None
         
+        self.ema_alpha = 0.005
+        
+        self.additional_mlflow_params = mlflow_params | { "ema_alpha": self.ema_alpha }
 
     # ——————————————————————————————————————————————————————————————————————————————
    
@@ -332,23 +339,24 @@ class Trainer():
         }
 
 
-    def get_model_metadata(self):
+    def get_subject_ids_per_partition(self):
 
-        metadata = { 
+        subject_ids = { 
             "train_ids": sorted(self.training_loader.dataset.subjects),
             "valid_ids": sorted(self.valid_loader.dataset.subjects),
             "test_ids":  sorted(self.test_loader.dataset.subjects),
         }
-        return metadata
+        return subject_ids
 
 
     def get_vocab_len(self, domain_name):
-        self.transformer.embed.domain_embed[domain_name].weight.shape[0]
+        self.model.transformer.embed.domain_embed[domain_name].weight.shape[0]
 
 
     def train(self, max_epochs=1000):
 
         self.logger.log_params(self.model.config)
+        self.logger.log_params(self.additional_mlflow_params)
 
         # self.logger.log_params(self.optimizer.config)
         # self.logger.log_params(self.scheduler.config)
@@ -370,16 +378,28 @@ class Trainer():
 
             should_stop, improved = self.early_stopper.step(self.mean_val_loss)
 
-            if improved:                
-                (ckpt_dir := Path("checkpoints")).mkdir(exist_ok=True)
-                self.best_epoch = epoch
-                ckpt_path = ckpt_dir / f"best_model_epoch{epoch}_valloss{self.mean_val_loss:.4f}.ckpt"
-                torch.save(self.model.state_dict(), ckpt_path)
-                print(f"New best model saved → {ckpt_path}")
+            if improved:
+                ckpt_uri = self.logger.save_model(
+                    self.model,
+                    self.optimizer,
+                    self.scheduler,
+                    metadata={
+                      "epoch": epoch, 
+                      "val_loss": float(self.mean_val_loss.cpu()),
+                      "train_loss": float(train_loss["train_total"].cpu()),
+                      "n_params": sum(p.numel() for p in self.model.parameters()),
+                      "timestamp": datetime.now().isoformat(timespec="seconds"),
+                      "attention_scheme": getattr(self.model.config, "attention_scheme", None),
+                      "date_cutoff": None,  # placeholder - to be set later when needed
+                    } | self.get_subject_ids_per_partition(),
+                )
+                print(f"New best model logged at {ckpt_uri}")
  
             if should_stop:
                 print(f"Early stopping triggered at epoch {self.current_epoch}")
                 break
+
+            self.epoch_end()
             
 
 
@@ -458,23 +478,56 @@ class Trainer():
         
 
     def compute_mean(self, outputs: List[Dict]):
-        return {k: torch.stack([d[k] for d in outputs]).mean() for k in outputs[0]}
+
+        out = {}
+        if not outputs:
+            return out
+    
+        for k in outputs[0].keys():
+            try:
+                vals = [
+                    (v[k].detach() if torch.is_tensor(v[k]) else torch.as_tensor(v[k]))
+                    for v in outputs
+                    if k in v
+                ]
+                out[k] = torch.stack(vals).mean()
+            except Exception as e:
+                print(f"[compute_mean] Skipping key '{k}': {e}")
+                out[k] = torch.tensor(float('nan'))
+        return out
         
+
 
     def train_epoch(self, n_batches=None, eval_every=None):
 
-        pbar = tqdm(self.training_loader)
-
         self.val_step = 0
+        ce_ema, time_ema = None, None
+
+        pbar = tqdm(self.training_loader)
 
         for i, batch in enumerate(pbar):
             
             self.optimizer.zero_grad()
             loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
-            self.train_outputs.append(loss)
             
             loss['train_total'].backward()
-    
+            self.optimizer.step()
+            self.scheduler.step() 
+
+            with torch.no_grad():
+                ce_val = loss['train_ce_loss'].detach()
+                time_val = loss['train_time_loss'].detach()
+                ce_ema = ce_val if ce_ema is None else (1 - self.ema_alpha) * ce_ema + self.ema_alpha * ce_val
+                time_ema = time_val if time_ema is None else (1 - self.ema_alpha) * time_ema + self.ema_alpha * time_val
+        
+            self.train_outputs.append({
+                'train_ce_loss': ce_val,
+                'train_time_loss': time_val,
+                'train_ce_ema_loss': ce_ema,
+                'train_time_ema_loss': time_ema,
+                'train_total': ce_val + time_val,
+            })
+            
             if eval_every is not None and (i % eval_every) == 0:
                 self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches='all')
                 self.val_step += 1                        
@@ -486,9 +539,6 @@ class Trainer():
                 "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
             })
     
-            self.optimizer.step() 
-            self.scheduler.step()
-            
             if (n_batches is not None) and (i == n_batches):
                 break
             
@@ -719,10 +769,14 @@ class Trainer():
     def get_offset_per_domain(self, model, domains_of_interest):
         
         domain_to_int = { k: i for i, k in enumerate(model.transformer.embed.domain_embed.keys()) } 
+
+        # TODO: check if this gives the same results
+        # vocab_lens = model.vocab_lens
         vocab_lens = { 
             domain_to_int[k]: v.vocab_len 
-            for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest 
+            for k, v in self.model.transformer.embed.domain_embed.items() if k in domains_of_interest 
         }
+        
         offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
         offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
         return offsets_per_domain
@@ -739,10 +793,10 @@ def get_cli_args():
     parser.add_argument("--n_head",           default=10,  type=int)
     parser.add_argument("--n_embd",           default=120, type=int)
     parser.add_argument("--test_fold",        default=1,   type=int)
-    parser.add_argument("--domains",          default=["diseases", "death", "lifestyle", "hla_alleles", "sex", "padding"], nargs="+")
+    parser.add_argument("--domains",          default="diseases,death,lifestyle,hla_alleles,sex,padding")
     parser.add_argument("--experiment_name",  default="default")
     parser.add_argument("--run_name",         default=None)
-    parser.add_argument("--batch_size",       default=4, type=int)
+    parser.add_argument("--batch_size",       default=16, type=int)
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
     args = parser.parse_args()
 
@@ -758,7 +812,7 @@ else:
         "patience": 2,
         "batch_size": 4,
         "lr": 1e-4,
-        "run_name": os.getenv("RUN_NAME", "default2"),
+        "run_name": os.getenv("RUN_NAME", "default"),
     })
 
 if isinstance(args.attention_scheme, str):
@@ -776,10 +830,11 @@ default_cfg_per_domain = {
   "padding":     EmbedConfig(projector="embed")    
 }
 
+domains = args.domains.split(",")
 # k, v doesn't work for some reason!
-domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in args.domains }
+domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in domains }
 
-assert all([k in default_cfg_per_domain for k in args.domains])
+assert all([k in default_cfg_per_domain for k in domains])
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -791,7 +846,7 @@ train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
 valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
 test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
 
-dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, 2048, 2048][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
+dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, 128, 128][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -829,7 +884,9 @@ optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, devic
 assert args.run_name != 'default', f"You are using the 'default' value for run_name."
 logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
 
-trainer = Trainer(model, *dataloaders, optimizer, scheduler, logger=logger)
+logged_params = { "test_fold": args.test_fold, "batch_size": args.batch_size }
+
+trainer = Trainer(model, *dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params)
 trainer.train(max_epochs=1000)
 
 # %%
