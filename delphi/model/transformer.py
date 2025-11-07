@@ -510,7 +510,7 @@ class DomainEmbedding(nn.Module):
         # ————————————————————————————————————————————————————————————————————————————————————
 
         if config.projector.lower() == "embed":
-            print(f"DomainEmbedding: Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
+            logging.info(f"DomainEmbedding for '{domain_name}': Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
             self.projector = nn.Embedding(config.input_size, n_embed)
 
         elif config.projector.lower() == "linear":
@@ -584,13 +584,13 @@ class DomainEmbedding(nn.Module):
 
         if self.config.projector.lower() == "pretrained":
             h = self.embed(x)
-            logger.debug(f"After pretrained lookup: {tuple(x.shape)}")
+            # logger.info(f"After pretrained lookup: {tuple(x.shape)}")
             out = self.projector(h)
-            logger.debug(f"After projection: {tuple(out.shape)}")
+            # logger.info(f"After projection: {tuple(out.shape)}")
             return out
 
         out = self.projector(x)
-        logger.debug(f"After projector: {tuple(out.shape)}")
+        # logger.info(f"After projector: {tuple(out.shape)}")
         return out
 
 # ———————————————————— Final embedding to logits ——————————————————————————————————————————————————
@@ -796,13 +796,6 @@ class MaskedSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
 
-        # TODO: Take care of this for generalized attention patterns!!!
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
 
     def forward(self, x, attn_mask=None):
 
@@ -820,7 +813,6 @@ class MaskedSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         
         if attn_mask is not None:
-            # import ipdb; ipdb.set_trace()
             att = att.masked_fill(attn_mask == 0, float("-inf"))
 
         att = F.softmax(att, dim=-1)
@@ -886,24 +878,28 @@ def initialize_weights(model: torch.nn.Module, config: DelphiConfig):
 class Delphi(torch.nn.Module):
     
     def __init__(self, config: DelphiConfig):
+        
         super().__init__()        
         
-        self.config = config
-        
-        if isinstance(self.config.attention_scheme, str):
-            self.config.attention_scheme = [self.config.attention_scheme]
-        if len(self.config.attention_scheme) == 1:
-            self.config.attention_scheme = self.config.n_layer * self.config.attention_scheme
-
+        self.config = config        
+        self.config.attention_scheme = self.adapt_attention_scheme(self.config.attention_scheme)       
         self.build_model(config)
         
         initialize_weights(self, config=config)
         
-        # self.max_seq_len = 128
-        
         self.PAD_TOKEN_ID = 0
         self.PAD_DOMAIN_ID = 0 
         self.PAD_AGE = -10000
+
+    
+    def adapt_attention_scheme(self, attention_scheme):
+
+        if isinstance(attention_scheme, str):
+            attention_scheme = [attention_scheme]
+        if len(attention_scheme) == 1:
+            attention_scheme = self.config.n_layer * attention_scheme
+        
+        return attention_scheme
 
 
     def build_model(self, config: DelphiConfig):
@@ -919,19 +915,41 @@ class Delphi(torch.nn.Module):
 
         self.embedding_to_logits = DomainwiseTiedLinear(self.transformer.embed)
 
-        # self.ce_head = CrossEntropyHead()
-        
-        # self.dt_head = CompetingExpHead(
-            # n_input=config.n_embd, 
-            # zero_inflate=config.zero_inflate, 
-            # pi_head=config.zero_inflate_projector
-        # )
-
 
     def set_valid_loss_mode(self, validation_loss_mode):
         self.validation_loss_mode = validation_loss_mode
+
+    
+    @property
+    def predicted_domains(self):
+        return [ dname for dname, config in self.config.domains.items() if config.predict ]
+
+    @property
+    def predicted_domains_as_int(self):
+        return torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(self.device)
+
+    @property
+    def domain_to_int(self):
+        return { dname: i for i, dname in enumerate(self.transformer.embed.domain_embed.keys()) }
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+    
+
+    def get_offset_per_domain(self, domains_of_interest):
+        
+        # domain_to_int = { k: i for i, k in enumerate(self.transformer.embed.domain_embed.keys()) } 
+        vocab_lens = { 
+            self.domain_to_int[k]: v.vocab_len 
+            for k, v in self.transformer.embed.domain_embed.items() if k in domains_of_interest 
+        }
+        offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
+        offsets_per_domain = torch.tensor(offsets_per_domain).to(self.device)
+        return offsets_per_domain    
    
 
+    #### LOSSES ########################################################################
     def cross_entropy_loss(self, logits, targets, agg=None):
         '''
         Cross entropy loss for the next token prediction.
@@ -989,8 +1007,24 @@ class Delphi(torch.nn.Module):
           
         return loss_dt
     
+    ########################################################################################
         
     def to_tensor(self, x, ages, embeddings, subject_ids):
+
+        '''
+            input values:
+              - x:          dict[domain, Tensor] where the tensor has data for batch_size subjects
+              - ages:       dict[domain, Tensor]
+              - subjects:   dict[domain, Tensor]
+              - embeddings: dict[domain, Tensor]
+
+            return values: batches of 
+              - tokens
+              - ages
+              - embeddings
+              - unique_subjects
+              - domains
+        '''
 
         all_tokens, all_embeddings, all_ages, all_domains, all_subjects = [], [], [], [], []
         
@@ -1020,12 +1054,12 @@ class Delphi(torch.nn.Module):
     
         unique_subjects = subjects_flat.unique(sorted=True)
         batch_tokens, batch_embeddings, batch_ages, batch_domains = [], [], [], []
-        # 2) Process subject by subject
         
+        # 2) Process subject by subject        
         for subj in unique_subjects:
             mask = subjects_flat == subj
             a_subj = ages_flat[mask]
-            a_subj = a_subj[order:=torch.argsort(a_subj)]
+            a_subj = a_subj[ order:=torch.argsort(a_subj) ]
             t_subj = tokens_flat[mask][order]
             e_subj = embeddings_flat[mask][order]
             d_subj = domains_flat[mask][order]
@@ -1047,49 +1081,59 @@ class Delphi(torch.nn.Module):
             unique_subjects,\
             batch_domains.squeeze(1)
 
+    
+    #/*********************************************************************************************************
+    ### —————— FORWARD ——————— ################################################################################
 
-    def forward(self, x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor,
-        validation_loss_mode: bool = False,
-    ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], torch.Tensor]:
+    def forward(self, 
+        x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor,
+        validation_loss_mode: bool = False, return_attention=False
+    ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
 
-        domain2id = { k: i for i, k in enumerate(x) }
+        x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
         
-        emb = self.transformer.embed(x)
-        x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb, subject_ids)
+        # TODO: check if this is still necessary
+        self._trace = dict(
+            tokens=x.detach(),
+            ages=ages.detach(),
+            emb=emb.detach(),
+            subject_ids=subject_ids.detach(),
+            domains=domains.detach()
+        )
         
-        self._trace = dict(domains=domains.detach(), tokens=x.detach(), emb=emb.detach(), ages=ages.detach())
+        emb += self.transformer.age_embedding(ages)        
         
-        emb += self.transformer.age_embedding(ages)
+        # ——— BUILDING ATTENTION MASK —————————————————————————————————————————————————————————————————————————
+        # attn_mask = AttentionMaskStack(self.transformer.attn_mask_builder[0](ages, domains, domain2id))
+        group = AttentionMaskGroup(self.transformer.attn_mask_builder)
 
         #TODO: passing domain2id on every call doesn't seem right. Try to pass it in the constructor if possible.
-        
-        # attn_mask = AttentionMaskStack(self.transformer.attn_mask_builder[0](ages, domains, domain2id))
-        
-        group = AttentionMaskGroup(self.transformer.attn_mask_builder)
-        attn_view = group.build(ages, domains, domain2id)
+        attn_view = group.build(ages, domains, self.domain_to_int)
+
         # attn_mask = torch.stack([ 
             # self.transformer.attn_mask_builder[i](ages, domains, domain2id) 
             # for i, _ in enumerate(self.transformer.h) ]
         # ) 
+                
+        attn_mask = attn_view[0].unsqueeze(0).expand(self.config.n_layer, -1, -1, -1)
         
-        attn_mask = attn_view[0].unsqueeze(0).expand(12, -1, -1, -1).permute(1, 0, 2, 3)
+        # (N_LAYERS, BATCH_SIZE, ..., ...) -> (BATCH_SIZE, N_LAYERS, ..., ...)
+        attn_mask = attn_mask.permute(1, 0, 2, 3)
+        # —————————————————————————————————————————————————————————————————————————————————————————————————————
 
-        # attn_mask = attn_mask # (N_LAYERS, BATCH_SIZE, ..., ...) -> (BATCH_SIZE, N_LAYERS, ..., ...)
         h, att = emb[:, :-1], []
         for i, transformer_block in enumerate(self.transformer.h):            
             h, _att = transformer_block(h, attn_mask)
             att.append(_att)
-        att = torch.stack(att)
-
+        
         h = self.transformer.ln_f(h)        
         logits = self.embedding_to_logits(h)
         
-        return logits, att
+        return logits,\
+               (attention_matrices := torch.stack(att) if return_attention else None)
 
-        # self.lm_head(
-            # h[:, :, :]
-        # )   # note: using list [-1] to preserve the time dim
-    
+    ### ———————— END FORWARD ———————— #########################################################################
+    #************************************************************************/********************************/
 
     def compute_loss(self, logits, targets, targets_age):
 
@@ -1175,10 +1219,6 @@ class Delphi(torch.nn.Module):
         return tokens, ages, subject_ids
     
 
-    def get_embedding_at_age(self, x, ages, readout_age):
-        raise NotImplementedError
-
-
     @classmethod
     def from_checkpoint(cls, ckpt_path, device=None):
 
@@ -1231,3 +1271,20 @@ class Delphi(torch.nn.Module):
     
     def add_token_domain(self, new_token_domain):
         raise NotImplementedError("add_token_domain method not yet implemented.")
+
+    def get_embedding_at_age(self, x, ages, readout_age):
+        raise NotImplementedError
+
+
+    # TODO: incorporate this
+    # Still not tested and not in use
+    def local_to_global_ids(self, local_ids, domains_of_interest):
+
+        vocab_lens = { self.domain_to_int[k]: v.vocab_len for k, v in self.transformer.embed.domain_embed.items() if k in domains_of_interest }
+        offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
+        offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
+        local_ids = targets[torch.isin(target_domains, domains_of_interest_int.to(local_ids.device))]
+        f_domains = target_domains[mask]
+        offsets = offsets_per_domain[f_domains]
+        global_ids = offsets + local_ids
+        return global_ids

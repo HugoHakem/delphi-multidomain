@@ -6,6 +6,8 @@ os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoi
 from pathlib import Path
 root_path = Path("../data/transforms")
 
+import re
+import ast
 from datetime import datetime
 
 import numpy as np
@@ -14,8 +16,13 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, random_split, DataLoader
 
-from easydict import EasyDict
+import tempfile
+import shutil
+from urllib.parse import urlparse
+from typing import List, Dict
+from copy import deepcopy
 
+from easydict import EasyDict
 import mlflow
 
 from tqdm import tqdm
@@ -35,21 +42,75 @@ from delphi.model.transformer import (
     DelphiConfig,
 )
 
-import tempfile
-import shutil
-
-from urllib.parse import urlparse
-
-from typing import List, Dict
-
-from copy import deepcopy
-
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 RUN_NAME = os.getenv("RUN_NAME", "default")
-
 odir = f"output/{RUN_NAME}"
-os.makedirs(odir, exist_ok=True)
+
+# os.makedirs(odir, exist_ok=True)
+
+print(f"{sys.stdout.isatty()=}")
+
+USE_TQDM = sys.stdout.isatty()
+print(f"{USE_TQDM=}")
+
+def clone_run_to_new_experiment(
+    old_run_id: str,
+    new_experiment_name: str,
+    new_run_name: str = None
+) -> str:
+    """
+    Clone an existing MLflow run into a NEW experiment (fresh run + copied artifacts).
+
+    Parameters
+    ----------
+    old_run_id : str
+        The MLflow run ID to clone.
+    new_experiment_name : str
+        Name for the new experiment (created if it doesn't exist).
+    new_run_name : str, optional
+        Name for the new run. Defaults to "<old_run_name>_resumed".
+
+    Returns
+    -------
+    new_run_id : str
+        ID of the newly created run in the new experiment.
+    """
+    # Fetch old run data
+    old_run = mlflow.get_run(old_run_id)
+    old_run_name = old_run.data.tags.get("mlflow.runName", "unnamed_run")
+
+    # Create or get target experiment
+    exp = mlflow.get_experiment_by_name(new_experiment_name)
+    if exp is None:
+        exp_id = mlflow.create_experiment(new_experiment_name)
+    else:
+        exp_id = exp.experiment_id
+
+    # Start the new run
+    new_run = mlflow.start_run(
+        experiment_id=exp_id,
+        run_name=new_run_name or f"{old_run_name}_resumed"
+    )
+    new_run_id = new_run.info.run_id
+
+    # Copy params and tags
+    # mlflow.log_params(old_run.data.params)
+    for k, v in old_run.data.tags.items():
+        mlflow.set_tag(k, v)
+    mlflow.set_tag("resumed_from", old_run_id)
+
+    # Copy all artifacts
+    src_dir = mlflow.artifacts.download_artifacts(run_id=old_run_id)
+    dst_dir = Path(mlflow.get_artifact_uri()).as_posix().replace("file://", "")
+    dst_dir = Path(dst_dir)
+    shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+
+    print(f"✅ Cloned run {old_run_id} → {new_run_id} (experiment: {new_experiment_name})")
+    print(f"Artifacts copied from {src_dir} to {dst_dir}")
+
+    mlflow.end_run()
+    return new_run_id
 
 
 # ————————————————————————————————————————————————————————————————————————————————————————————
@@ -86,18 +147,6 @@ class TrainBaseConfig:
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
 VAL_EVERY_NSAMPLES = 100000
-
-def local_to_global_ids(local_ids):
-
-    vocab_lens = { domain_to_int[k]: v.vocab_len for k, v in model.transformer.embed.domain_embed.items() if k in domains_of_interest }
-    offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
-    offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
-    local_ids = targets[torch.isin(target_domains, domains_of_interest_int.to(DEVICE))]
-    f_domains = target_domains[mask]
-    offsets = offsets_per_domain[f_domains]
-    global_ids = offsets + local_ids
-    return global_ids
-
 
 class EarlyStopping:
     def __init__(self, patience=10, min_delta=0.0, mode='min'):
@@ -176,16 +225,22 @@ class MLFlowLogger:
         if autostart:
             self.start(nested=nested)
 
-    def start(self, nested=False):
-        """
-        Start an MLflow run if none is active.
-        """
-        mlflow.set_experiment(self.experiment_name)
-        if self.active_run is None:
+    def start(self, nested=False, resume_run_id=None):
+      """
+      Start a new MLflow run, or resume an existing one if resume_run_id is provided.
+      """
+      mlflow.set_experiment(self.experiment_name)
+      if self.active_run is None:
+          if resume_run_id:
+            # Resume an existing run
+            self.active_run = mlflow.start_run(run_id=resume_run_id)
+          else:
+            # Start a fresh run
             self.active_run = mlflow.start_run(run_name=self.run_name, nested=nested)
-        # store the tracking base for relative URI resolution
-        self.tracking_base = self._strip_file_prefix(mlflow.get_tracking_uri())
-        return self.active_run
+
+      # Store tracking base for relative URI resolution
+      self.tracking_base = self._strip_file_prefix(mlflow.get_tracking_uri())
+      return self.active_run
 
     def end(self):
         """
@@ -293,7 +348,15 @@ class MLFlowLogger:
 
 class Trainer():
 
-    def __init__(self, model, training_loader, valid_loader, test_loader, optimizer, scheduler, patience=3, n_train_batches=None, n_val_batches=None, logger=NullLogger(), mlflow_params=dict()):
+    def __init__(self, model, dataloaders, 
+          optimizer, scheduler, patience=3, 
+          n_train_batches=None, n_val_batches=None, 
+          logger=NullLogger(), mlflow_params=dict(), start_epoch=0
+        ):
+
+        '''
+
+        '''
 
         self.model           = model        
         
@@ -301,12 +364,19 @@ class Trainer():
         self.scheduler       = scheduler        
         self.early_stopper   = EarlyStopping(patience=patience, min_delta=0.001, mode='min')                        
 
-        self.training_loader, self.valid_loader, self.test_loader = training_loader, valid_loader, test_loader
-
-        self.n_train_batches, self.n_val_batches = n_train_batches, n_val_batches
+        assert isinstance(dataloaders, list), "Argument 'dataloaders' should be a list of either 2 or 3 dataloaders (train/val[/test])"
+        if len(dataloaders) == 2:
+            self.train_loader, self.valid_loader = dataloaders
+        elif len(dataloaders) == 3:
+            self.train_loader, self.valid_loader, self.test_loader = dataloaders
+        else:
+            raise ValueError(f"{len(dataloaders)=} ")
+        
+        self.n_train_batches, self.n_val_batches = n_train_batches or 'all', n_val_batches or 'all'
+        
         self.train_outputs,   self.valid_outputs, self.test_outputs = [], [], []            
 
-        self.current_epoch  = 0
+        self.current_epoch  = start_epoch
         self._valid_counter = 0
         
         self.logger = logger
@@ -342,7 +412,7 @@ class Trainer():
     def get_subject_ids_per_partition(self):
 
         subject_ids = { 
-            "train_ids": sorted(self.training_loader.dataset.subjects),
+            "train_ids": sorted(self.train_loader.dataset.subjects),
             "valid_ids": sorted(self.valid_loader.dataset.subjects),
             "test_ids":  sorted(self.test_loader.dataset.subjects),
         }
@@ -382,7 +452,7 @@ class Trainer():
                 ckpt_uri = self.logger.save_model(
                     self.model,
                     self.optimizer,
-                    self.scheduler,
+                    self.scheduler,                    
                     metadata={
                       "epoch": epoch, 
                       "val_loss": float(self.mean_val_loss.cpu()),
@@ -392,6 +462,7 @@ class Trainer():
                       "attention_scheme": getattr(self.model.config, "attention_scheme", None),
                       "date_cutoff": None,  # placeholder - to be set later when needed
                     } | self.get_subject_ids_per_partition(),
+                    filename=f"best_model_epoch{self.current_epoch}_trainloss_{train_loss}_{timestamp}.pt"
                 )
                 print(f"New best model logged at {ckpt_uri}")
  
@@ -409,25 +480,25 @@ class Trainer():
 
         x, ages, subject_ids = trainer.get_tensors_from_batch(batch)
 
-        max_ages = model.get_max_ages_per_subject(ages, subject_ids)
+        max_ages             = model.get_max_ages_per_subject(ages, subject_ids)
         x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
         x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
         x, ages, subject_ids = trainer.adjust_to_seqlen(x, ages, subject_ids, seqlen:=96)
         
         logits, att = model(x, ages, subject_ids)
         
-        domains     = model._trace['domains']
-        targets     = model._trace['tokens'][:,1:]
-        input_ages  = model._trace['ages'][:,:-1]
-        target_ages = model._trace['ages'][:,1:]
-        target_domains = domains[:,1:];
+        # This is necessary
+        domains        = model._trace['domains']
+        targets        = model._trace['tokens'][:,1:]
+        input_ages     = model._trace['ages'][:,:-1]
+        target_ages    = model._trace['ages'][:,1:]
+        target_domains = domains[:,1:]
         
-        predict_mask = torch.isin(target_domains, self.predicted_domains_as_int)
-        
-        logits    = torch.cat([logits[dname] for dname in self.predicted_domains], axis=-1)
-        f_logits  = logits[predict_mask]
-        f_domains = target_domains[predict_mask]
-        local_ids = targets[predict_mask]
+        predict_mask = torch.isin(target_domains, self.predicted_domains_as_int)        
+        logits       = torch.cat([logits[dname] for dname in self.predicted_domains], axis=-1)
+        f_logits     = logits[predict_mask]
+        f_domains    = target_domains[predict_mask]
+        local_ids    = targets[predict_mask]
         
         offsets_per_domain = self.get_offset_per_domain(model, domains_of_interest=self.predicted_domains)
         
@@ -444,11 +515,11 @@ class Trainer():
         prefix = "" if add_prefix is None else add_prefix + "_"
 
         loss = EasyDict({                
-            f'{prefix}ce_loss': loss_ce,            
-            f'{prefix}time_loss': time_loss,
-            f'{prefix}ce_ema_loss': torch.lerp(outputs[-1][f'{prefix}ce_ema_loss'], loss_ce, weight=0.002) if outputs else loss_ce,
+            f'{prefix}ce_loss':       loss_ce,            
+            f'{prefix}time_loss':     time_loss,
+            f'{prefix}ce_ema_loss':   torch.lerp(outputs[-1][f'{prefix}ce_ema_loss'], loss_ce, weight=0.002) if outputs else loss_ce,
             f'{prefix}time_ema_loss': torch.lerp(outputs[-1][f'{prefix}time_ema_loss'], time_loss, weight=0.002) if outputs else time_loss,
-            f'{prefix}total': loss_ce + time_loss,            
+            f'{prefix}total':         loss_ce + time_loss,            
         })
 
         if log_per_disease:
@@ -503,9 +574,12 @@ class Trainer():
         self.val_step = 0
         ce_ema, time_ema = None, None
 
-        pbar = tqdm(self.training_loader)
+        pbar = tqdm(
+            total=len(self.train_loader) if n_batches == "all" else n_batches, 
+            disable=not USE_TQDM
+        )
 
-        for i, batch in enumerate(pbar):
+        for i, batch in enumerate(self.train_loader):
             
             self.optimizer.zero_grad()
             loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
@@ -529,48 +603,49 @@ class Trainer():
             })
             
             if eval_every is not None and (i % eval_every) == 0:
-                self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches='all')
+                self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=self.n_val_batches)
                 self.val_step += 1                        
     
             pbar.set_postfix({
-                "ce_loss":      f"{loss['train_ce_loss'].item():.4f}", 
-                "time_loss":    f"{loss['train_time_loss'].item():.4f}",
-                "loss_sm":      f"{loss['train_ce_ema_loss'].item():.4f}", 
-                "time_loss_sm": f"{loss['train_time_ema_loss'].item():.4f}",
+                "train_cce_loss":  f"{loss['train_ce_loss'].item():.3f} ({loss['train_ce_ema_loss'].item():.3f})", 
+                "train_time_loss": f"{loss['train_time_loss'].item():.3f} ({loss['train_time_ema_loss'].item():.3f})"
             })
+
+            pbar.update(self.train_loader.batch_size)
     
             if (n_batches is not None) and (i == n_batches):
                 break
             
         return self.compute_mean(self.train_outputs)
-            
-
-    def epoch_end(self):
-
-        self.train_outputs = []
-        self.valid_outputs = []
-
+                
 
     def valid_epoch(self, n_batches='all'):
         
-        pbar = tqdm(self.valid_loader)
+        pbar = tqdm(
+            total=len(self.valid_loader) if n_batches == "all" else n_batches, 
+            disable=not USE_TQDM
+        )
 
         with torch.no_grad():
+            
             loss_outputs = []
-            for i, batch in enumerate(pbar):
+            for i, batch in enumerate(self.valid_loader):
+
                 loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_per_disease=True, stage="validation", add_prefix="val")
                 loss_outputs.append(loss)
             
                 pbar.set_postfix({
-                    "ce_loss":      f"{loss['val_ce_loss'].item():.4f}", 
-                    "time_loss":    f"{loss['val_time_loss'].item():.4f}",
-                    "loss_sm":      f"{loss['val_ce_ema_loss'].item():.4f}", 
-                    "time_loss_sm": f"{loss['val_time_ema_loss'].item():.4f}",
+                    "val_cce":      f"{loss['val_ce_loss'].item():.3f} ({loss['val_ce_ema_loss'].item():.3f})", 
+                    "val_time_loss":    f"{loss['val_time_loss'].item():.3f} ({loss['val_time_ema_loss'].item():.3f})"
                 })
             
+                pbar.update(self.valid_loader.batch_size)
+
                 if n_batches != "all" and i == n_batches:
                     break
         
+        pbar.close()
+
         loss_per_disease_df = self.valid_epoch_end(loss_outputs).reset_index()
         self.logger.log_df_as_artifact(df=loss_per_disease_df, filename=f"losses_epoch{self.current_epoch}_{self.val_step}.csv", artifact_path="val_loss_per_disease")
         loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
@@ -578,6 +653,11 @@ class Trainer():
         mean_loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
 
         return loss, mean_loss,
+
+    
+    def epoch_end(self):
+        self.train_outputs = []
+        self.valid_outputs = []
 
 
     def mlflow_logging(self):
@@ -781,6 +861,71 @@ class Trainer():
         offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
         return offsets_per_domain
 
+# --------------------------------------------------------------------------------------------------------------------
+
+def config_from_runid(runid):
+
+    # Retrieve run info (contains experiment ID and tags)
+    runinfo = mlflow.get_run(runid)
+    
+    # experiment_id = runinfo.info.experiment_id
+    # experiment_name = mlflow.get_experiment(experiment_id).name
+    
+    artifact_uri = re.sub(".*mlruns", "mlruns", runinfo.info.artifact_uri)                
+    batch_size = int(runinfo.data.params.pop("batch_size"))
+    test_fold = runinfo.data.params.pop("test_fold")
+    learning_rate = runinfo.data.params.pop("learning_rate")
+
+    # ------------------------------------------------------------------------------------------------
+    runinfo.data.params.pop("ema_alpha")
+    runinfo.data.params['attention_scheme'] = ast.literal_eval(runinfo.data.params['attention_scheme'])            
+    s = runinfo.data.params['domains']        
+    s_clean = re.sub(r"PosixPath\(([^)]+)\)", r"\1", s)
+    runinfo.data.params['domains'] = s_clean
+    runinfo.data.params['domains'] = ast.literal_eval(runinfo.data.params['domains'])
+    runinfo.data.params['domains'] = { k: EmbedConfig(**v) for k, v in runinfo.data.params['domains'].items() }
+    for param, value in runinfo.data.params.items():
+        if "drop"in param:
+            runinfo.data.params[param] = float(value)
+        if param in {"n_embd", "n_head", "n_layer", "block_size", "n_layer"}:
+            runinfo.data.params[param] = int(value)
+        if param in {"zero_inflate", "bias"}:
+            runinfo.data.params[param] = True if runinfo.data.params[param] == "True" else False                    
+    # ------------------------------------------------------------------------------------------------
+    ckpt_dir = artifact_uri + "/checkpoints"
+    ckpt_files = sorted(Path(ckpt_dir).glob("*.pt"))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoints found for run {args.resume_run_id}")
+    latest_ckpt = ckpt_files[-1]
+    print(f"Loading latest checkpoint: {latest_ckpt}")
+    delphi_cfg = DelphiConfig(**runinfo.data.params)
+    model = Delphi(delphi_cfg).to(DEVICE)
+    ckpt = torch.load(latest_ckpt)
+    start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
+    weights = ckpt['state_dict']
+    model.load_state_dict(weights)
+    torch.compile(model)
+    
+    optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)                      
+    if "optimizer_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    if "scheduler_state" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+    train_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['train_ids']).to("cuda")
+    valid_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['valid_ids']).to("cuda")
+    test_dataset  = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['test_ids']).to("cuda")
+    
+    dataloaders = [
+        train_loader := DelphiDataloader(train_dataset, batch_size=batch_size),
+        valid_loader := DelphiDataloader(valid_dataset, batch_size=256), 
+        test_loader  := DelphiDataloader(test_dataset,  batch_size=256)
+    ]    
+
+    previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
+    logged_params = { "test_fold": test_fold, "batch_size": batch_size }    
+
+    return model, dataloaders, optimizer, scheduler, logged_params, previous_run_name
+
 
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
@@ -798,12 +943,17 @@ def get_cli_args():
     parser.add_argument("--run_name",         default=None)
     parser.add_argument("--batch_size",       default=16, type=int)
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
+    parser.add_argument("--resume_run_id", type=str, default=None,
+                    help="Resume training from the latest checkpoint of this MLflow run")
+    parser.add_argument("--dryrun", "--dry-run", "--dry_run", dest="dry_run", action="store_true", default=False)
+
     args = parser.parse_args()
 
     return args
 
 if __name__ == "__main__":    
     args =  get_cli_args()
+    
 else:
     args = EasyDict({
         "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"],
@@ -818,75 +968,82 @@ else:
 if isinstance(args.attention_scheme, str):
     args.attention_scheme = [args.attention_scheme]
 
-tokens_path = root_path / 'tokens'
-
-default_cfg_per_domain = {
-# 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
-  'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
-  'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
-  'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
-  "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
-  "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
-  "padding":     EmbedConfig(projector="embed")    
-}
-
-domains = args.domains.split(",")
-# k, v doesn't work for some reason!
-domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in domains }
-
-assert all([k in default_cfg_per_domain for k in domains])
-
-# —————————————————————————————————————————————————————————————————————————————————————————————————————————
-
-train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
-
-dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[])
-
-train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
-valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
-test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
-
-dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, 128, 128][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
-
-# —————————————————————————————————————————————————————————————————————————————————————————————————————————
-
-# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
-# ATTENTION_SCHEME = "[hla_alleles,sex,diseases,lifestyle,death]:causal(mask_ties=True)"
-# ATTENTION_SCHEME = "[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
-# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,genetic_pcs,death]:causal(mask_ties=True)"
-# ATTENTION_SCHEME = "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
-# ATTENTION_SCHEME = "[h,s]:bidirectional,[s,dis,l,de]:causal(mask_ties=True)"
-
-assert len(args.attention_scheme) in {1, args.n_layer}, f"len of the --attention_scheme argument should be either 1 or args.n_layer (={args.n_layer})"
-
-if len(args.attention_scheme) == 1:
-    attention_scheme = args.n_layer * args.attention_scheme
-elif args.n_layer == len(args.attention_scheme):
-    attention_scheme = args.attention_scheme
-
-print(domain_cfg)
-
-config = DelphiConfig(
-    n_layer=args.n_layer, 
-    token_dropout=0.1, 
-    domains=domain_cfg, 
-    attention_scheme=attention_scheme
-)
-
-model  = Delphi(config).to(DEVICE)
-torch.compile(model)
-
-optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
-optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
-
-# —————————————————————————————————————————————————————————————————————————————————————————————————————————
-
-assert args.run_name != 'default', f"You are using the 'default' value for run_name."
-logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
-
-logged_params = { "test_fold": args.test_fold, "batch_size": args.batch_size }
-
-trainer = Trainer(model, *dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params)
-trainer.train(max_epochs=1000)
-
 # %%
+
+if not args.resume_run_id:
+
+    ################################ FROM SCRATCH ################################
+
+    tokens_path = root_path / 'tokens'
+
+    default_cfg_per_domain = {
+    # 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
+      'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
+      'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
+      'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
+      "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
+      "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
+      "padding":     EmbedConfig(projector="embed")    
+    }
+    
+    domains = args.domains.split(",")
+    # k, v doesn't work for some reason!
+    domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in domains }
+    
+    assert all([k in default_cfg_per_domain for k in domains])
+    
+    # —————————————————————————————————————————————————————————————————————————————————————————————————————————
+    
+    train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
+    
+    dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[])
+    
+    train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
+    valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
+    test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
+    
+    dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, 128, 128][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
+    
+    # —————————————————————————————————————————————————————————————————————————————————————————————————————————
+      
+    assert len(args.attention_scheme) in {1, args.n_layer}, f"len of the --attention_scheme argument should be either 1 or args.n_layer (={args.n_layer})"
+    
+    if len(args.attention_scheme) == 1:
+        attention_scheme = args.n_layer * args.attention_scheme
+    elif args.n_layer == len(args.attention_scheme):
+        attention_scheme = args.attention_scheme
+    
+    config = DelphiConfig(
+        n_layer=args.n_layer, 
+        token_dropout=0.1, 
+        domains=domain_cfg, 
+        attention_scheme=attention_scheme
+    )
+    
+    model  = Delphi(config).to(DEVICE)
+    torch.compile(model)
+    
+    optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
+    optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
+    
+    assert args.run_name != 'default', f"You are using the 'default' value for run_name."
+    logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
+    
+    logged_params = { "test_fold": args.test_fold, "batch_size": args.batch_size, "learning_rate": args.lr }
+   
+else:
+
+    ################################ FROM SCRATCH ################################
+
+    model, dataloaders, optimizer, scheduler, logged_params, previous_run_name = config_from_runid(args.resume_run_id)
+        
+    new_run_id = clone_run_to_new_experiment(args.resume_run_id, args.experiment_name)
+    logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=previous_run_name, autostart=False)
+    logger.start(resume_run_id=new_run_id)
+
+    print(f"Resuming from MLflow run {args.resume_run_id} ...")
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+trainer = Trainer(model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params)
+trainer.train(max_epochs=1000)
