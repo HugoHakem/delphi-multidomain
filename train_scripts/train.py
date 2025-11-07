@@ -874,7 +874,9 @@ def config_from_runid(runid):
     artifact_uri = re.sub(".*mlruns", "mlruns", runinfo.info.artifact_uri)                
     batch_size = int(runinfo.data.params.pop("batch_size"))
     test_fold = runinfo.data.params.pop("test_fold")
-    learning_rate = runinfo.data.params.pop("learning_rate")
+    
+    if "learning_rate" in runinfo.data.params:
+        learning_rate = runinfo.data.params.pop("learning_rate")
 
     # ------------------------------------------------------------------------------------------------
     runinfo.data.params.pop("ema_alpha")
@@ -892,6 +894,7 @@ def config_from_runid(runid):
         if param in {"zero_inflate", "bias"}:
             runinfo.data.params[param] = True if runinfo.data.params[param] == "True" else False                    
     # ------------------------------------------------------------------------------------------------
+    
     ckpt_dir = artifact_uri + "/checkpoints"
     ckpt_files = sorted(Path(ckpt_dir).glob("*.pt"))
     if not ckpt_files:
@@ -1033,7 +1036,7 @@ if not args.resume_run_id:
    
 else:
 
-    ################################ FROM SCRATCH ################################
+    ################################ FROM PREVIOUS RUN ################################
 
     model, dataloaders, optimizer, scheduler, logged_params, previous_run_name = config_from_runid(args.resume_run_id)
         
@@ -1041,6 +1044,7 @@ else:
     logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=previous_run_name, autostart=False)
     logger.start(resume_run_id=new_run_id)
 
+    #TODO: Add possibility to change some parameters, e.g. attention scheme, or add domains (e.g. genetic PCs and HLA alleles)
     print(f"Resuming from MLflow run {args.resume_run_id} ...")
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
