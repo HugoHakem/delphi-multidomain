@@ -520,7 +520,9 @@ class DomainEmbedding(nn.Module):
             self.projector = self.build_mlp_projector(config)                    
 
         elif config.projector.lower() == "pretrained":
-            assert hasattr(config, "pretrained_path"), f"You need to provide pretrained_path in the config if using config.projector == 'pretrained'"
+            assert hasattr(config, "pretrained_path"), f"""
+            You need to provide pretrained_path in the config if using config.projector == 'pretrained'
+            """
             self.projector = self.get_from_pretrained(config.pretrained_path, n_embed, config.freeze)
 
         else:
