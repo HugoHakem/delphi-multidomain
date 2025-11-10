@@ -861,9 +861,11 @@ class Trainer():
         offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
         return offsets_per_domain
 
-# --------------------------------------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------------------------
 
 def config_from_runid(runid):
+
+    VAL_BATCH_SIZE = 256
 
     # Retrieve run info (contains experiment ID and tags)
     runinfo = mlflow.get_run(runid)
@@ -872,8 +874,15 @@ def config_from_runid(runid):
     # experiment_name = mlflow.get_experiment(experiment_id).name
     
     artifact_uri = re.sub(".*mlruns", "mlruns", runinfo.info.artifact_uri)                
-    batch_size = int(runinfo.data.params.pop("batch_size"))
-    test_fold = runinfo.data.params.pop("test_fold")
+    if "batch_size" in runinfo.data.params:
+        batch_size = int(runinfo.data.params.pop("batch_size"))
+    else:
+        batch_size = 16
+
+    if "test_fold" in runinfo.data.params:
+        test_fold = runinfo.data.params.pop("test_fold")
+    else:
+        test_fold = 0
     
     if "learning_rate" in runinfo.data.params:
         learning_rate = runinfo.data.params.pop("learning_rate")
@@ -895,10 +904,12 @@ def config_from_runid(runid):
             runinfo.data.params[param] = True if runinfo.data.params[param] == "True" else False                    
     # ------------------------------------------------------------------------------------------------
     
-    ckpt_dir = artifact_uri + "/checkpoints"
+    tracking_uri = Path(os.path.dirname(mlflow.get_tracking_uri()))
+    ckpt_dir = tracking_uri / (artifact_uri + "/checkpoints")
+    print(ckpt_dir)
     ckpt_files = sorted(Path(ckpt_dir).glob("*.pt"))
     if not ckpt_files:
-        raise FileNotFoundError(f"No checkpoints found for run {args.resume_run_id}")
+        raise FileNotFoundError(f"No checkpoints found for run {runid}")
     latest_ckpt = ckpt_files[-1]
     print(f"Loading latest checkpoint: {latest_ckpt}")
     delphi_cfg = DelphiConfig(**runinfo.data.params)
@@ -906,7 +917,7 @@ def config_from_runid(runid):
     ckpt = torch.load(latest_ckpt)
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
     weights = ckpt['state_dict']
-    model.load_state_dict(weights)
+    model.load_state_dict(weights, strict=False)
     torch.compile(model)
     
     optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)                      
@@ -920,8 +931,8 @@ def config_from_runid(runid):
     
     dataloaders = [
         train_loader := DelphiDataloader(train_dataset, batch_size=batch_size),
-        valid_loader := DelphiDataloader(valid_dataset, batch_size=256), 
-        test_loader  := DelphiDataloader(test_dataset,  batch_size=256)
+        valid_loader := DelphiDataloader(valid_dataset, batch_size=VAL_BATCH_SIZE), 
+        test_loader  := DelphiDataloader(test_dataset,  batch_size=VAL_BATCH_SIZE)
     ]    
 
     previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
@@ -973,7 +984,8 @@ if isinstance(args.attention_scheme, str):
 
 # %%
 
-if not args.resume_run_id:
+if __name__ == "__main__":
+  if not args.resume_run_id:
 
     ################################ FROM SCRATCH ################################
 
@@ -1034,7 +1046,7 @@ if not args.resume_run_id:
     
     logged_params = { "test_fold": args.test_fold, "batch_size": args.batch_size, "learning_rate": args.lr }
    
-else:
+  else:
 
     ################################ FROM PREVIOUS RUN ################################
 
@@ -1049,5 +1061,5 @@ else:
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-trainer = Trainer(model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params)
-trainer.train(max_epochs=1000)
+  trainer = Trainer(model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params)
+  trainer.train(max_epochs=1000)
