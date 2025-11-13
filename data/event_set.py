@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Callable
 import numpy as np
 import torch
 from dataclasses import dataclass
@@ -595,12 +595,6 @@ class EventSet:
         elif all(isinstance(o, torch.Tensor) for o in outputs):
             return torch.cat(outputs, dim=0)
         return outputs
-
-
-from dataclasses import dataclass
-import numpy as np
-import weakref
-from typing import Optional, Callable
 
 @dataclass
 class EventSetMask:
