@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import weakref
 
+
 @dataclass
 class EventSet:
     
@@ -17,13 +18,14 @@ class EventSet:
 
     X_tokens: np.ndarray           # shape: [n_subjects, seq_len]
     X_ages:   np.ndarray           # shape: [n_subjects, seq_len]
-    Y_tokens: np.ndarray           # shape: [n_subjects, seq_len]
-    Y_ages:   np.ndarray           # shape: [n_subjects, seq_len]
+    Y_tokens: Optional[np.ndarray] = None           # shape: [n_subjects, seq_len]
+    Y_ages:   Optional[np.ndarray] = None           # shape: [n_subjects, seq_len]
 
     meta: Dict[str, Any] = field(default_factory=dict)
 
     subject_ids:  Optional[np.ndarray] = None  # [n_subjects]
-
+    tokenizer: Optional[dict] = None
+    
     # Optional metadata
     # domain_info:  Optional[Dict[str, Any]] = None            # e.g. model.transformer.embed.domain_embed
     # token_maps:   Optional[Dict[str, Dict[int, str]]] = None  # {domain: {id: name}}
@@ -32,7 +34,7 @@ class EventSet:
     cache: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_batch(cls, batch_tuple, subject_ids=None):
+    def from_batch(cls, batch_tuple, subject_ids=None, tokenizer=None):
         """
         Build an EventSet from a 4-tuple of arrays/tensors:
         (X_tokens, X_ages, Y_tokens, Y_ages).
@@ -42,7 +44,13 @@ class EventSet:
             X_tokens, X_ages, Y_tokens, Y_ages = [
                 x.detach().cpu().numpy() for x in batch_tuple
             ]
-        return cls(X_tokens, X_ages, Y_tokens, Y_ages, subject_ids)
+        return cls(
+            X_tokens=X_tokens, 
+            X_ages=X_ages, 
+            Y_tokens=Y_tokens, 
+            Y_ages=Y_ages, 
+            subject_ids=np.array(subject_ids).astype(int), tokenizer=tokenizer
+        )
 
     
     # ─────────────────────────── Properties ───────────────────────────
@@ -53,6 +61,11 @@ class EventSet:
     @property
     def seq_len(self) -> int:
         return self.X_tokens.shape[1]
+
+    @property
+    def block_size(self) -> int:
+        """ Just an alias """
+        return self.seq_len
 
     @property
     def has_targets(self) -> bool:
@@ -67,12 +80,11 @@ class EventSet:
     # --------------------------------------------------------------------------------
     def for_token(self, token_id: int, return_type: str = "EventSet", on_targets=True):
         """
-        Return a new EventSet view focused on a specific token ID.
-        Keeps only subjects that have at least one token equal to token_id
-        in Y_tokens (i.e. they experienced this token).
+        Return a new subject mask/token mask/EventSet view focused on a specific token ID.
+        if return_type == "EventSet", it keeps only subjects that have at least one token 
+        equal to token_id in Y_tokens (i.e. they experienced this event/have this feature).
         """
-        # Boolean mask of shape [n_subjects]
-        
+      
         if on_targets:
             is_token  = (self.Y_tokens == token_id)
         else:
@@ -83,6 +95,7 @@ class EventSet:
         if return_type == "token_mask":
             return is_token
         if return_type == "subject_mask":
+            # Boolean mask of shape [n_subjects]
             return has_token
         else:
             # Filter all arrays by subject
@@ -92,9 +105,9 @@ class EventSet:
             Y_ages_f   = self.Y_ages[has_token]
   
             if self.subject_ids is not None:
-              subj_ids_f = self.subject_ids[has_token]
+                subj_ids_f = self.subject_ids[has_token]
             else:
-              subj_ids_f = None
+                subj_ids_f = None
    
             # Shallow copy of metadata
             meta = dict(self.meta)
@@ -102,12 +115,12 @@ class EventSet:
   
             # Return a new view
             return EventSet(
-              X_tokens_f,
-              X_ages_f,
-              Y_tokens_f,
-              Y_ages_f,
-              subject_ids=subj_ids_f,
-              meta=meta
+                X_tokens_f,
+                X_ages_f,
+                Y_tokens_f,
+                Y_ages_f,
+                subject_ids=subj_ids_f,
+                meta=meta
             )
 
     # def cut_to_age(self, max_age_years: float):
@@ -552,12 +565,10 @@ class EventSet:
 
     def to_tensor(self):
 
-        import torch
-
         self.X_tokens = torch.tensor(self.X_tokens)
-        self.X_ages = torch.tensor(self.X_ages)
+        self.X_ages   = torch.tensor(self.X_ages)
         self.Y_tokens = torch.tensor(self.Y_tokens)
-        self.Y_ages = torch.tensor(self.Y_ages)
+        self.Y_ages   = torch.tensor(self.Y_ages)
 
         return self
 
@@ -596,12 +607,47 @@ class EventSet:
             return torch.cat(outputs, dim=0)
         return outputs
 
+    def to(self, device):
+        self.X_tokens = self.X_tokens.to(device)
+        self.X_ages   = self.X_ages.to(device)
+        self.Y_tokens = self.Y_tokens.to(device)
+        self.Y_ages   = self.Y_ages.to(device)
+
+
+    def __getitem__(self, index):
+        
+        if isinstance(index, int) and index > 1_000_000:
+            return self.mask_subjects(self.subject_ids == index).apply_mask()        
+        if isinstance(index, str):
+            return self[int(index)]
+        if index.shape[0] == self.n_subjects:
+            subject_mask = index 
+            return self.mask_subjects(subject_mask).apply_mask()
+
+        else:
+            raise ValueError("Qué hacés?")
+
+    def as_dataframe(self):
+        import pandas as pd
+        
+        df = pd.DataFrame(
+            np.concatenate([self.X_tokens.flatten()[:, np.newaxis], self.X_ages.flatten()[:, np.newaxis] / 365.25], axis=1),
+            columns=["token", "age"]
+          ).\
+          astype({"token": int}).\
+          query("token != 0").\
+          assign( **{"age (years)": lambda df: df.age.round(2) }).\
+          drop("age", axis=1)
+        
+        return df.assign(token=lambda df: pd.Categorical(df["token"].map(self.tokenizer)))
+
+
 @dataclass
 class EventSetMask:
     """
     Boolean mask view over an EventSet.
     Can be combined with logical operations (&, |, ~)
-    and applied later with .apply_mask() to produce a filtered EventSet.
+    and applied later to produce a filtered EventSet.
     """
     _mask: Optional[np.ndarray] = None
     _op: Optional[Callable] = None
@@ -664,5 +710,5 @@ class EventSetMask:
             Y_ages=e.Y_ages[subj_mask],
             subject_ids=e.subject_ids[subj_mask] if e.subject_ids is not None else None,
             meta={**e.meta, "mask_applied": True},
-        )
-    
+            tokenizer=e.tokenizer
+        )    
