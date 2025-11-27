@@ -612,6 +612,7 @@ class EventSet:
         self.X_ages   = self.X_ages.to(device)
         self.Y_tokens = self.Y_tokens.to(device)
         self.Y_ages   = self.Y_ages.to(device)
+        return self
 
 
     def __getitem__(self, index):

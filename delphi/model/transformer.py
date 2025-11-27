@@ -151,79 +151,122 @@ class AttentionMaskBuilder(nn.Module):
 
 class AttentionMaskGroup:
     """
-    Holds multiple AttentionMaskBuilder instances but avoids redundant
-    computation and memory usage. Behaves like a (B, n_layers, L, L) tensor.
+    Extended: handles per-layer AND per-head builder schemes,
+    avoiding redundant computation.
+
+    builders_layers: list of lists
+        builders_layers[layer][head] -> AttentionMaskBuilder
     """
-    def __init__(self, builders: list[nn.Module]):
-        self.builders = builders
-        # Map serialized scheme → list of layer indices
+    def __init__(self, builders_layers: list[list[nn.Module]]):
+        self.builders_layers = builders_layers
+        self.n_layers = len(builders_layers)
+        self.n_heads = len(builders_layers[0])
+
+        # Cache: scheme_key -> list of (layer, head)
         self.scheme_cache = {}
-        for i, b in enumerate(builders):
-            key = str(b.scheme)
-            self.scheme_cache.setdefault(key, []).append(i)
+        for i, layer_builders in enumerate(builders_layers):
+            for j, b in enumerate(layer_builders):
+                key = str(b.scheme)
+                self.scheme_cache.setdefault(key, []).append((i, j))
+
         self.unique_schemes = list(self.scheme_cache.keys())
 
+    # ------------------------------------------------------------------
     def build(self, ages, domains, domain2id):
-        """Builds only the distinct attention masks once."""
+        """
+        Returns tensor (B, n_layers, n_heads, L, L)
+        """
+        B, L = ages.shape
+        device = ages.device
+
+        # Build base masks for each unique scheme
         base_masks = {}
         for key in self.unique_schemes:
-            idx0 = self.scheme_cache[key][0]
-            base_masks[key] = self.builders[idx0].build(ages, domains, domain2id)
-        return LayerMaskView(base_masks, self.scheme_cache)
+            i0, j0 = self.scheme_cache[key][0]
+            builder0 = self.builders_layers[i0][j0]
+            base_masks[key] = builder0.build(ages, domains, domain2id)
+            # (B, L, L)
 
-    def __len__(self):
-        return len(self.builders)
+        # Assemble full tensor
+        out = torch.zeros(
+            B, self.n_layers, self.n_heads, L - 1, L - 1,  # because builder trimmed
+            device=device
+        )
 
+        for key, positions in self.scheme_cache.items():
+            mask = base_masks[key]  # (B, L-1, L-1)
+            for (i, j) in positions:
+                out[:, i, j] = mask
 
-class LayerMaskView:
-    """
-    Lazy view over multiple attention masks.
-    Provides layer-wise indexing without materializing all copies.
-    """
-    def __init__(self, base_masks: dict[str, torch.Tensor], scheme_cache: dict[str, list[int]]):
-        self.base_masks = base_masks
-        self.scheme_cache = scheme_cache
+        return out
 
-        # Build a quick layer→scheme mapping
-        self.layer2key = {}
-        for key, idxs in scheme_cache.items():
-            for i in idxs:
-                self.layer2key[i] = key
-
-        self.n_layers = len(self.layer2key)
-
-    def __getitem__(self, idx):
-        if isinstance(idx, int):
-            key = self.layer2key[idx]
-            return self.base_masks[key]
-        elif isinstance(idx, slice):
-            layers = range(*idx.indices(self.n_layers))
-            return [self[i] for i in layers]
-        else:
-            raise TypeError("Index must be int or slice")
-
+    # ------------------------------------------------------------------
     def __len__(self):
         return self.n_layers
 
+
+
+class LayerHeadMaskView:
+    """
+    Lazy 2D view over layer×head attention masks.
+    Uses shared base masks so repeated schemes aren't recomputed.
+    """
+
+    def __init__(self, base_masks: dict[str, torch.Tensor],
+                 scheme_cache: dict[str, list[tuple[int, int]]],
+                 n_layers: int, n_heads: int):
+
+        self.base_masks = base_masks
+        self.scheme_cache = scheme_cache
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+
+        # Build mapping: (layer, head) -> key
+        self.lh2key = {}
+        for key, positions in scheme_cache.items():
+            for (layer, head) in positions:
+                self.lh2key[(layer, head)] = key
+
+    # --------------------------------------------------------------
+    def __getitem__(self, idx):
+        """
+        idx can be:
+            - int (layer)       → returns list-of-head-masks
+            - tuple (l, h)      → returns mask for that head
+        """
+        if isinstance(idx, int):
+            # layer index: return list of head masks
+            return [ self.base_masks[self.lh2key[(idx, h)]]
+                     for h in range(self.n_heads) ]
+
+        if isinstance(idx, tuple) and len(idx) == 2:
+            l, h = idx
+            key = self.lh2key[(l, h)]
+            return self.base_masks[key]
+
+        raise TypeError("Index must be int (layer) or (layer, head)")
+
+    # --------------------------------------------------------------
     def to(self, device):
-        """Moves all underlying masks to a new device."""
         for k, v in self.base_masks.items():
             self.base_masks[k] = v.to(device)
         return self
 
+    # --------------------------------------------------------------
     def as_tensor(self):
         """
-        Materializes a full tensor (B, n_layers, L, L) only if required.
-        Each layer view points to the corresponding base mask.
+        Materializes full tensor (B, n_layers, n_heads, L, L).
         """
         sample = next(iter(self.base_masks.values()))
         B, L, _ = sample.shape
-        out = torch.empty(B, self.n_layers, L, L,
+        out = torch.empty(B, self.n_layers, self.n_heads, L, L,
                           device=sample.device,
                           dtype=sample.dtype)
-        for i in range(self.n_layers):
-            out[:, i] = self[i]
+        for l in range(self.n_layers):
+            for h in range(self.n_heads):
+                out[:, l, h] = self[l, h]
         return out
+
 
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -639,6 +682,8 @@ class MultiDomainEmbedding(nn.Module):
         if len(self.domain_embed) > 0:
             emb = {}
             for domain_name in self.domain_embed:
+                if domain_name == "padding":
+                    import ipdb; ipdb.set_trace()
                 token_emb = self.domain_embed[domain_name](x[domain_name])
                 emb[domain_name] = token_emb
         else:
@@ -813,7 +858,7 @@ class MaskedSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         # manual implementation of attention
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        
+
         if attn_mask is not None:
             att = att.masked_fill(attn_mask == 0, float("-inf"))
 
@@ -910,7 +955,12 @@ class Delphi(torch.nn.Module):
             embed=MultiDomainEmbedding(config),
             age_embedding=AgeEncoding(n_embd=config.n_embd),
             drop=nn.Dropout(config.dropout),
-            attn_mask_builder=nn.ModuleList([AttentionMaskBuilder(config.attention_scheme[i]) for i in range(config.n_layer)]),
+            attn_mask_builder=nn.ModuleList([
+                nn.ModuleList( [
+                    AttentionMaskBuilder(config.attention_scheme[i]) 
+                    for i in range(config.n_layer)
+                ] ) for j in range(config.n_head) ]
+            ),
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias)
         ))
@@ -1085,7 +1135,7 @@ class Delphi(torch.nn.Module):
 
     
     #/*********************************************************************************************************
-    ### —————— FORWARD ——————— ################################################################################
+    ### ——————— FORWARD ——————— ###############################################################################
 
     def forward(self, 
         x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor,
@@ -1104,28 +1154,36 @@ class Delphi(torch.nn.Module):
         )
         
         emb += self.transformer.age_embedding(ages)        
+
+        single_mask = self.transformer.attn_mask_builder[0][0].build(
+            ages, domains, self.domain_to_int
+        )  # (B, L-1, L-1)
+
+        attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
+                expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
+                    permute(1, 0, 2, 3, 4)        
         
+
         # ——— BUILDING ATTENTION MASK —————————————————————————————————————————————————————————————————————————
-        # attn_mask = AttentionMaskStack(self.transformer.attn_mask_builder[0](ages, domains, domain2id))
-        group = AttentionMaskGroup(self.transformer.attn_mask_builder)
+        # group = AttentionMaskGroup(self.transformer.attn_mask_builder)
 
         #TODO: passing domain2id on every call doesn't seem right. Try to pass it in the constructor if possible.
-        attn_view = group.build(ages, domains, self.domain_to_int)
+        # attn_view = group.build(ages, domains, self.domain_to_int)
 
         # attn_mask = torch.stack([ 
             # self.transformer.attn_mask_builder[i](ages, domains, domain2id) 
             # for i, _ in enumerate(self.transformer.h) ]
         # ) 
                 
-        attn_mask = attn_view[0].unsqueeze(0).expand(self.config.n_layer, -1, -1, -1)
+        # attn_mask = attn_view[0].unsqueeze(0).expand(self.config.n_layer, -1, -1, -1)
         
         # (N_LAYERS, BATCH_SIZE, ..., ...) -> (BATCH_SIZE, N_LAYERS, ..., ...)
-        attn_mask = attn_mask.permute(1, 0, 2, 3)
+        # attn_mask = attn_mask.permute(1, 0, 2, 3)
         # —————————————————————————————————————————————————————————————————————————————————————————————————————
 
         h, att = emb[:, :-1], []
         for i, transformer_block in enumerate(self.transformer.h):            
-            h, _att = transformer_block(h, attn_mask)
+            h, _att = transformer_block(h, attn_mask[i])
             att.append(_att)
         
         h = self.transformer.ln_f(h)        
@@ -1135,7 +1193,7 @@ class Delphi(torch.nn.Module):
                (attention_matrices := torch.stack(att) if return_attention else None)
 
     ### ———————— END FORWARD ———————— #########################################################################
-    #************************************************************************/********************************/
+    #*********************************************************************************************************/
 
     def compute_loss(self, logits, targets, targets_age):
 
