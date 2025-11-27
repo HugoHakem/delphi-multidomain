@@ -42,6 +42,8 @@ from delphi.model.transformer import (
     DelphiConfig,
 )
 
+from old_model import Delphi as OldDelphi
+
 torch.set_grad_enabled(False)
 
 from collections import OrderedDict
@@ -271,8 +273,73 @@ def old_get_data_partitions(datafile, fold):
            (test_data, test_p2i, test_ids)
 
 
+import torch
+import traceback
+
+def debug_run_forward(model, *args, **kwargs):
+    """
+    Ejecuta el forward módulo por módulo con hooks,
+    capturando exactamente dónde ocurre un IndexError
+    y mostrando los inputs/outputs de cada módulo.
+    """
+    model = model.cuda()
+
+    traces = {}
+
+    # Hook para registrar inputs/outputs de cada submódulo
+    def hook_fn(name):
+        def hook(module, inp, out):
+            traces[name] = {"input": inp, "output": out}
+        return hook
+
+    hooks = []
+    for name, module in model.named_modules():
+        if not list(module.children()):  # solo leaf modules
+            hooks.append(module.register_forward_hook(hook_fn(name)))
+
+    try:
+        out = model(*args, **kwargs)
+        print("Forward OK sin errores.")
+        return out
+
+    except IndexError as e:
+        print("\n🔥🔥🔥 INDEX ERROR DETECTADO 🔥🔥🔥")
+        print("Mensaje:", e)
+        print("-------------------------------\n")
+
+        print("➡ Buscando en qué módulo se produjo...\n")
+
+        # Mostramos los últimos módulos que ejecutaron correctamente
+        for name in reversed(traces.keys()):
+            print(f"Último módulo ejecutado OK: {name}")
+            inp = traces[name]["input"]
+            out = traces[name]["output"]
+
+            print(f"  - Input shapes: {[x.shape if torch.is_tensor(x) else x for x in inp]}")
+            if torch.is_tensor(out):
+                print(f"  - Output shape: {out.shape}")
+            else:
+                print(f"  - Output: {out}")
+
+            print("  - Valores max/min de input:")
+            for i, x in enumerate(inp):
+                if torch.is_tensor(x):
+                    print(f"    input[{i}] max={x.max().item()}, min={x.min().item()}")
+
+            print("\n")
+            break  # solo mostramos el último módulo correcto
+
+        print("Stack trace completo:")
+        traceback.print_exc()
+
+    finally:
+        for h in hooks:
+            h.remove()
+
+
+
 MLFLOW_URI = "./output/mlruns"
-MLFLOW_URI = "./mlruns"
+# MLFLOW_URI = "./mlruns"
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 tokens_path = root_path / 'tokens'
@@ -289,7 +356,7 @@ default_cfg_per_domain = {
 
 domain_cfg = default_cfg_per_domain
 
-attention_scheme = "[diseases, death, lifestyle, sex, padding]:causal(mask_ties=True)"
+attention_scheme = "[hla_alleles]:bidirectional,[diseases, death, lifestyle, sex, padding]:causal(mask_ties=True)"
 
 config = DelphiConfig(
     n_layer=6, 
@@ -301,18 +368,16 @@ config = DelphiConfig(
     
 model  = Delphi(config).to(DEVICE)
 
-# %%
 mlflow.set_tracking_uri(MLFLOW_URI)
+HOME = os.environ['HOME']
 
 hla_exp   = "278131880607437980"
 def fix_artifact_uri(path):
-    return re.sub(".*mlruns", "/homes/bonazzola/repos/delphi/mlruns", path)
+    return re.sub(".*mlruns", f"{HOME}/repos/delphi/{MLFLOW_URI}", path)
 
 runs_hla = mlflow.search_runs(experiment_ids=hla_exp)
 runs_hla.artifact_uri = runs_hla.artifact_uri.apply(fix_artifact_uri)
 runid = runs_hla.run_id[0]
-
-display(runs_hla)
 
 run = mlflow.get_run(runid)
 run_artifact_uri = fix_artifact_uri(run.info.artifact_uri)
@@ -320,27 +385,30 @@ run_artifact_uri = fix_artifact_uri(run.info.artifact_uri)
 ckpt_path  = list((Path(run_artifact_uri) / "checkpoints").glob("*pt"))[-1]
 checkpoint = torch.load(ckpt_path, map_location=DEVICE)        
 state_dict = { k.replace("_orig_mod.", ""): v for k, v in checkpoint['model'].items() }
+
+model = load_legacy_weights_into_delphi(model, state_dict)
+
 wte_weights = state_dict['transformer.wte.weight']
+
+# %%
 
 domains = ['padding','sex','lifestyle','hla_alleles','diseases','death']
 kk = np.array([0] + [ model.transformer.embed.domain_embed[d].projector.num_embeddings for d in domains ])
 
-for i, (start, end) in enumerate(pairwise(kk.cumsum())):
-    domain = domains[i]
-    model.transformer.embed.domain_embed[domain].parameters = wte_weights[start:end]
-
-model = load_legacy_weights_into_delphi(model, state_dict)
+with torch.no_grad():
+    for i, (start, end) in enumerate(pairwise(kk.cumsum())):
+        domain = domains[i]
+        model.transformer.embed.domain_embed[domain].weight.copy_(wte_weights[start:end])
 
 # NEW DATA
 # train_ids, val_ids, test_ids = get_data_partitions("./data/transforms/subject_lists", fold=0)
 
 # OLD DATA
-train, valid, test = old_get_data_partitions("./data/transforms/ukb_real_5_folds_4digit/all.bin", 1)
+train, valid, test = old_get_data_partitions("./data/transforms/deprecated/ukb_real_5_folds_4digit/all.bin", 1)
 train_data, train_p2i, train_ids = train
 val_data, val_p2i, val_ids       = valid
 test_data, test_p2i, val_ids     = test
 
-# %%
 # val_dataset      = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=val_ids).to('cuda')
 # test_dataset     = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=test_ids).to('cuda')
 # val_dataloader   = DelphiDataloader(val_dataset,   batch_size=16)
@@ -358,8 +426,8 @@ subject_ids = subject_ids.tolist()
 event_set = EventSet.from_batch((x, a, y, b), subject_ids=subject_ids, tokenizer=tokenizer)
 event_set.X_tokens, event_set.X_ages
 
-dataset    = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=subject_ids).to('cuda')
-dataloader = DelphiDataloader(dataset, batch_size=256)  
+dataset    = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=subject_ids).to("cuda")
+dataloader = DelphiDataloader(dataset, batch_size=128)  
 batch = next(iter(dataloader))
 
 # trainer = Trainer(model, dataloaders, optimizer:=None, scheduler:=None, logger:=None, mlflow_params:=None)
@@ -371,29 +439,36 @@ batch = next(iter(dataloader))
 # assign(age=lambda df: (df.age / 365.25).round(2)).\
 # sort_values(["age", "token"])
 
+# %%
+old_model = OldDelphi.from_checkpoint(ckpt_path).to("cuda")
+debug_run_forward(old_model, *event_set.to_tensor().to('cuda').as_tuple())
+
 model.to('cuda')
 x, ages, subject_ids = get_tensors_from_batch(batch)
+
+for dname in x:
+    x[dname] = x[dname].to('cuda')
+    ages[dname] = ages[dname].to('cuda')
+    subject_ids[dname] = subject_ids[dname].to('cuda')
+
 max_ages             = model.get_max_ages_per_subject(ages, subject_ids)
 x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
 x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
 x, ages, subject_ids = adjust_to_seqlen(x, ages, subject_ids, seqlen:=128, verbose="debug")       
+
 logits, att = model(x, ages, subject_ids)
 
 # %%
 embeddings = model.transformer.embed(x)
-# x_tensor, ages_tensor, embeddings_tensor, uniq_subjs, domains = model.to_tensor(x, ages, embeddings, subject_ids)
+x_tensor, ages_tensor, embeddings_tensor, uniq_subjs, domains = model.to_tensor(x, ages, embeddings, subject_ids)
 
-embeddings['padding']
 # %%
 # Okay, now let's try to load the weights using the old model code.
-from old_model import Delphi as OldDelphi
-
-old_model = OldDelphi.from_checkpoint(ckpt_path)
 old_logits, loss, _, _ = old_model(*event_set.to_tensor().to('cuda').as_tuple())
-old_logits = old_logits.cpu()[:, :, 372:]
 
-
+# %%
 def attach_tracer(model, prefix=""):
+
     trace = {}
     hooks = []
 
@@ -403,31 +478,59 @@ def attach_tracer(model, prefix=""):
         return module.register_forward_hook(hook)
 
     for name, module in model.named_modules():
-        # filtramos cosas que no tienen datos (e.g. container modules)
         if not list(module.children()):  
             h = register(module, prefix + name)
             hooks.append(h)
 
     return trace, hooks
 
-# %%
 
+debug_run_forward(old_model, *event_set.to_tensor().to('cuda').as_tuple())
+
+# %%
+# kk = 434
+# old_logits[(aa == 372+kk)][:, 372:]
+
+# %%
 trace_old, hooks_old = attach_tracer(old_model, prefix="old/")
 trace_new, hooks_new = attach_tracer(model, prefix="new/")
 
-# Hacemos forward
 _ = old_model(*event_set.to_tensor().to('cuda').as_tuple())
 _ = model(x, ages, subject_ids)
 
-# Luego removemos los hooks para no ensuciar nada
 for h in hooks_old: h.remove()
 for h in hooks_new: h.remove()
 # %%
-trace_old['old/transformer.wte'][0]
+x_old, x_ages_old, y_old, y_ages_old = event_set.to_tensor().to('cuda').as_tuple()
+
+kk = 434
+trace_old['old/transformer.wte'].cpu()[x_old.cpu() == 372+kk]
+
 # %%
-trace_new['new/transformer.embed.domain_embed.padding.projector'][:, 0]
+trace_new['new/transformer.embed.domain_embed.diseases.projector'][x['diseases'].cpu() == kk].shape
+
 # %%
-list(old_model.transformer.wte.parameters())[0].cpu().numpy()
+# x_tensor, ages_tensor, embeddings_tensor, uniq_subjs, domains
+
+single_mask = model.transformer.attn_mask_builder[0][0].build(
+            ages_tensor, domains, model.domain_to_int
+        )  # (B, L-1, L-1)
+
+attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
+    expand(-1, model.config.n_layer, model.config.n_head, -1, -1).\
+    permute(1, 0, 2, 3, 4)        
+        
 # %%
-x['padding']
+attn_mask.shape
+# %%
+import matplotlib.pyplot as plt
+
+import ipywidgets as widgets
+from ipywidgets import interact
+
+@interact
+def show_attn(i=widgets.IntSlider(min=0, max=128)):
+    plt.imshow(attn_mask[0][i][0][-128:,-128:].cpu().numpy())
+# %%
+attn_mask[0][0][0]
 # %%

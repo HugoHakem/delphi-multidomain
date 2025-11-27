@@ -947,7 +947,7 @@ def get_cli_args():
 
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)", nargs="+")
+    parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
     parser.add_argument("--n_layer",          default=12,  type=int)
     parser.add_argument("--n_head",           default=10,  type=int)
     parser.add_argument("--n_embd",           default=120, type=int)

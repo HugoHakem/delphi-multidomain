@@ -681,11 +681,11 @@ class MultiDomainEmbedding(nn.Module):
         
         if len(self.domain_embed) > 0:
             emb = {}
-            for domain_name in self.domain_embed:
-                if domain_name == "padding":
-                    import ipdb; ipdb.set_trace()
+            for domain_name in self.domain_embed:                
                 token_emb = self.domain_embed[domain_name](x[domain_name])
                 emb[domain_name] = token_emb
+                # if domain_name == "padding":
+                    # import ipdb; ipdb.set_trace()
         else:
             token_emb = self.token_embedding(x)
             token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
