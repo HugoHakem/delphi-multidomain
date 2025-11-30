@@ -711,7 +711,7 @@ class DelphiDataloader(FlexibleDataLoader):
         )
 
     
-    def get_tensors_from_batch(self, batch):
+    def get_tensors_from_batch(self, batch, device=None):
         
         tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
         
@@ -728,6 +728,12 @@ class DelphiDataloader(FlexibleDataLoader):
                 tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
                 ages[dname] = domain_data[:, AGE_COLUMN]
                 subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
+
+        if device is not None:
+            for dname in x:
+                x[dname] = x[dname].to(device)
+                ages[dname] = ages[dname].to(device)
+                subject_ids[dname] = subject_ids[dname].to(device)
 
         return tokens, ages, subject_ids
     
@@ -881,7 +887,7 @@ class DelphiDataloader(FlexibleDataLoader):
         return x, ages, subject_ids
 # %%
 
-def get_tensors_from_batch(batch):
+def get_tensors_from_batch(batch, device=None):
     from easydict import EasyDict
         
     tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
@@ -905,6 +911,12 @@ def get_tensors_from_batch(batch):
             tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
             ages[dname] = domain_data[:, AGE_COLUMN]
             subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
+
+    if device is not None:
+        for dname in tokens:
+            tokens[dname] = tokens[dname].to(device)
+            ages[dname] = ages[dname].to(device)
+            subject_ids[dname] = subject_ids[dname].to(device)
 
     return tokens, ages, subject_ids
 

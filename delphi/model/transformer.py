@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+
 import logging
 logger = logging.getLogger(__name__)
 from pathlib import Path
@@ -139,9 +140,6 @@ class AttentionMaskBuilder(nn.Module):
             # in-place version
             mask.masked_fill_(both & causal, FALSE := 0)
     
-        # Finally, let's remove the last line of input and the first line of output.
-        mask = mask[:,1:,:-1]
-        
         return mask
 
 
@@ -1181,7 +1179,7 @@ class Delphi(torch.nn.Module):
         # attn_mask = attn_mask.permute(1, 0, 2, 3)
         # —————————————————————————————————————————————————————————————————————————————————————————————————————
 
-        h, att = emb[:, :-1], []
+        h, att = emb, []
         for i, transformer_block in enumerate(self.transformer.h):            
             h, _att = transformer_block(h, attn_mask[i])
             att.append(_att)
