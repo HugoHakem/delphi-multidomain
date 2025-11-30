@@ -168,7 +168,7 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
         x, a, y, b = x.to(device), a.to(device), y.to(device), b.to(device)
 
     if return_subject_ids:
-        return x, a, y, b, subject_ids
+        return x, a, y, b, subject_ids.tolist()
     else:           
         return x, a, y, b
 
