@@ -1,7 +1,6 @@
 # %%
 import torch
 import os, sys
-import copy
 
 import mlflow
 import re
@@ -12,11 +11,6 @@ from itertools import pairwise
 import importlib
 from copy import deepcopy
 from collections import defaultdict
-
-import matplotlib.pyplot as plt
-
-import ipywidgets as widgets
-from ipywidgets import interact
 
 # sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "./data")
@@ -50,16 +44,18 @@ from delphi.model.transformer import (
 
 from old_model import Delphi as OldDelphi
 
-import traceback
 torch.set_grad_enabled(False)
 
 from collections import OrderedDict
-import re
 
-def load_legacy_weights_into_new_delphi(
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from ipywidgets import interact
+
+
+def load_legacy_weights_into_delphi(
     model_new,
     state_dict_old,
-    domains,
     skip_prefixes=("transformer.wte", "embedding"),
     verbose=False
 ):
@@ -77,15 +73,6 @@ def load_legacy_weights_into_new_delphi(
     new_sd = model_new.state_dict()
     loaded = {}
     skipped = []
-
-    wte_weights = state_dict['transformer.wte.weight']
-
-    vocab_lens = np.array([0] + [ model.transformer.embed.domain_embed[d].projector.num_embeddings for d in domains ])
-    
-    with torch.no_grad():
-        for i, (start, end) in enumerate(pairwise(vocab_lens.cumsum())):
-            domain = domains[i]
-            model_new.transformer.embed.domain_embed[domain].weight.copy_(wte_weights[start:end])
 
     # ------------------------------------------------------------------
     # Mapping rules: old_key_pattern -> new_key_pattern
@@ -290,6 +277,9 @@ def old_get_data_partitions(datafile, fold):
            (test_data, test_p2i, test_ids)
 
 
+import torch
+import traceback
+
 def debug_run_forward(model, *args, **kwargs):
     """
     Ejecuta el forward módulo por módulo con hooks,
@@ -317,7 +307,7 @@ def debug_run_forward(model, *args, **kwargs):
         return out
 
     except IndexError as e:
-        print("INDEX ERROR DETECTADO")
+        print("\n🔥🔥🔥 INDEX ERROR DETECTADO 🔥🔥🔥")
         print("Mensaje:", e)
         print("-------------------------------\n")
 
@@ -351,147 +341,137 @@ def debug_run_forward(model, *args, **kwargs):
             h.remove()
 
 
-def filter_subjects(batch, subject_ids):
-    
-    batch = copy.deepcopy(batch)
-    subject_ids = torch.tensor(subject_ids)
 
-    for dname in batch:
-        batch[dname] = batch[dname][torch.isin(batch[dname][:,0].cpu(), subject_ids)]
-
-    return batch
-
-
-def fix_artifact_uri(path):
-    return re.sub(".*mlruns", f"{HOME}/repos/delphi/{MLFLOW_URI}", path)
-
-
-def get_ckpt_path_from_runid(runid):
-
-    run = mlflow.get_run(runid)
-    run_artifact_uri = fix_artifact_uri(run.info.artifact_uri)
-    ckpt_path  = list((Path(run_artifact_uri) / "checkpoints").glob("*pt"))[-1]
-    return ckpt_path
-
-
-def get_state_dict(ckpt_path):
-
-    checkpoint = torch.load(ckpt_path, map_location=DEVICE)        
-    state_dict = { k.replace("_orig_mod.", ""): v for k, v in checkpoint['model'].items() }
-    return state_dict
-
-#————————————————————————————————————————————————————————————————————————————————————————————————
-
-# MLFLOW_URI = "./output/mlruns"
-MLFLOW_URI = "./mlruns"
+MLFLOW_URI = "./output/mlruns"
+# MLFLOW_URI = "./mlruns"
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-HOME = os.environ['HOME']
-TOKENS_PATH = root_path / 'tokens'
 
-HLA4D_EXPERIMENT   = "278131880607437980"
-DATA_FILE = "./data/transforms/ukb_real_5_folds_4digit/all.bin"
-LABELS_FILE = "data/delphi_labels_chapters_colours_icd_with_hla4d.csv"
-DOMAINS = ['padding','sex','lifestyle','hla_alleles','diseases','death']
-tokenizer = pd.read_csv(LABELS_FILE)["name"].to_dict()
+tokens_path = root_path / 'tokens'
 
-mlflow.set_tracking_uri(MLFLOW_URI)
-
-DEFAULT_CFG_PER_DOMAIN = {
+default_cfg_per_domain = {
     # 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
-    'diseases':    EmbedConfig(projector="embed", path=TOKENS_PATH / 'diseases',    predict=True),
-    'death':       EmbedConfig(projector="embed", path=TOKENS_PATH / 'death',       predict=True),
-    'lifestyle':   EmbedConfig(projector="embed", path=TOKENS_PATH / 'lifestyle',   age_jitter=True),  
-    "hla_alleles": EmbedConfig(projector="embed", path=TOKENS_PATH / 'hla_alleles', at_birth=True),
-    "sex":         EmbedConfig(projector="embed", path=TOKENS_PATH / 'sex',         at_birth=True),
+    'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
+    'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
+    'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
+    "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
+    "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
     "padding":     EmbedConfig(projector="embed")    
 }
 
-SEQLEN = 128
+domain_cfg = default_cfg_per_domain
 
-#————————————————————————————————————————————————————————————————————————————————————————————————
-
-attention_scheme = "[hla_alleles, sex]:bidirectional,[diseases, death, lifestyle, sex, padding]:causal(mask_ties=True)"
-# attention_scheme = "[diseases, death, lifestyle, sex, hla_alleles, padding]:causal(mask_ties=True)"
+attention_scheme = "[hla_alleles]:bidirectional,[diseases, death, lifestyle, sex, padding]:causal(mask_ties=True)"
 
 config = DelphiConfig(
     n_layer=6, 
     n_embd=240,
     token_dropout=0.1, 
-    domains=DEFAULT_CFG_PER_DOMAIN, 
+    domains=domain_cfg, 
     attention_scheme=attention_scheme
 )
     
 model  = Delphi(config).to(DEVICE)
 
-runid = mlflow.search_runs(experiment_ids=HLA4D_EXPERIMENT).run_id[0]
-ckpt_path = get_ckpt_path_from_runid(runid)
-state_dict = get_state_dict(ckpt_path)
+mlflow.set_tracking_uri(MLFLOW_URI)
+HOME = os.environ['HOME']
 
-model   = load_legacy_weights_into_new_delphi(model, state_dict, domains=DOMAINS)
+hla_exp   = "278131880607437980"
+def fix_artifact_uri(path):
+    return re.sub(".*mlruns", f"{HOME}/repos/delphi/{MLFLOW_URI}", path)
 
-# ——————————————————————————————————————————————————————————————————————————————————————————————————
-# OLD DATA
-train, valid, test = old_get_data_partitions(DATA_FILE, fold=1)
-train_data, train_p2i, train_ids = train
+runs_hla = mlflow.search_runs(experiment_ids=hla_exp)
+runs_hla.artifact_uri = runs_hla.artifact_uri.apply(fix_artifact_uri)
+runid = runs_hla.run_id[0]
 
-n_subjects = len(train_ids)
-n_subjects = 256
-x, a, y, b, subject_ids = get_batch(range(n_subjects), train_data, train_p2i, select='left', return_subject_ids=True, block_size=128)
-event_set  = EventSet.from_batch((x, a, y, b), subject_ids=subject_ids, tokenizer=tokenizer)
-x_old, x_ages_old, y_old, y_ages_old = event_set.to_tensor().to('cuda').as_tuple()
+run = mlflow.get_run(runid)
+run_artifact_uri = fix_artifact_uri(run.info.artifact_uri)
 
-# NEW DATA
-dataset    = DelphiDataset(domains=DEFAULT_CFG_PER_DOMAIN, root="./data/transforms", subjects=subject_ids, required_domains=["diseases", "hla_alleles"]).to("cuda")
-dataloader = DelphiDataloader(dataset, batch_size=16)  
-# batch      = next(iter(dataloader))
+ckpt_path  = list((Path(run_artifact_uri) / "checkpoints").glob("*pt"))[-1]
+checkpoint = torch.load(ckpt_path, map_location=DEVICE)        
+state_dict = { k.replace("_orig_mod.", ""): v for k, v in checkpoint['model'].items() }
 
-# batch = filter_subjects(batch, [subject_ids[48], subject_ids[77], subject_ids[122]])
+model = load_legacy_weights_into_delphi(model, state_dict)
 
-pd.concat(
-     list(map(lambda x: pd.DataFrame(x.cpu().numpy(), columns=["subject_id", "age", "token"]), dataset[2005166].values()))
-).\
-astype({"token": int, "subject_id": int}).\
-assign(age=lambda df: (df.age / 365.25).round(2)).\
-sort_values(["age", "token"])#.pipe(print)
-
-# debug_run_forward(old_model, *event_set.to_tensor().to(DEVICE).as_tuple())
+wte_weights = state_dict['transformer.wte.weight']
 
 # %%
-for i, batch in enumerate(dataloader):
 
-    x, ages, subject_ids = get_tensors_from_batch(batch, device=DEVICE)
-    max_ages             = model.get_max_ages_per_subject(ages, subject_ids)
-    x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
-    x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-    x, ages, subject_ids = adjust_to_seqlen(x, ages, subject_ids, seqlen=SEQLEN, verbose=False)
-    
-    logits, _ = model(x, ages, subject_ids)
-    
-    for dname in logits:
-        logits[dname] = logits[dname].cpu()
-    
-    kk = logits['diseases'].isnan().sum().cpu().item()
-    
-    # print(kk)
+domains = ['padding','sex','lifestyle','hla_alleles','diseases','death']
+kk = np.array([0] + [ model.transformer.embed.domain_embed[d].projector.num_embeddings for d in domains ])
 
-    if kk != 0:
-        print(i)
-        
-    # print({ i: logits['diseases'][i].isnan().sum().cpu().item() for i in range(len(logits['diseases'])) })
+with torch.no_grad():
+    for i, (start, end) in enumerate(pairwise(kk.cumsum())):
+        domain = domains[i]
+        model.transformer.embed.domain_embed[domain].weight.copy_(wte_weights[start:end])
+
+# NEW DATA
+# train_ids, val_ids, test_ids = get_data_partitions("./data/transforms/subject_lists", fold=0)
+
+# OLD DATA
+train, valid, test = old_get_data_partitions("./data/transforms/deprecated/ukb_real_5_folds_4digit/all.bin", 1)
+train_data, train_p2i, train_ids = train
+val_data, val_p2i, val_ids       = valid
+test_data, test_p2i, val_ids     = test
+
+# val_dataset      = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=val_ids).to('cuda')
+# test_dataset     = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=test_ids).to('cuda')
+# val_dataloader   = DelphiDataloader(val_dataset,   batch_size=16)
+# test_dataloader  = DelphiDataloader(test_dataset,  batch_size=16)
+# dataloaders      = [train_dataloader, val_dataloader, test_dataloader]
+
+# dataset = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=train_ids).to('cuda')
+# dataloader = train_dataloader
+
+tokenizer = pd.read_csv("data/delphi_labels_chapters_colours_icd_with_hla4d.csv")["name"].to_dict()
+
+x, a, y, b, subject_ids = get_batch(range(256), train_data, train_p2i, select='left', return_subject_ids=True, block_size=128)
+
+event_set = EventSet.from_batch((x, a, y, b), subject_ids=subject_ids, tokenizer=tokenizer)
+event_set.X_tokens, event_set.X_ages
+
+dataset    = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=subject_ids).to("cuda")
+dataloader = DelphiDataloader(dataset, batch_size=128)  
+batch = next(iter(dataloader))
+
+# trainer = Trainer(model, dataloaders, optimizer:=None, scheduler:=None, logger:=None, mlflow_params:=None)
+
+# pd.concat(
+#     list(map(lambda x: pd.DataFrame(x.cpu().numpy(), columns=["subject_id", "age", "token"]), dataset[2005166].values()))
+# ).\
+# astype({"token": int, "subject_id": int}).\
+# assign(age=lambda df: (df.age / 365.25).round(2)).\
+# sort_values(["age", "token"])
+
+old_model = OldDelphi.from_checkpoint(ckpt_path).to("cuda")
+debug_run_forward(old_model, *event_set.to_tensor().to('cuda').as_tuple())
+
+model.to('cuda')
+x, ages, subject_ids = get_tensors_from_batch(batch)
+
+for dname in x:
+    x[dname] = x[dname].to('cuda')
+    ages[dname] = ages[dname].to('cuda')
+    subject_ids[dname] = subject_ids[dname].to('cuda')
+
+max_ages             = model.get_max_ages_per_subject(ages, subject_ids)
+x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
+x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+x, ages, subject_ids = adjust_to_seqlen(x, ages, subject_ids, seqlen:=128, verbose="debug")       
+logits, att = model(x, ages, subject_ids)
 
 # %%
 embeddings = model.transformer.embed(x)
 x_tensor, ages_tensor, embeddings_tensor, uniq_subjs, domains = model.to_tensor(x, ages, embeddings, subject_ids)
 
 # %%
-# OLD MODEL
-old_model = OldDelphi.from_checkpoint(ckpt_path).to(DEVICE)
-# old_logits, loss, _, _ = old_model(*event_set.to_tensor().to('cuda').as_tuple())
+# Okay, now let's try to load the weights using the old model code.
+old_logits, loss, _, _ = old_model(*event_set.to_tensor().to('cuda').as_tuple())
 
 # %%
 def attach_tracer(model, prefix=""):
 
-    trace, hooks = {}, []
+    trace = {}
+    hooks = []
 
     def register(module, name):
         def hook(_, inp, out):
@@ -505,8 +485,14 @@ def attach_tracer(model, prefix=""):
 
     return trace, hooks
 
-# debug_run_forward(old_model, *event_set.to_tensor().to('cuda').as_tuple())
 
+debug_run_forward(old_model, *event_set.to_tensor().to('cuda').as_tuple())
+
+# %%
+# kk = 434
+# old_logits[(aa == 372+kk)][:, 372:]
+
+# %%
 trace_old, hooks_old = attach_tracer(old_model, prefix="old/")
 trace_new, hooks_new = attach_tracer(model, prefix="new/")
 
@@ -515,29 +501,37 @@ _ = model(x, ages, subject_ids)
 
 for h in hooks_old: h.remove()
 for h in hooks_new: h.remove()
+# %%
+x_old, x_ages_old, y_old, y_ages_old = event_set.to_tensor().to('cuda').as_tuple()
+
+kk = 434
+trace_old['old/transformer.wte'].cpu()[x_old.cpu() == 372+kk]
 
 # %%
-
-DISEASE = 434
-trace_old['old/transformer.wte'].cpu()[x_old.cpu() == 372+DISEASE]
-trace_new['new/transformer.embed.domain_embed.diseases.projector'][x['diseases'].cpu() == DISEASE]
+trace_new['new/transformer.embed.domain_embed.diseases.projector'][x['diseases'].cpu() == kk].shape
 
 # %%
+# x_tensor, ages_tensor, embeddings_tensor, uniq_subjs, domains
+
 single_mask = model.transformer.attn_mask_builder[0][0].build(
-    ages_tensor, domains, model.domain_to_int
-)  # (B, L-1, L-1)
+            ages_tensor, domains, model.domain_to_int
+        )  # (B, L-1, L-1)
 
 attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
     expand(-1, model.config.n_layer, model.config.n_head, -1, -1).\
     permute(1, 0, 2, 3, 4)        
         
-attn_mask
 # %%
 @interact
 def show_attn(i=widgets.IntSlider(min=0, max=128)):
     plt.imshow(attn_mask[0][i][0][-128:,-128:].cpu().numpy())
-
 # %%
+attn_mask[0][0][0]
+# %%
+
+
+# Examine attentions
+
 attn_masks = {}
 
 def hook_attn_mask(module, inputs, outputs):
@@ -547,79 +541,13 @@ def hook_attn_mask(module, inputs, outputs):
 
 # attach hooks to all attention modules
 for i, block in enumerate(old_model.transformer.h):
-    print(block.attn)
     block.attn.register_forward_hook(hook_attn_mask)
+# %%
 
-
+# logits, loss, att, emb = model(token_stream, age, return_attentions=True)
 old_logits, loss, _, _ = old_model(*event_set.to_tensor().to('cuda').as_tuple())
-attn_masks
-
-plt.imshow(list(attn_masks.values())[0][0,0].numpy())
-plt.show()
 
 # %%
-int_to_domain = { v: k for k, v in model.domain_to_int.items() }
-
-def show_attention_map(att, domains, int_to_domain, title=None):
-    """
-    att: tensor 2D o 3D
-        - [seq, seq]                  -> 1 head
-        - [heads, seq, seq]           -> varias heads
-        - [batch, heads, seq, seq]    -> batch + heads
-    """
-
-    # Normalizar dimensiones
-    if att.dim() == 2:
-        att = att.unsqueeze(0).unsqueeze(0)    # [1,1,seq,seq]
-    elif att.dim() == 3:
-        att = att.unsqueeze(0)                 # [1,heads,seq,seq]
-    elif att.dim() != 4:
-        raise ValueError("Formato no soportado.")
-
-    b, h, seq, _ = att.shape
-
-    # Preparo labels
-    domain_labels = [int_to_domain[int(d.item())] for d in domains.squeeze(0)]
-
-    # Grilla
-    fig, axes = plt.subplots(
-        nrows=b,
-        ncols=h,
-        figsize=(16*h, 16*b),
-        squeeze=False
-    )
-
-    for bi in range(b):
-        for hi in range(h):
-
-            ax = axes[bi][hi]
-            ax.imshow(att[bi, hi].detach().cpu(), aspect='auto')
-            ax.set_title(f"Batch {bi}, Head {hi}", fontsize=10)
-
-            ax.set_xticks(range(seq))
-            ax.set_xticklabels(domain_labels, rotation=90)
-
-            ax.set_yticks(range(seq))
-            ax.set_yticklabels(domain_labels)
-
-            ax.set_xlabel("Key positions")
-            ax.set_ylabel("Query positions")
-
-            ax.grid(which="major", color="black", linewidth=0.4)
-
-
-    if title:
-        fig.suptitle(title)
-
-    plt.tight_layout()
-    plt.show()
-
-# %%
-subject_idx = 4
-kk = attn_mask[0][subject_idx][0].cpu().numpy() # attn_mask[0][i][0][-128:,-128:].cpu().numpy()
-
-n = 64
-show_attention_map(torch.tensor(kk)[-n:,-n:], domains[subject_idx][-n:], int_to_domain)
-# %%
-kk.shape
+import matplotlib.pyplot as plt
+plt.imshow(list(attn_masks.values())[0][0][0].numpy())
 # %%

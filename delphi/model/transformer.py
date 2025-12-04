@@ -118,29 +118,60 @@ class AttentionMaskBuilder(nn.Module):
 
 
     def build(self, ages: torch.Tensor, domains: torch.Tensor, domain2id: dict):
-
+        """
+        Build a [B, L, L] attention mask from a declarative DSL.
+        1 = attention allowed
+        0 = attention blocked
+        """
         B, L = ages.shape
-        dd = { "device": ages.device }
+        device = ages.device
 
-        # 1 == True
-        mask = torch.ones(B, L, L, **dd)
+        # Start with everything blocked
+        mask = torch.zeros(B, L, L, device=device)
+
+        # Always allow self-attention
+        diag = torch.arange(L, device=device)
+        mask[..., diag, diag] = 1
+
+        # Precompute expanded views for causal tests
+        age_row  = ages.unsqueeze(2)  # [B, L, 1]
+        age_col  = ages.unsqueeze(1)  # [B, 1, L]
 
         for dom_names, cfg in self.scheme.items():
-            
-            dom_ids = torch.tensor([domain2id[d] for d in dom_names], **dd)
-            dom_mask = torch.isin(domains, dom_ids)  # [B, L]
-    
+            # Gather domain ids
+            dom_ids = torch.tensor([domain2id[d] for d in dom_names], device=device)
+
+            # Boolean mask for tokens belonging to this rule
+            dom_mask = torch.isin(domains, dom_ids)   # [B, L]
+
+            # Pairs of tokens both belonging to allowed domains in this rule
+            pair_mask = dom_mask.unsqueeze(2) & dom_mask.unsqueeze(1)   # [B, L, L]
+
             if cfg["type"] == "bidirectional":
-                continue
-    
-            both = dom_mask.unsqueeze(2) & dom_mask.unsqueeze(1)
-            causal = ages.unsqueeze(2) < ages.unsqueeze(1)
-            causal = causal | ((cfg["mask_ties"]) & (ages.unsqueeze(2) == ages.unsqueeze(1)))
-            
-            # in-place version
-            mask.masked_fill_(both & causal, FALSE := 0)
-    
+                # Allow everything inside the domain pair
+                mask[pair_mask] = 1
+
+            elif cfg["type"] == "causal":
+                if cfg.get("mask_ties", False):
+                    # strict causal: do not allow ties
+                    causal = age_row > age_col
+                else:
+                    # allow ties
+                    causal = age_row >= age_col
+
+                # causal = age_row >= age_col
+                # if not cfg.get("mask_ties", False):
+                    # causal = age_row > age_col
+
+                # Combine with the domain pair mask
+                final = pair_mask & causal
+                mask[final] = 1
+
+            else:
+                raise ValueError(f"Unknown attention type: {cfg['type']}")
+
         return mask
+
 
 
     def forward(self, ages, domains, domain2id):

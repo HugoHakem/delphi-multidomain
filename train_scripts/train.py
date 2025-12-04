@@ -496,6 +496,7 @@ class Trainer():
         
         predict_mask = torch.isin(target_domains, self.predicted_domains_as_int)        
         logits       = torch.cat([logits[dname] for dname in self.predicted_domains], axis=-1)
+        logits       = logits[:,:-1,:]
         f_logits     = logits[predict_mask]
         f_domains    = target_domains[predict_mask]
         local_ids    = targets[predict_mask]
@@ -970,7 +971,7 @@ if __name__ == "__main__":
     
 else:
     args = EasyDict({
-        "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"],
+        "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death, hla_alleles]:causal(mask_ties=True)"],
         "n_layer": 12,
         "test_fold": 3,
         "patience": 2,
@@ -1063,3 +1064,5 @@ if __name__ == "__main__":
 
   trainer = Trainer(model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params)
   trainer.train(max_epochs=1000)
+
+# %%
