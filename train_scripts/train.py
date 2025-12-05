@@ -359,7 +359,6 @@ class Trainer():
         '''
 
         self.model           = model        
-        
         self.optimizer       = optimizer
         self.scheduler       = scheduler        
         self.early_stopper   = EarlyStopping(patience=patience, min_delta=0.001, mode='min')                        
@@ -447,8 +446,11 @@ class Trainer():
             self.logger.log_metrics(metrics['train_loss'], step=epoch)            
 
             should_stop, improved = self.early_stopper.step(self.mean_val_loss)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
             if improved:
+
                 ckpt_uri = self.logger.save_model(
                     self.model,
                     self.optimizer,
@@ -462,7 +464,7 @@ class Trainer():
                       "attention_scheme": getattr(self.model.config, "attention_scheme", None),
                       "date_cutoff": None,  # placeholder - to be set later when needed
                     } | self.get_subject_ids_per_partition(),
-                    filename=f"best_model_epoch{self.current_epoch}_trainloss_{train_loss}_{timestamp}.pt"
+                    filename=f"best_model_epoch{self.current_epoch}_trainloss_{train_loss['train_total']}_{timestamp}.pt"
                 )
                 print(f"New best model logged at {ckpt_uri}")
  
@@ -954,7 +956,7 @@ def get_cli_args():
     parser.add_argument("--n_embd",           default=120, type=int)
     parser.add_argument("--test_fold",        default=1,   type=int)
     parser.add_argument("--domains",          default="diseases,death,lifestyle,hla_alleles,sex,padding")
-    parser.add_argument("--experiment_name",  default="default")
+    parser.add_argument("--experiment_name",  default="attention_schemes")
     parser.add_argument("--run_name",         default=None)
     parser.add_argument("--batch_size",       default=16, type=int)
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
@@ -986,6 +988,7 @@ if isinstance(args.attention_scheme, str):
 # %%
 
 if __name__ == "__main__":
+
   if not args.resume_run_id:
 
     ################################ FROM SCRATCH ################################
@@ -1003,7 +1006,7 @@ if __name__ == "__main__":
     }
     
     domains = args.domains.split(",")
-    # k, v doesn't work for some reason!
+    # k, v with .items() doesn't work for some reason!
     domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in domains }
     
     assert all([k in default_cfg_per_domain for k in domains])
@@ -1030,6 +1033,7 @@ if __name__ == "__main__":
         attention_scheme = args.attention_scheme
     
     config = DelphiConfig(
+        n_embd=args.n_embd,
         n_layer=args.n_layer, 
         token_dropout=0.1, 
         domains=domain_cfg, 
