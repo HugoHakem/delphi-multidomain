@@ -5,7 +5,8 @@ from typing import List, Dict
 
 def get_best_ckpt_from_mlflow(runid):
     runinfo = mlflow.get_run(run_id=runid)
-    ckpt_dir = re.sub(r'^.*(?=mlruns)', '', runinfo.info.artifact_uri) + '/checkpoints'
+    mlflow_uri = os.path.dirname(mlflow.get_tracking_uri()) + "/"
+    ckpt_dir = re.sub(r'^.*(?=mlruns)', mlflow_uri, runinfo.info.artifact_uri) + '/checkpoints'
     best_ckpt = [x for x in os.listdir(ckpt_dir) if 'best' in x][0]
     best_ckpt = os.path.join(ckpt_dir, best_ckpt)
     return best_ckpt
