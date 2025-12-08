@@ -1,10 +1,12 @@
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any, Callable
+
 import numpy as np
 import torch
-from dataclasses import dataclass
-import numpy as np
 import weakref
+
+from copy import deepcopy
+from easydict import EasyDict
 
 
 @dataclass
@@ -713,3 +715,671 @@ class EventSetMask:
             meta={**e.meta, "mask_applied": True},
             tokenizer=e.tokenizer
         )    
+    
+
+
+class EventSetV2:
+    """
+    Multi-domain event set.
+    Each domain is a tensor of shape [N_events, 3]:
+        column 0 → subject_id
+        column 1 → age (days)
+        column 2 → token_id inside that domain
+    """
+
+    def __init__(self, domains: dict[str, torch.Tensor]):
+        """
+        domains: dict[str, torch.Tensor[N,3]]
+        """
+        # TODO: Validate shapes (must be Nx3)
+        # TODO: Validate dtype consistency (ages float, ids int)
+        self.domains = {d: arr.clone() for d, arr in domains.items()}
+        self._update_subject_ids()
+
+    # ----------------------------------------------------------------------
+    # INTERNAL UTILITIES
+    # ----------------------------------------------------------------------
+
+    def _update_subject_ids(self):
+        """Compute the full set of subjects across all domains."""
+        # TODO: Handle case of empty domains without raising ValueError
+        sids = []
+        for arr in self.domains.values():
+            if len(arr) > 0:
+                sids.append(arr[:, 0].cpu().numpy())
+        self.subject_ids = np.unique(np.concatenate(sids)) if sids else np.array([])
+
+    def _subset_by_subjects(self, subjects):
+        """Return new domains containing only rows whose subject_id is in `subjects`."""
+        # TODO: Performance concern: np.isin on large arrays
+        subjects = set(int(s) for s in subjects)
+        new = {}
+        for d, arr in self.domains.items():
+            if len(arr) == 0:
+                new[d] = arr.clone()
+                continue
+            mask = np.isin(arr[:, 0].cpu().numpy(), list(subjects))
+            # TODO: Could use boolean mask directly on GPU without round-trip to numpy
+            new[d] = arr[torch.tensor(mask, device=arr.device)]
+        return new
+
+    # ----------------------------------------------------------------------
+    # FILTERING BY SUBJECTS
+    # ----------------------------------------------------------------------
+
+    def filter_subjects(self, subjects):
+        """Keep only these subjects."""
+        # TODO: Should we preserve domains exactly or drop empty ones?
+        new_domains = self._subset_by_subjects(subjects)
+        return EventSetV2(new_domains)
+
+    # ----------------------------------------------------------------------
+    # FILTERING BY TOKENS (domain-aware)
+    # ----------------------------------------------------------------------
+
+    def for_token(self, domain: str, token_id: int):
+        """Keep only subjects that contain this (domain, token_id)."""
+        if domain not in self.domains:
+            raise ValueError(f"Domain '{domain}' not found.")
+
+        arr = self.domains[domain]
+        if len(arr) == 0:
+            # TODO: Should empty domain mean empty EventSet or copy of current?
+            return EventSetV2({d: a.clone() for d, a in self.domains.items()})
+
+        sids = arr[arr[:, 2] == token_id][:, 0].cpu().numpy()
+        # TODO: preserve ordering of subject_ids?
+        return self.filter_subjects(sids)
+
+    def exclude_token(self, domain: str, token_id: int):
+        """Remove all subjects that contain this (domain, token_id)."""
+        if domain not in self.domains:
+            raise ValueError(f"Domain '{domain}' not found.")
+
+        arr = self.domains[domain]
+        if len(arr) == 0:
+            # TODO: same logic as for_token: what do we expect?
+            return EventSetV2({d: a.clone() for d, a in self.domains.items()})
+
+        bad = set(arr[arr[:, 2] == token_id][:, 0].cpu().numpy())
+        keep = [sid for sid in self.subject_ids if sid not in bad]
+        return self.filter_subjects(keep)
+
+    # ----------------------------------------------------------------------
+    # DATA MERGING
+    # ----------------------------------------------------------------------
+
+    def merge_data(self):
+        """
+        Merge all domains into a single DataFrame-like tensor with explicit domain labels:
+        columns:
+            subject_id, age, token_id, domain_id
+        """
+        # TODO: document that domain_id is assigned by enumeration ordering
+        rows = []
+        for i, (dname, arr) in enumerate(self.domains.items()):
+            if len(arr) == 0:
+                continue
+            # TODO: Should domain_id be stable across runs? (hash(domain))
+            dom_col = torch.full((len(arr), 1), i, device=arr.device, dtype=torch.long)
+            rows.append(torch.cat([arr, dom_col], dim=1))
+        if not rows:
+            return torch.empty(0, 4)
+        
+        #TODO 
+        return torch.cat(rows, dim=0).long()
+
+    # ----------------------------------------------------------------------
+    # PIPE (batching!)
+    # ----------------------------------------------------------------------
+
+    def pipe(self, func, batch_size=None, device=None, *args, **kwargs):
+        """
+        Apply func(domains) to either:
+            - full set if batch_size=None
+            - batches of subjects otherwise
+        func receives a dict[str, Tensor] for each batch.
+        """
+        # TODO: func return type may vary — consider contract
+        # TODO: Should func get EventSetV2 object instead of dict?
+
+        if batch_size is None:
+            return func(self.domains, *args, **kwargs)
+
+        outputs = []
+        sids = self.subject_ids
+        n = len(sids)
+
+        for i in range(0, n, batch_size):
+            batch_sids = sids[i : i + batch_size]
+            sub = EventSetV2(self._subset_by_subjects(batch_sids))
+
+            if device:
+                # TODO: verify device exists (cpu/cuda)
+                sub_dev = {
+                    d: arr.to(device) for d, arr in sub.domains.items()
+                }
+                out = func(sub_dev, *args, **kwargs)
+            else:
+                out = func(sub.domains, *args, **kwargs)
+
+            outputs.append(out)
+
+        # Try concat
+        if all(isinstance(o, torch.Tensor) for o in outputs):
+            try:
+                return torch.cat(outputs, dim=0)
+            except Exception:
+                # TODO: inconsistent shapes → return list?
+                return outputs
+
+        if all(isinstance(o, np.ndarray) for o in outputs):
+            try:
+                return np.concatenate(outputs, axis=0)
+            except Exception:
+                return outputs
+
+        return outputs
+
+    # ----------------------------------------------------------------------
+    # INSERTION (subject-wise)
+    # ----------------------------------------------------------------------
+
+    def insert_tokens(self, domain: str, tokens, ages, inplace=False):
+        """
+        Insert events into one domain. tokens/ages follow the same broadcasting rules
+        as your previous implementation.
+        """
+
+        if domain not in self.domains:
+            raise ValueError(f"Domain '{domain}' not found.")
+
+        # TODO: Could support specifying new domain automatically
+        # TODO: Should tokens be validated for integers?
+
+        # Convert to numpy
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.cpu().numpy()
+        if isinstance(ages, torch.Tensor):
+            ages = ages.cpu().numpy()
+
+        # Convert ages to days if needed
+        # TODO: better heuristic for days / years
+        if np.nanmax(ages) < 300:
+            ages_days = np.array(ages) * 365.25
+        else:
+            ages_days = np.array(ages, dtype=float)
+
+        arr = self.domains[domain].cpu().numpy()
+        out_rows = []
+
+        # TODO: performance: loop over subjects instead of events is fine, but for large datasets?
+        for sid in self.subject_ids:
+            mask = arr[:, 0] == sid
+            subj_tok = arr[mask][:, 2]
+            subj_age = arr[mask][:, 1]
+
+            tok_i, age_i = self._broadcast_insert(tokens, ages_days, sid)
+
+            # Append + sort
+            new_tok = np.concatenate([subj_tok, np.atleast_1d(tok_i)])
+            new_age = np.concatenate([subj_age, np.atleast_1d(age_i)])
+            # TODO: age ties? deterministic order?
+            order = np.argsort(new_age)
+
+            new_tok = new_tok[order]
+            new_age = new_age[order]
+            new_sid = np.full_like(new_tok, fill_value=sid)
+
+            out_rows.append(
+                np.stack([new_sid, new_age, new_tok], axis=1)
+            )
+
+        # TODO: dtype inference might be inconsistent if ages float32 vs float64
+        new_arr = torch.tensor(np.concatenate(out_rows), dtype=self.domains[domain].dtype)
+
+        if inplace:
+            self.domains[domain] = new_arr
+            self._update_subject_ids()
+            return self
+
+        new = deepcopy(self)
+        new.domains[domain] = new_arr
+        new._update_subject_ids()
+        return new
+
+    def _broadcast_insert(self, tokens, ages, sid):
+        """Internal helper replicating previous broadcast rules."""
+        # TODO: sid indexing assumes tokens/ages are indexed by subject order
+        # TODO: better error messages for shape mismatch
+
+        if np.ndim(tokens) == 0 and np.ndim(ages) == 0:
+            return tokens, ages
+        if np.ndim(tokens) == 0 and np.ndim(ages) == 1:
+            return tokens, ages[sid]  # TODO: sid may not index ages array literally
+        if np.ndim(tokens) == 1 and np.ndim(ages) == 1:
+            return tokens[sid], ages[sid]
+        if np.ndim(tokens) == 2 and np.ndim(ages) == 2:
+            return tokens[sid], ages[sid]
+        raise ValueError("Incompatible token/age shapes")
+
+    # ----------------------------------------------------------------------
+    # UTILS
+    # ----------------------------------------------------------------------
+
+    def summary(self):
+        print("EventSetV2 Summary:")
+        print(f"  Domains: {list(self.domains.keys())}")
+        print(f"  Subjects: {len(self.subject_ids)}")
+        for d, arr in self.domains.items():
+            print(f"    {d}: {len(arr)} events")
+            # TODO: maybe show min/max age or token distribution
+
+    def __len__(self):
+        return len(self.subject_ids)
+    
+
+    def compute_max_ages(self):
+        """
+        Compute max age per subject across ALL domains.
+        Stores result as self.meta['max_age_per_subject'].
+        Returns a NEW EventSet (pipeable).
+        """
+    
+        # recolectar todos los ages y subject_ids
+        ages_all = []
+        sids_all = []
+    
+        for dname, arr in self.domains.items():
+            if arr.numel() == 0:
+                continue
+            sids_all.append(arr[:, 0].cpu().numpy())
+            ages_all.append(arr[:, 1].cpu().numpy())
+    
+        sids = np.concatenate(sids_all)
+        ages = np.concatenate(ages_all)
+    
+        # max age per subject
+        df = pd.DataFrame({"sid": sids, "age": ages})
+        max_age = df.groupby("sid")["age"].max().to_dict()
+    
+        new = deepcopy(self)
+        new.meta["max_age_per_subject"] = max_age
+        return new
+    
+
+    def insert_no_event_tokens(self, rate=5, domain="padding"):
+        """
+        Insert synthetic 'no-event' tokens up to max_age_per_subject.
+        Requires compute_max_ages() to have been called.
+        Returns new EventSet.
+        """
+    
+        if "max_age_per_subject" not in self.meta:
+            raise ValueError("Call compute_max_ages() before insert_no_event_tokens().")
+    
+        max_age = self.meta["max_age_per_subject"]
+    
+        if domain not in self.domains:
+            raise ValueError(f"Domain '{domain}' not found.")
+    
+        arr = self.domains[domain].cpu().numpy()
+        out = []
+    
+        for sid in self.subject_ids:
+            m = max_age.get(int(sid), None)
+            if m is None or m <= 0:
+                continue
+    
+            # generate evenly spaced ages
+            pad_ages = np.arange(0, m, rate * 365.25)
+            pad_tokens = np.zeros_like(pad_ages, dtype=int)  # token_id = 0
+    
+            # existing
+            mask = arr[:, 0] == sid
+            tok = arr[mask][:, 2]
+            age = arr[mask][:, 1]
+    
+            # merge
+            new_tok = np.concatenate([tok, pad_tokens])
+            new_age = np.concatenate([age, pad_ages])
+            order = np.argsort(new_age)
+    
+            out.append(
+                np.stack([np.full_like(new_tok, sid), new_age[order], new_tok[order]], axis=1)
+            )
+    
+        new = deepcopy(self)
+        new.domains[domain] = torch.tensor(np.concatenate(out), dtype=self.domains[domain].dtype)
+        return new
+    
+    def mask_tokens_after_max_age(self):
+        """
+        Remove events that occur AFTER the max age of each subject.
+        Uses meta['max_age_per_subject'] computed earlier.
+        """
+    
+        if "max_age_per_subject" not in self.meta:
+            raise ValueError("Call compute_max_ages() before mask_tokens_after_age().")
+    
+        max_age = self.meta["max_age_per_subject"]
+    
+        new = deepcopy(self)
+    
+        for dname, arr in self.domains.items():
+            arr_np = arr.cpu().numpy()
+            sids = arr_np[:, 0]
+            ages = arr_np[:, 1]
+    
+            keep = np.array([
+                ages[i] <= max_age.get(int(sids[i]), -1)
+                for i in range(len(arr_np))
+            ])
+    
+            new.domains[dname] = torch.tensor(arr_np[keep], dtype=arr.dtype)
+    
+        return new
+
+
+        # ─────────────────────────── Ajuste a seqlen ───────────────────────────
+
+    def adjust_to_seqlen(
+        self,
+        seqlen: int,
+        *,
+        pad_domain: str = "padding",
+        trim_domains: set[str] = frozenset({"diseases"}),
+        PADDING_TOKEN: int = 0,
+        PAD_AGE: float = -10000.0,
+        mode: str = "fast",   # "fast" o "slow"
+    ) -> "EventSet":
+        """
+        Garantiza que cada sujeto tenga EXACTAMENTE `seqlen` eventos en total,
+        contando todos los dominios excepto `pad_domain`.
+
+        - Si tiene más: se recortan los eventos más recientes (edad mayor) solo
+          en los dominios listados en `trim_domains`.
+        - Si tiene menos: se agregan eventos de padding en `pad_domain`.
+
+        `mode="fast"`: versión vectorizada.
+        `mode="slow"`: versión de referencia (más simple de leer / debugear).
+        """
+        if mode not in {"fast", "slow"}:
+            raise ValueError("mode must be 'fast' or 'slow'")
+
+        if mode == "fast":
+            new_domains = self._adjust_to_seqlen_fast(
+                seqlen,
+                pad_domain=pad_domain,
+                trim_domains=trim_domains,
+                PADDING_TOKEN=PADDING_TOKEN,
+                PAD_AGE=PAD_AGE,
+            )
+        else:
+            new_domains = self._adjust_to_seqlen_slow(
+                seqlen,
+                pad_domain=pad_domain,
+                trim_domains=trim_domains,
+                PADDING_TOKEN=PADDING_TOKEN,
+                PAD_AGE=PAD_AGE,
+            )
+
+        new = deepcopy(self)
+        new.domains = new_domains
+        new._update_subject_ids()
+        return new
+
+    # ------------------------------------------------------------------ #
+    #   Versión lenta / referencia (loops explícitos por sujeto)
+    # ------------------------------------------------------------------ #
+
+    def _adjust_to_seqlen_slow(
+        self,
+        seqlen: int,
+        *,
+        pad_domain: str,
+        trim_domains: set[str],
+        PADDING_TOKEN: int,
+        PAD_AGE: float,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Versión 'naive' / de referencia:
+        - recorre sujetos en Python,
+        - decide cuántos eventos borrar y cuáles (los más recientes),
+        - luego padcea igual que la rápida.
+
+        Útil para comparar resultados con la versión rápida.
+        """
+        from collections import defaultdict
+
+        device = next(iter(self.domains.values())).device
+        # dominios que cuentan para el total, excluyendo el de padding
+        count_domains = [d for d in self.domains.keys() if d != pad_domain]
+        trim_domains = [d for d in trim_domains if d in self.domains]
+
+        # total de eventos por sujeto (antes de truncar)
+        all_sids = torch.cat([self.domains[d][:, 0].long() for d in count_domains])
+        unique_sids, counts = torch.unique(all_sids, return_counts=True)
+        total_per_subject = {int(s.item()): int(c.item()) for s, c in zip(unique_sids, counts)}
+
+        # ── truncar: elegir qué borrar en trim_domains ──
+        to_drop_by_domain = defaultdict(list)
+        for sid, tot in total_per_subject.items():
+            diff = seqlen - tot
+            if diff >= 0:
+                continue
+            R = -diff  # cuántos eventos hay que bajar
+
+            candidates = []
+            for d in trim_domains:
+                arr = self.domains[d]
+                sids_d = arr[:, 0].long()
+                ages_d = arr[:, 1].float()
+                idx = (sids_d == sid).nonzero(as_tuple=True)[0]
+                for j in idx.tolist():
+                    candidates.append((float(ages_d[j].item()), d, j))
+
+            if not candidates:
+                continue
+
+            # ordenar por edad y sacar los más recientes
+            candidates.sort(key=lambda t: t[0])
+            drop = candidates[-min(R, len(candidates)):]
+            for _, d, j in drop:
+                to_drop_by_domain[d].append(j)
+
+        new_domains = dict(self.domains)
+        for d, lst in to_drop_by_domain.items():
+            if not lst:
+                continue
+            arr = self.domains[d]
+            mask = torch.ones(arr.shape[0], dtype=torch.bool, device=device)
+            mask[torch.tensor(sorted(set(lst)), device=device)] = False
+            new_domains[d] = arr[mask]
+
+        # ── recomputar totales tras truncar ──
+        all_sids2 = torch.cat([new_domains[d][:, 0].long() for d in count_domains])
+        unique_sids2, counts2 = torch.unique(all_sids2, return_counts=True)
+        total_per_subject2 = {int(s.item()): int(c.item()) for s, c in zip(unique_sids2, counts2)}
+
+        # ── pad ──
+        pad_rows = []
+        # usamos el primer dominio que cuenta para inferir dtypes
+        ref_dom = count_domains[0]
+        ref = new_domains[ref_dom]
+        sid_dtype = ref[:, 0].dtype
+        age_dtype = ref[:, 1].dtype
+        tok_dtype = ref[:, 2].dtype
+
+        for sid, tot in total_per_subject2.items():
+            diff = seqlen - tot
+            if diff <= 0:
+                continue
+            pad_sid = torch.full((diff,), sid, device=device, dtype=sid_dtype)
+            pad_age_col = torch.full((diff,), PAD_AGE, device=device, dtype=age_dtype)
+            pad_token_col = torch.full((diff,), PADDING_TOKEN, device=device, dtype=tok_dtype)
+            pad_rows.append(torch.stack([pad_sid, pad_age_col, pad_token_col], dim=1))
+
+        if pad_rows:
+            pad_rows = torch.cat(pad_rows, dim=0)
+            if pad_domain in new_domains:
+                new_domains[pad_domain] = torch.cat([new_domains[pad_domain], pad_rows], dim=0)
+            else:
+                new_domains[pad_domain] = pad_rows
+
+        return new_domains
+
+    # ------------------------------------------------------------------ #
+    #   Versión rápida / vectorizada
+    # ------------------------------------------------------------------ #
+
+    def _adjust_to_seqlen_fast(
+        self,
+        seqlen: int,
+        *,
+        pad_domain: str,
+        trim_domains: set[str],
+        PADDING_TOKEN: int,
+        PAD_AGE: float,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Versión vectorizada:
+        - cuenta tokens por sujeto con torch.unique,
+        - construye un gran array solo de dominios recortables (trim_domains),
+        - ordena por (subject_id, age) y decide en bloque qué eventos borrar,
+        - luego padcea en un solo shot usando repeat_interleave.
+        """
+        device = next(iter(self.domains.values())).device
+
+        # dominios que cuentan para el total, excluyendo padding
+        count_domains = [d for d in self.domains.keys() if d != pad_domain]
+        trim_domains = [d for d in trim_domains if d in self.domains]
+
+        # ── totales por sujeto (antes de truncar) ──
+        all_sids_count = torch.cat([self.domains[d][:, 0].long() for d in count_domains])
+        total_sids, total_counts = torch.unique(all_sids_count, return_counts=True)
+        total_counts = total_counts.to(torch.int64)
+
+        # ordenamos sujetos para poder usar searchsorted
+        total_sids_sorted, perm = torch.sort(total_sids)
+        total_counts_sorted = total_counts[perm]
+
+        # ── construir arrays globales para dominios recortables ──
+        if trim_domains:
+            trim_sids_list = []
+            trim_ages_list = []
+            trim_dom_ids_list = []
+            trim_idx_list = []
+
+            for dom_idx, d in enumerate(trim_domains):
+                t = self.domains[d]
+                n = t.shape[0]
+                trim_sids_list.append(t[:, 0].long())
+                trim_ages_list.append(t[:, 1].float())
+                trim_dom_ids_list.append(torch.full((n,), dom_idx, device=device, dtype=torch.long))
+                trim_idx_list.append(torch.arange(n, device=device, dtype=torch.long))
+
+            trim_sids = torch.cat(trim_sids_list)
+            trim_ages = torch.cat(trim_ages_list)
+            trim_dom_ids = torch.cat(trim_dom_ids_list)
+            trim_idx = torch.cat(trim_idx_list)
+
+            # sort por (subject_id, age) usando numpy.lexsort (más simple)
+            key = np.lexsort(
+                np.stack([trim_ages.cpu().numpy(), trim_sids.cpu().numpy()])
+            )
+            key = torch.from_numpy(key).to(device)
+
+            trim_sids_sorted = trim_sids[key]
+            trim_ages_sorted = trim_ages[key]          # noqa: F841  # (por si luego lo querés inspeccionar)
+            trim_dom_ids_sorted = trim_dom_ids[key]
+            trim_idx_sorted = trim_idx[key]
+
+            # sujetos presentes en dominios recortables + cuántos eventos tiene cada uno
+            trim_sids_unique, trim_counts = torch.unique_consecutive(
+                trim_sids_sorted, return_counts=True
+            )
+            num_trim_subj = trim_sids_unique.shape[0]
+
+            # alinear con total_sids_sorted para saber total de eventos por sujeto
+            pos = torch.searchsorted(total_sids_sorted, trim_sids_unique)
+            tot_for_trim = total_counts_sorted[pos]           # total (todos los dominios) de ese sujeto
+            diff = tot_for_trim.to(torch.int64) - seqlen      # >0 => hay que borrar
+            drop_needed = torch.clamp(diff, min=0)
+
+            # offsets por sujeto dentro del array global ordenado
+            offsets = torch.cumsum(trim_counts, dim=0) - trim_counts
+            subj_idx_per_event = torch.repeat_interleave(
+                torch.arange(num_trim_subj, device=device), trim_counts
+            )
+            offsets_per_event = offsets[subj_idx_per_event]
+            within_group = torch.arange(trim_sids_sorted.shape[0], device=device) - offsets_per_event
+
+            drop_per_subj = torch.minimum(drop_needed, trim_counts)
+            thresholds = (trim_counts - drop_per_subj)[subj_idx_per_event]
+
+            # True => este evento se borra
+            drop_mask_sorted = within_group >= thresholds
+
+            # mapear de vuelta a cada dominio
+            new_domains = dict(self.domains)
+            for di, d in enumerate(trim_domains):
+                t = self.domains[d]
+                mask_keep = torch.ones(t.shape[0], dtype=torch.bool, device=device)
+
+                sel = trim_dom_ids_sorted == di          # eventos en este dominio
+                idx_global = trim_idx_sorted[sel]        # índice local dentro de t
+                drop_local = drop_mask_sorted[sel]
+
+                mask_keep[idx_global[drop_local]] = False
+                new_domains[d] = t[mask_keep]
+        else:
+            # nada que recortar, solo paddear
+            new_domains = dict(self.domains)
+
+        # ── totales tras truncar ──
+        all_sids_after = torch.cat([new_domains[d][:, 0].long() for d in count_domains])
+        final_sids, final_counts = torch.unique(all_sids_after, return_counts=True)
+        final_sids_sorted, perm2 = torch.sort(final_sids)
+        final_counts_sorted = final_counts[perm2].to(torch.int64)
+
+        pad_needed = seqlen - final_counts_sorted
+        pad_needed = torch.clamp(pad_needed, min=0)
+
+        # ── construir filas de padding ──
+        if pad_needed.sum() > 0:
+            subj_ids_to_pad = final_sids_sorted[pad_needed > 0]
+            counts_to_pad = pad_needed[pad_needed > 0]
+
+            pad_sid = torch.repeat_interleave(subj_ids_to_pad, counts_to_pad).to(device)
+
+            # dtypes de referencia
+            ref_dom = count_domains[0]
+            ref = new_domains[ref_dom]
+            sid_dtype = ref[:, 0].dtype
+            age_dtype = ref[:, 1].dtype
+            tok_dtype = ref[:, 2].dtype
+
+            pad_sid_col = pad_sid.to(dtype=sid_dtype)
+            pad_age_col = torch.full(
+                (pad_sid.shape[0],),
+                PAD_AGE,
+                device=device,
+                dtype=age_dtype,
+            )
+            pad_token_col = torch.full(
+                (pad_sid.shape[0],),
+                PADDING_TOKEN,
+                device=device,
+                dtype=tok_dtype,
+            )
+
+            pad_rows = torch.stack([pad_sid_col, pad_age_col, pad_token_col], dim=1)
+
+            if pad_domain in new_domains:
+                new_domains[pad_domain] = torch.cat([new_domains[pad_domain], pad_rows], dim=0)
+            else:
+                new_domains[pad_domain] = pad_rows
+
+        return new_domains
+    
