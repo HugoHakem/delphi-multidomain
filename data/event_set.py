@@ -727,14 +727,46 @@ class EventSetV2:
         column 2 → token_id inside that domain
     """
 
-    def __init__(self, domains: dict[str, torch.Tensor]):
+    def __init__(
+        self,
+        domains: dict[str, torch.Tensor],
+        domain_to_int: dict[str, int] = None,
+        meta: dict = None,
+    ):
         """
-        domains: dict[str, torch.Tensor[N,3]]
+        domains: dict[str, torch.Tensor] 
+            Each tensor must be shape [N_events, 3] = [subject_id, age_days, token_id]
+    
+        domain_to_int: optional mapping {domain_name -> integer_id}.
+            If None, a stable mapping is generated automatically using sorted(domains.keys()).
+    
+        meta: optional metadata dict.
         """
-        # TODO: Validate shapes (must be Nx3)
-        # TODO: Validate dtype consistency (ages float, ids int)
+    
+        # --- Core structure (your original behavior) ---
         self.domains = {d: arr.clone() for d, arr in domains.items()}
-        self._update_subject_ids()
+        self.meta = meta or {}
+    
+        # Validate minimal structure
+        for dname, arr in self.domains.items():
+            # TODO: full validation of dtype/range if needed
+            if arr.ndim != 2 or arr.shape[1] != 3:
+                raise ValueError(f"Domain '{dname}' must be tensor [N,3], got {arr.shape}")
+    
+        # --- Establish subject_ids ---
+        self._update_subject_ids()   # same behavior as before
+    
+        # --- Domain ID mapping ---
+        if domain_to_int is None:
+            # stable deterministic mapping (important for reproducibility)
+            domain_names = sorted(self.domains.keys())
+            self.domain_to_int = {name: i for i, name in enumerate(domain_names)}
+        else:
+            self.domain_to_int = dict(domain_to_int)  # copy to avoid side-effects
+    
+        # inverse mapping
+        self.int_to_domain = {i: d for d, i in self.domain_to_int.items()}
+    
 
     # ----------------------------------------------------------------------
     # INTERNAL UTILITIES
@@ -809,25 +841,57 @@ class EventSetV2:
     # DATA MERGING
     # ----------------------------------------------------------------------
 
-    def merge_data(self):
+    def merge_data(self, as_dataframe=False):
         """
-        Merge all domains into a single DataFrame-like tensor with explicit domain labels:
-        columns:
-            subject_id, age, token_id, domain_id
+        Merge all domains into a single tensor or pandas DataFrame.
+    
+        Tensor form (default) returns:
+            [subject_id, age_days, token_id, domain_id]
+    
+        DataFrame form (as_dataframe=True) returns:
+            subject_id | age_days | token_id | domain | domain_id
+            padded events removed, sorted by (subject_id, age_days)
         """
-        # TODO: document that domain_id is assigned by enumeration ordering
+    
         rows = []
-        for i, (dname, arr) in enumerate(self.domains.items()):
-            if len(arr) == 0:
-                continue
-            # TODO: Should domain_id be stable across runs? (hash(domain))
-            dom_col = torch.full((len(arr), 1), i, device=arr.device, dtype=torch.long)
-            rows.append(torch.cat([arr, dom_col], dim=1))
-        if not rows:
-            return torch.empty(0, 4)
-        
-        #TODO 
-        return torch.cat(rows, dim=0).long()
+        for domain_name, arr in self.domains.items():
+            # arr shape = [N, 3]: sid, age_days, token_id
+            t = arr
+    
+            # Add domain_id column
+            dom_id = self.domain_to_int[domain_name]
+            dom_col = torch.full((t.shape[0], 1), dom_id, device=t.device, dtype=torch.int64)
+    
+            rows.append(torch.cat([t, dom_col], dim=1))
+    
+        merged = torch.cat(rows, dim=0)
+    
+        # If DataFrame is not requested → return the raw tensor
+        if not as_dataframe:
+            return merged
+    
+        # Otherwise build a clean dataframe
+        import pandas as pd
+    
+        df = pd.DataFrame({
+            "subject_id": merged[:, 0].cpu().numpy().astype(int),
+            "age_days":   merged[:, 1].cpu().numpy().astype(float),
+            "token_id":   merged[:, 2].cpu().numpy().astype(int),
+            "domain_id":  merged[:, 3].cpu().numpy().astype(int),
+        })
+    
+        # Map domain names
+        inv_domain_map = {v: k for k, v in self.domain_to_int.items()}
+        df["domain"] = df["domain_id"].map(inv_domain_map)
+    
+        # Remove padding (token_id == 0 or age_days <= 0)
+        df = df[(df.age_days > 0) & (df.token_id > 0)]
+    
+        # Sort for chronological access
+        df = df.sort_values(["subject_id", "age_days"], ignore_index=True)
+    
+        return df
+
 
     # ----------------------------------------------------------------------
     # PIPE (batching!)
@@ -1383,3 +1447,250 @@ class EventSetV2:
 
         return new_domains
     
+
+    def to_model_inputs(self, device=None):
+
+        """
+        Return (tokens, ages, subject_ids) dictionaries compatible with Delphi.forward().
+        Shapes: each is a dict[domain] -> 1D tensor of length (#events in that domain).
+        """
+    
+        tokens = {}
+        ages = {}
+        subject_ids = {}
+    
+        for dname, arr in self.domains.items():
+            # arr has shape (N_d, 3): [subject_id, age, token_id]
+            if arr.numel() == 0:
+                # empty domain → empty tensors matching expected dtype
+                tokens[dname]      = torch.empty(0, dtype=torch.long)
+                ages[dname]        = torch.empty(0, dtype=torch.float)
+                subject_ids[dname] = torch.empty(0, dtype=torch.long)
+                continue
+    
+            tokens[dname]      = arr[:, 2].long()
+            ages[dname]        = arr[:, 1].float()
+            subject_ids[dname] = arr[:, 0].long()
+    
+            if device is not None:
+                tokens[dname]      = tokens[dname].to(device)
+                ages[dname]        = ages[dname].to(device)
+                subject_ids[dname] = subject_ids[dname].to(device)
+    
+        return tokens, ages, subject_ids
+    
+    def get_case_control_masks(
+        self,
+        disease_domain: str,
+        disease_label: str,     # por ejemplo "I10"
+        min_age: float,
+        max_age: float,
+        sex_domain: str = "sex",
+        sex_label: str = None,
+    ):
+        """
+        Retorna máscaras de CASOS y CONTROLES para un dominio de enfermedades.
+        
+        CASO  = tokens cuyo siguiente token es la enfermedad de interés,
+                en el rango etario, y del sexo solicitado.
+        
+        CONTROL = sujetos que JAMÁS tuvieron la enfermedad,
+                  con tokens en el rango etario y del sexo solicitado.
+    
+        Retorna:
+          mask_cases      : boolean mask (N_events,)
+          mask_controls   : boolean mask (N_events,)
+          df              : dataframe mergeado usado para las máscaras
+        """
+    
+        # ——————————————————————————————————————
+        # 1. Convertir dataset a DF (solo 1 vez)
+        # ——————————————————————————————————————
+        df = self.merge_data()  # columnas: subject_id, age_days, token_id, domain_id, domain
+    
+        # ——————————————————————————————————————
+        # 2. Obtener tokenizer del dominio de enfermedad
+        # ——————————————————————————————————————
+        if not hasattr(self, "tokenizer"):
+            raise ValueError("EventSetV2 necesita self.tokenizer[domain] para mapear token labels.")
+    
+        tokmap = self.tokenizer[disease_domain]     # ej: {0:'I10', 1:'E11', ...}
+        inv_tokmap = {v: k for k, v in tokmap.items()}
+    
+        if disease_label not in inv_tokmap:
+            raise ValueError(f"La enfermedad '{disease_label}' no existe en tokenizer[{disease_domain}]")
+    
+        disease_token_id = inv_tokmap[disease_label]
+    
+        # ——————————————————————————————————————
+        # 3. Mascara base por dominio y edad
+        # ——————————————————————————————————————
+        mask_domain = (df["domain"] == disease_domain)
+        mask_age    = df["age_days"].between(min_age * 365.25, max_age * 365.25)
+    
+        # ——————————————————————————————————————
+        # 4. Filtrar sexo si corresponde
+        # ——————————————————————————————————————
+        if sex_label is not None:
+            sex_tokmap = self.tokenizer[sex_domain]
+            inv_sex = {v: k for k, v in sex_tokmap.items()}
+    
+            if sex_label not in inv_sex:
+                raise ValueError(f"Sexo '{sex_label}' no válido en tokenizer[{sex_domain}]")
+    
+            sex_token_id = inv_sex[sex_label]
+    
+            # sujetos cuyo token de sexo coincide
+            df_sex = df[df["domain"] == sex_domain]
+            valid_subjects = df_sex[df_sex["token_id"] == sex_token_id]["subject_id"].unique()
+    
+            mask_sex = df["subject_id"].isin(valid_subjects)
+        else:
+            mask_sex = True
+    
+        # ——————————————————————————————————————
+        # 5. CASOS: evento cuyo siguiente token == enfermedad
+        # ——————————————————————————————————————
+        df_sorted = df.sort_values(["subject_id", "age_days"]).reset_index(drop=True)
+    
+        # token siguiente dentro del mismo sujeto
+        df_sorted["next_token_id"] = df_sorted.groupby("subject_id")["token_id"].shift(-1)
+        df_sorted["next_domain"]   = df_sorted.groupby("subject_id")["domain"].shift(-1)
+    
+        mask_case_core = (
+            (df_sorted["next_token_id"] == disease_token_id) &
+            (df_sorted["next_domain"]   == disease_domain)
+        )
+    
+        mask_cases = (
+            mask_case_core &
+            df_sorted["age_days"].between(min_age * 365.25, max_age * 365.25) &
+            (df_sorted["subject_id"].isin(valid_subjects) if sex_label else True)
+        )
+    
+        # ——————————————————————————————————————
+        # 6. CONTROLES: sujetos sin la enfermedad + tokens válidos de ese rango
+        # ——————————————————————————————————————
+        # sujetos enfermos
+        sick_subjects = df_sorted[
+            (df_sorted["domain"] == disease_domain) &
+            (df_sorted["token_id"] == disease_token_id)
+        ]["subject_id"].unique()
+    
+        # sujetos válidos por sexo
+        if sex_label:
+            cand_subjects = valid_subjects
+        else:
+            cand_subjects = df_sorted["subject_id"].unique()
+    
+        # sujetos que jamás tuvieron esa enfermedad
+        control_subjects = np.setdiff1d(cand_subjects, sick_subjects)
+    
+        mask_controls = (
+            df_sorted["subject_id"].isin(control_subjects) &
+            df_sorted["age_days"].between(min_age * 365.25, max_age * 365.25)
+        )
+    
+        return mask_cases.to_numpy(), mask_controls.to_numpy(), df_sorted
+
+
+    def case_control_masks(
+        es, 
+        disease_id: int,
+        sex_token_id: int,
+        age_min: float,
+        age_max: float,
+        disease_domain="diseases",
+    ):
+        """
+        Returns:
+          case_mask:     boolean mask over merged dataframe rows  
+          control_mask:  boolean mask over merged dataframe rows
+          df: merged dataframe (cached)
+        """
+    
+        df = es.merge_data(as_dataframe=True)
+    
+        # ─────────────────────────────────────
+        # SEX FILTER
+        # ─────────────────────────────────────
+        # sujetos cuyo sexo == sex_token_id
+        # asumo que el dominio "sex" tiene UN solo token por sujeto en df
+        subject_sex = (
+            df[df.domain == "sex"]
+            .groupby("subject_id")["token_id"]
+            .first()
+        )
+    
+        allowed_subjects = subject_sex[subject_sex == sex_token_id].index
+    
+        df = df[df.subject_id.isin(allowed_subjects)]
+    
+        # ─────────────────────────────────────
+        # AGE FILTER
+        # ─────────────────────────────────────
+        df_in_age = df[
+            (df.age_days >= age_min * 365.25) &
+            (df.age_days <  age_max * 365.25)
+        ]
+    
+        # ─────────────────────────────────────
+        # FIND FIRST DIAGNOSIS PER SUBJECT
+        # ─────────────────────────────────────
+        disease_df = df[df.domain == disease_domain]
+    
+        # primer diagnóstico por sujeto
+        first_diag = (
+            disease_df[disease_df.token_id == disease_id]
+            .groupby("subject_id")["age_days"]
+            .min()
+        )
+    
+        subjects_with_disease = set(first_diag.index)
+        subjects_without_disease = set(df.subject_id.unique()) - subjects_with_disease
+    
+        # ─────────────────────────────────────
+        # CASE MASK
+        # ─────────────────────────────────────
+        # evento inmediatamente anterior al diagnóstico
+        def is_case_row(row):
+            sid = row.subject_id
+            if sid not in subjects_with_disease:
+                return False
+            diag_age = first_diag[sid]
+            return (
+                row.domain == disease_domain and
+                row.age_days < diag_age and
+                (diag_age - row.age_days) == (row.age_next_gap if "age_next_gap" in df.columns else min(df.age_days[df.subject_id==sid] - row.age_days[df.domain==disease_domain and df.age_days > row.age_days]))
+            )
+    
+        # Mejor versión: calculado vectorizado
+        df_d = df[df.domain == disease_domain].copy()
+    
+        # para cada sujeto: ordeno por edad y encuentro el anterior al diagnóstico
+        df_d["is_case"] = False
+        for sid, g in df_d.groupby("subject_id"):
+            if sid not in subjects_with_disease:
+                continue
+            diag_age = first_diag[sid]
+            # tokens previos al diagnóstico
+            prev = g[g.age_days < diag_age]
+            if len(prev) == 0:
+                continue
+            # el último antes del diag
+            idx = prev.age_days.idxmax()
+            df_d.loc[idx, "is_case"] = True
+    
+        case_mask = df_in_age.index.isin(df_d[df_d.is_case].index)
+    
+        # ─────────────────────────────────────
+        # CONTROL MASK  — one token per subject
+        # ─────────────────────────────────────
+        df_ctrl = df_in_age[df_in_age.subject_id.isin(subjects_without_disease)]
+        df_ctrl = df_ctrl[df_ctrl.domain == disease_domain]
+    
+        # sample one per subject
+        ctrl_idx = df_ctrl.groupby("subject_id").sample(n=1, random_state=1337).index
+        control_mask = df_in_age.index.isin(ctrl_idx)
+    
+        return case_mask, control_mask, df_in_age
