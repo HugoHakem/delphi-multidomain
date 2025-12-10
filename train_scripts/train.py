@@ -503,11 +503,13 @@ class Trainer():
         f_domains    = target_domains[predict_mask]
         local_ids    = targets[predict_mask]
         
+        # import ipdb; ipdb.set_trace()
         offsets_per_domain = self.get_offset_per_domain(model, domains_of_interest=self.predicted_domains)
         
         offsets = offsets_per_domain[f_domains]
         global_ids = offsets + local_ids
 
+        # import ipdb; ipdb.set_trace()
         loss_ce = model.cross_entropy_loss(f_logits, global_ids)
 
         age_diff = (target_ages - input_ages)[predict_mask]
@@ -951,12 +953,13 @@ def get_cli_args():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
-    parser.add_argument("--n_layer",          default=12,  type=int)
-    parser.add_argument("--n_head",           default=10,  type=int)
-    parser.add_argument("--n_embd",           default=120, type=int)
-    parser.add_argument("--test_fold",        default=1,   type=int)
-    parser.add_argument("--domains",          default="diseases,death,lifestyle,hla_alleles,sex,padding")
-    parser.add_argument("--experiment_name",  default="attention_schemes")
+    parser.add_argument("--n_layer",          default=12,   type=int)
+    parser.add_argument("--n_head",           default=10,   type=int)
+    parser.add_argument("--n_embd",           default=120,  type=int)
+    parser.add_argument("--test_fold",        default=1,    type=int)
+    parser.add_argument("--subjects",         default=None, type=str)
+    parser.add_argument("--domains",          default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
+    parser.add_argument("--experiment_name",  default="drugs-predicted")
     parser.add_argument("--run_name",         default=None)
     parser.add_argument("--batch_size",       default=16, type=int)
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
@@ -999,6 +1002,8 @@ if __name__ == "__main__":
     # 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
       'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
       'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
+      'cv_drugs':    EmbedConfig(projector="embed", path=tokens_path / 'cv_drugs',    predict=True),
+      'ns_drugs':    EmbedConfig(projector="embed", path=tokens_path / 'ns_drugs',    predict=True),
       'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
       "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
       "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
@@ -1015,7 +1020,13 @@ if __name__ == "__main__":
     
     train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
     
-    dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[])
+    if args.subjects is not None:
+        subject_ids = pd.read_csv(args.subjects, header=None)[0].tolist()
+        train_ids   = list(set(train_ids) & set(subject_ids))
+        val_ids     = list(set(val_ids) & set(subject_ids))
+        test_ids    = list(set(test_ids) & set(subject_ids))
+
+    dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[], required_domains=["diseases"])
     
     train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
     valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
