@@ -480,8 +480,14 @@ class Trainer():
 
         model = self.model
 
-        x, ages, subject_ids = trainer.get_tensors_from_batch(batch)
+        # events = EventSet.from_batch(batch)
+        # events = events.\
+        #  compute_max_ages().\
+        #  insert_no_event_tokens(rate=5).\
+        #  mask_tokens_after_age().\
+        #  adjust_to_seqlen(96)
 
+        x, ages, subject_ids = trainer.get_tensors_from_batch(batch)
         max_ages             = model.get_max_ages_per_subject(ages, subject_ids)
         x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
         x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
