@@ -816,6 +816,8 @@ df_auc_unpooled.to_csv("auc_unpooled.csv")
 df_auc_merged.to_csv("auc_merged.csv")
 '''
 
+# %%
+
 root_path = Path("./data/transforms")
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -934,20 +936,16 @@ def infer_delphi_config_from_state_dict(sd):
 # %%
 # ————————————————————————————————————————————————————————————————————————————————————————————————
 
-MLFLOW_URI = Path("/home/bonazzola/repos/delphi/train_scripts/mlruns")
+MLFLOW_URI = Path("/home/rodrigo/repos/delphi/train_scripts/mlruns")
 mlflow.set_tracking_uri(MLFLOW_URI)
 experiment_id = "276216673358193607"
+runid = "10a09e55a89d440298155eb74a1cc6b1"
 
 ckpt_path = get_last_epoch_checkpoint(MLFLOW_URI / experiment_id / runid)
 print(ckpt_path[0])
-weights = torch.load(ckpt_path[0])['state_dict']
-
-
-runid = "10a09e55a89d440298155eb74a1cc6b1"
+weights = torch.load(ckpt_path[0], map_location=torch.device('cpu'))['state_dict']
 run = mlflow.get_run(runid)
 params = run.data.params
-
-# 1. Extract attention scheme
 attention_scheme = params.get("attention_scheme")
 
 config = infer_delphi_config_from_state_dict(weights)
@@ -981,31 +979,35 @@ config = DelphiConfig(
     domains=domain_cfg, 
     attention_scheme=attention_scheme
 )    
-# %%
 
 new_model = Delphi(config)
-new_model.to("cuda")
+new_model.to("cpu")
 
 # %% 
 importlib.reload(data.event_set)
 EventSetV2 = data.event_set.EventSetV2
 
-dataset    = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=train_ids).to('cuda')
+dataset    = DelphiDataset(domains=domain_cfg, root="./data/transforms", subjects=train_ids).to('cpu')
 dataloader =  DelphiDataloader(dataset, batch_size=128)
+
+case_logits_lst = []
+ctrl_logits_lst = []
 
 for i, batch in enumerate(dataloader):
     print(i)
-    if i == 10:
+    if i == 100:
         break
     
     # pipe(lambda es: es.insert_no_event_tokens(...)).\
-    es = EventSetV2(batch).adjust_to_seqlen(
-            seqlen=128,
-            pad_domain="padding",
-            trim_domains={"diseases"},
-            PADDING_TOKEN=0,
-            PAD_AGE=-10000.0,
-            mode="fast"
+    es = EventSetV2(batch).\
+            insert_no_event_tokens(rate=5).\
+            adjust_to_seqlen(
+                seqlen=128,
+                pad_domain="padding",
+                trim_domains={"diseases"},
+                PADDING_TOKEN=0,
+                PAD_AGE=-10000.0,
+                mode="fast"
         )
 
     tokens, ages, subject_ids = es.to_model_inputs()
@@ -1013,63 +1015,44 @@ for i, batch in enumerate(dataloader):
     logits, _ = new_model(tokens, ages, subject_ids)
     disease_logits = logits['diseases']
 
-es_df = es.merge_data(as_dataframe=True)
+    a = es.get_case_indices(disease_token_id=DISEASE_ID, min_age=0, max_age=75, sex_token_id=1)[0]
+    b = es.get_control_indices(disease_token_id=DISEASE_ID, min_age=0, max_age=75, sex_token_id=1)[0]
+
+    a = np.array([ [x, y%128] for x, y in a ])
+    b = np.array([ [x, y%128] for x, y in b ])
+
+    # a, b, c = es.get_case_control_indices(disease_token_id=DISEASE_ID, min_age=0, max_age=75, sex_token_id=1)
+    
+    case_subject_indices = a[:,0]
+    case_token_indices   = a[:,1]
+    ctrl_subject_indices = b[:,0]
+    ctrl_token_indices   = b[:,1]
+# 
+    case_logits = disease_logits[case_subject_indices, case_token_indices, DISEASE_ID]
+    ctrl_logits = disease_logits[ctrl_subject_indices, ctrl_token_indices, DISEASE_ID]
+# 
+    case_logits_lst.append(case_logits)
+    ctrl_logits_lst.append(ctrl_logits)
 
 # %%
-DISEASE_ID = 486
-es_df.set_index("subject_id").loc[[subject_id for subject_id, gg in es_df.groupby("subject_id") if DISEASE_ID in set(gg.token_id)]]
+case_logits = torch.concat(case_logits_lst)
+ctrl_logits = torch.concat(ctrl_logits_lst)
 
+import matplotlib.pyplot as plt
+plt.hist(case_logits, alpha=0.4)
+plt.hist(ctrl_logits, alpha=0.4)
 # %%
-# case_subject_idx, case_token_idx, ctrl_subject_idx, ctrl_token_idx, d = 
-
-a, b, c = es.get_case_control_indices(disease_token_id=486, min_age=0, max_age=90, sex_token_id=0)
-[ [x, y % 128] for x, y in a ]
-[ [x, y % 128] for x, y in b ]
-
+ctrl_logits.std()
 # %%
-df = es.merge_data(as_dataframe=True)
-
+case_logits.std()
 # %%
-print("domain_to_int:", es.domain_to_int)
-print("df domain_id unique:", df.domain_id.unique())
-print("df domain unique:", df.domain.unique())
-print("min age:", df.age_days.min(), "max age:", df.age_days.max())
-print(df.head())
+import numpy as np
+from scipy.stats import mannwhitneyu
 
-# %%
-print(es.domain_to_int)
+a = np.array([...])  # grupo 1
+b = np.array([...])  # grupo 2
 
-df = es.merge_data(as_dataframe=True)
-print(df["domain"].value_counts())
-print(df["domain_id"].unique())
-
-d_dom = df[df["domain_id"] == es.domain_to_int["diseases"]]
-print("Total disease events:", len(d_dom))
-print("Token present?:", (d_dom["token_id"] == 486).any())
-print(d_dom[d_dom["token_id"] == 486].head())
-
-sex_dom = es.domain_to_int["sex"]
-df_sex = df[df["domain_id"] == sex_dom]
-print(df_sex["token_id"].unique()[:20])
-print("Subjects with sex=1:", 
-      df_sex[df_sex["token_id"] == 1]["subject_id"].nunique())
-
-age_min = 30 * 365.25
-age_max = 60 * 365.25
-print("Min age in diseases:", d_dom["age_days"].min())
-print("Max age in diseases:", d_dom["age_days"].max())
-
-print("Any inside age range?", d_dom["age_days"].between(age_min, age_max).any())
-
-
-d_dom_sorted = d_dom.sort_values(["subject_id", "age_days"]).reset_index(drop=True)
-d_dom_sorted["prev_age"] = d_dom_sorted.groupby("subject_id")["age_days"].shift(+1)
-
-mask = (
-    (d_dom_sorted["token_id"] == 486) &
-    (d_dom_sorted["prev_age"].between(age_min, age_max))
-)
-
-print("Number of case events:", mask.sum())
+stat, p = mannwhitneyu(case_logits.numpy(), ctrl_logits.numpy(), alternative="two-sided")
+print(stat, p)
 
 # %%

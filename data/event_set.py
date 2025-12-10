@@ -883,7 +883,6 @@ class EventSetV2:
     
         rows = []
         for domain_name, arr in self.domains.items():
-            print(domain_name)
             # arr shape = [N, 3]: sid, age_days, token_id
             t = arr
     
@@ -1102,14 +1101,15 @@ class EventSetV2:
     
 
     def insert_no_event_tokens(self, rate=5, domain="padding"):
+
         """
-        Insert synthetic 'no-event' tokens up to max_age_per_subject.
-        Requires compute_max_ages() to have been called.
-        Returns new EventSet.
+        Insert synthetic no-event tokens every `rate` years, per subject.
+        Automatically computes max ages if missing.
         """
     
+        # auto-compute if needed
         if "max_age_per_subject" not in self.meta:
-            raise ValueError("Call compute_max_ages() before insert_no_event_tokens().")
+            self = self.compute_max_ages()
     
         max_age = self.meta["max_age_per_subject"]
     
@@ -1120,58 +1120,59 @@ class EventSetV2:
         out = []
     
         for sid in self.subject_ids:
-            m = max_age.get(int(sid), None)
+            sid_int = int(sid)
+            m = max_age.get(sid_int, None)
             if m is None or m <= 0:
                 continue
     
-            # generate evenly spaced ages
+            # generate no-event tokens from age_days = 0 up to max real age
             pad_ages = np.arange(0, m, rate * 365.25)
-            pad_tokens = np.zeros_like(pad_ages, dtype=int)  # token_id = 0
+            pad_tokens = np.zeros_like(pad_ages, dtype=int)
     
-            # existing
-            mask = arr[:, 0] == sid
+            # existing padding events
+            mask = arr[:, 0] == sid_int
             tok = arr[mask][:, 2]
             age = arr[mask][:, 1]
     
-            # merge
             new_tok = np.concatenate([tok, pad_tokens])
             new_age = np.concatenate([age, pad_ages])
             order = np.argsort(new_age)
     
             out.append(
-                np.stack([np.full_like(new_tok, sid), new_age[order], new_tok[order]], axis=1)
+                np.stack([np.full_like(new_tok, sid_int), new_age[order], new_tok[order]], axis=1)
             )
     
         new = deepcopy(self)
         new.domains[domain] = torch.tensor(np.concatenate(out), dtype=self.domains[domain].dtype)
         return new
+
     
-    def mask_tokens_after_max_age(self):
-        """
-        Remove events that occur AFTER the max age of each subject.
-        Uses meta['max_age_per_subject'] computed earlier.
-        """
-    
-        if "max_age_per_subject" not in self.meta:
-            raise ValueError("Call compute_max_ages() before mask_tokens_after_age().")
-    
-        max_age = self.meta["max_age_per_subject"]
-    
-        new = deepcopy(self)
-    
-        for dname, arr in self.domains.items():
-            arr_np = arr.cpu().numpy()
-            sids = arr_np[:, 0]
-            ages = arr_np[:, 1]
-    
-            keep = np.array([
-                ages[i] <= max_age.get(int(sids[i]), -1)
-                for i in range(len(arr_np))
-            ])
-    
-            new.domains[dname] = torch.tensor(arr_np[keep], dtype=arr.dtype)
-    
-        return new
+    # def mask_tokens_after_max_age(self):
+    #     """
+    #     Remove events that occur AFTER the max age of each subject.
+    #     Uses meta['max_age_per_subject'] computed earlier.
+    #     """
+    # 
+    #     if "max_age_per_subject" not in self.meta:
+    #         raise ValueError("Call compute_max_ages() before mask_tokens_after_age().")
+    # 
+    #     max_age = self.meta["max_age_per_subject"]
+    # 
+    #     new = deepcopy(self)
+    # 
+    #     for dname, arr in self.domains.items():
+    #         arr_np = arr.cpu().numpy()
+    #         sids = arr_np[:, 0]
+    #         ages = arr_np[:, 1]
+    # 
+    #         keep = np.array([
+    #             ages[i] <= max_age.get(int(sids[i]), -1)
+    #             for i in range(len(arr_np))
+    #         ])
+    # 
+    #         new.domains[dname] = torch.tensor(arr_np[keep], dtype=arr.dtype)
+    # 
+    #     return new
 
 
         # ─────────────────────────── Ajuste a seqlen ───────────────────────────
@@ -1220,6 +1221,7 @@ class EventSetV2:
         new = deepcopy(self)
         new.domains = new_domains
         new._update_subject_ids()
+        new._build_index_maps()
         return new
 
     # ------------------------------------------------------------------ #
@@ -1345,7 +1347,7 @@ class EventSetV2:
         device = next(iter(self.domains.values())).device
 
         # dominios que cuentan para el total, excluyendo padding
-        count_domains = [d for d in self.domains.keys() if d != pad_domain]
+        count_domains = [d for d in self.domains.keys() ] # if d != pad_domain]
         trim_domains = [d for d in trim_domains if d in self.domains]
 
         # ── totales por sujeto (antes de truncar) ──
@@ -1507,7 +1509,116 @@ class EventSetV2:
                 subject_ids[dname] = subject_ids[dname].to(device)
     
         return tokens, ages, subject_ids
+
+    def get_case_indices(
+        self,
+        disease_token_id: int,
+        min_age: float,
+        max_age: float,
+        sex_token_id: int = None,
+    ):
+        df = self.merge_data(as_dataframe=True)
     
+        dom_disease = self.domain_to_int["diseases"]
+        dom_sex     = self.domain_to_int["sex"]
+    
+        df = df.sort_values(["subject_idx","seq_idx"]).reset_index(drop=True)
+    
+        # --- Sex filtering ---
+        if sex_token_id is not None:
+            valid_sj = df[
+                (df["domain_id"] == dom_sex) &
+                (df["token_id"] == sex_token_id)
+            ]["subject_id"].unique()
+            df = df[df["subject_id"].isin(valid_sj)]
+    
+        # --- Focus on disease domain for identifying cases ---
+        d = df[df["domain_id"] == dom_disease].copy()
+        d = d.sort_values(["subject_idx","seq_idx"]).reset_index(drop=True)
+    
+        # Previous event info
+        d["prev_age"]     = d.groupby("subject_idx")["age_days"].shift(+1)
+        d["prev_seq_idx"] = d.groupby("subject_idx")["seq_idx"].shift(+1)
+        d["prev_token"]   = d.groupby("subject_idx")["token_id"].shift(+1)
+    
+        # Age window in days
+        age_min = min_age * 365.25
+        age_max = max_age * 365.25
+    
+        # CASE = the disease token whose PREVIOUS event is inside the age range
+        mask_case = (
+            (d["token_id"] == disease_token_id) &
+            (d["prev_age"].between(age_min, age_max))
+        )
+    
+        case_df = d[mask_case][["subject_idx","prev_seq_idx"]].dropna()
+    
+        # rename to standard output format
+        case_df = case_df.rename(columns={"prev_seq_idx": "seq_idx"})
+    
+        case_rows = case_df.to_numpy()
+    
+        return case_rows, df
+
+
+    def get_control_indices(
+        self,
+        disease_token_id: int,
+        min_age: float,
+        max_age: float,
+        sex_token_id: int = None,
+    ):
+        df = self.merge_data(as_dataframe=True)
+    
+        dom_disease = self.domain_to_int["diseases"]
+        dom_sex     = self.domain_to_int["sex"]
+    
+        df = df.sort_values(["subject_idx","seq_idx"]).reset_index(drop=True)
+    
+        # --- Sex filtering ---
+        if sex_token_id is not None:
+            valid_sj = df[
+                (df["domain_id"] == dom_sex) &
+                (df["token_id"] == sex_token_id)
+            ]["subject_id"].unique()
+            df = df[df["subject_id"].isin(valid_sj)]
+    
+        # --- Subjects who EVER got the disease ---
+        diseased_subjects = df[
+            (df["domain_id"] == dom_disease) &
+            (df["token_id"] == disease_token_id)
+        ]["subject_id"].unique()
+    
+        # --- Eligible controls ---
+        control_subjects = np.setdiff1d(
+            df["subject_id"].unique(),
+            diseased_subjects
+        )
+    
+        # Age limits
+        age_min = min_age * 365.25
+        age_max = max_age * 365.25
+    
+        # --- Candidate control tokens: any disease-domain event in age range ---
+        df_controls = df[
+            (df["domain_id"] == dom_disease) &
+            (df["subject_id"].isin(control_subjects)) &
+            (df["age_days"].between(age_min, age_max))
+        ][["subject_idx", "seq_idx", "subject_id"]]
+    
+        # Must sample exactly 1 token per subject
+        if df_controls.empty:
+            return np.zeros((0,2), dtype=int), df
+    
+        control_df = df_controls.groupby("subject_id", group_keys=False).apply(
+            lambda g: g.sample(1)
+        )
+    
+        control_rows = control_df[["subject_idx","seq_idx"]].to_numpy()
+    
+        return control_rows, df
+
+    '''
     def get_case_control_indices(
         self,
         disease_token_id: int,
@@ -1565,7 +1676,7 @@ class EventSetV2:
         control_rows = df_controls[["subject_idx","seq_idx"]].to_numpy()
     
         return case_rows, control_rows, df
-
+    '''
 
     def _build_index_maps(self):
 
@@ -1596,104 +1707,3 @@ class EventSetV2:
             (int(r.subject_idx), float(r.age_days), int(r.token_id)) : int(i)
             for i, r in df.iterrows()
         }
-
-    def case_control_masks(
-        es, 
-        disease_id: int,
-        sex_token_id: int,
-        age_min: float,
-        age_max: float,
-        disease_domain="diseases",
-    ):
-        """
-        Returns:
-          case_mask:     boolean mask over merged dataframe rows  
-          control_mask:  boolean mask over merged dataframe rows
-          df: merged dataframe (cached)
-        """
-    
-        df = es.merge_data(as_dataframe=True)
-    
-        # ─────────────────────────────────────
-        # SEX FILTER
-        # ─────────────────────────────────────
-        # sujetos cuyo sexo == sex_token_id
-        # asumo que el dominio "sex" tiene UN solo token por sujeto en df
-        subject_sex = (
-            df[df.domain == "sex"]
-            .groupby("subject_id")["token_id"]
-            .first()
-        )
-    
-        allowed_subjects = subject_sex[subject_sex == sex_token_id].index
-    
-        df = df[df.subject_id.isin(allowed_subjects)]
-    
-        # ─────────────────────────────────────
-        # AGE FILTER
-        # ─────────────────────────────────────
-        df_in_age = df[
-            (df.age_days >= age_min * 365.25) &
-            (df.age_days <  age_max * 365.25)
-        ]
-    
-        # ─────────────────────────────────────
-        # FIND FIRST DIAGNOSIS PER SUBJECT
-        # ─────────────────────────────────────
-        disease_df = df[df.domain == disease_domain]
-    
-        # primer diagnóstico por sujeto
-        first_diag = (
-            disease_df[disease_df.token_id == disease_id]
-            .groupby("subject_id")["age_days"]
-            .min()
-        )
-    
-        subjects_with_disease = set(first_diag.index)
-        subjects_without_disease = set(df.subject_id.unique()) - subjects_with_disease
-    
-        # ─────────────────────────────────────
-        # CASE MASK
-        # ─────────────────────────────────────
-        # evento inmediatamente anterior al diagnóstico
-        def is_case_row(row):
-            sid = row.subject_id
-            if sid not in subjects_with_disease:
-                return False
-            diag_age = first_diag[sid]
-            return (
-                row.domain == disease_domain and
-                row.age_days < diag_age and
-                (diag_age - row.age_days) == (row.age_next_gap if "age_next_gap" in df.columns else min(df.age_days[df.subject_id==sid] - row.age_days[df.domain==disease_domain and df.age_days > row.age_days]))
-            )
-    
-        # Mejor versión: calculado vectorizado
-        df_d = df[df.domain == disease_domain].copy()
-    
-        # para cada sujeto: ordeno por edad y encuentro el anterior al diagnóstico
-        df_d["is_case"] = False
-        for sid, g in df_d.groupby("subject_id"):
-            if sid not in subjects_with_disease:
-                continue
-            diag_age = first_diag[sid]
-            # tokens previos al diagnóstico
-            prev = g[g.age_days < diag_age]
-            if len(prev) == 0:
-                continue
-            # el último antes del diag
-            idx = prev.age_days.idxmax()
-            df_d.loc[idx, "is_case"] = True
-    
-        case_mask = df_in_age.index.isin(df_d[df_d.is_case].index)
-    
-        # ─────────────────────────────────────
-        # CONTROL MASK  — one token per subject
-        # ─────────────────────────────────────
-        df_ctrl = df_in_age[df_in_age.subject_id.isin(subjects_without_disease)]
-        df_ctrl = df_ctrl[df_ctrl.domain == disease_domain]
-    
-        # sample one per subject
-        ctrl_idx = df_ctrl.groupby("subject_id").sample(n=1, random_state=1337).index
-        control_mask = df_in_age.index.isin(ctrl_idx)
-    
-        return case_mask, control_mask, df_in_age
