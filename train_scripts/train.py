@@ -1,10 +1,18 @@
 # %%
 import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from pathlib import Path
+
+DELPHI_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, DELPHI_DIR)
+DELPHI_DIR = Path(DELPHI_DIR)
+
 os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
 os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
-from pathlib import Path
+
+print(sys.path)
 root_path = Path("../data/transforms")
+
+MLFLOW_URI = os.getenv("MLFLOW_URI", DELPHI_DIR / "mlruns")
 
 import re
 import ast
@@ -1013,6 +1021,7 @@ if __name__ == "__main__":
       'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
       "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
       "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
+      "rare_variants":         EmbedConfig(projector="embed", path=tokens_path / 'rare_variants',         at_birth=True),
       "padding":     EmbedConfig(projector="embed")    
     }
     
