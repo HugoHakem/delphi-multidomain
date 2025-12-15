@@ -1,0 +1,31 @@
+hla_bidir:
+  description: HLA bidirectional with sex, rest causal
+  scheme: |
+    [hla_alleles,sex]:bidirectional,
+    [diseases,lifestyle,sex,hla_alleles,death]:causal(mask_ties=true)
+
+hla_causal:
+  description: causal, no attention within HLA.
+  scheme: |
+    [diseases,lifestyle,sex,hla_alleles,death]:causal(mask_ties=true)
+
+no_hla:
+  description: Clinical domains only, causal attention
+  scheme: |
+    [sex,diseases,death,lifestyle,death]:causal(mask_ties=true)
+
+ns_drugs:
+  description: Clinical domains and central nervous system drugs, causal attention
+  scheme: |
+    [sex,diseases,ns_drugs,lifestyle,death]:causal(mask_ties=true)
+
+cv_drugs:
+  description: Clinical domains and cardiovascular drugs , causal attention
+  scheme: |
+    [sex,diseases,cv_drugs,lifestyle,death]:causal(mask_ties=true)
+
+cvns_drugs:
+  description: Clinical domains and both CV and CNS drugs, causal attention
+  scheme: |
+    [sex,diseases,cv_drugs,ns_drugs,lifestyle,death]:causal(mask_ties=true)
+

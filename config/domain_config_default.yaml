@@ -1,0 +1,42 @@
+diseases:
+  projector: embed
+  path: diseases
+  predict: true
+
+death:
+  projector: embed
+  path: death
+  predict: true
+
+cv_drugs:
+  projector: embed
+  path: cv_drugs
+  predict: true
+
+ns_drugs:
+  projector: embed
+  path: ns_drugs
+  predict: true
+
+lifestyle:
+  projector: embed
+  path: lifestyle
+  age_jitter: true
+
+hla_alleles:
+  projector: embed
+  path: hla_alleles
+  at_birth: true
+
+sex:
+  projector: embed
+  path: sex
+  at_birth: true
+
+rare_variants:
+  projector: embed
+  path: rare_variants
+  at_birth: true
+
+padding:
+  projector: embed

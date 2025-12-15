@@ -1,6 +1,7 @@
 # %%
 import os, sys
 from pathlib import Path
+import yaml
 
 DELPHI_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, DELPHI_DIR)
@@ -9,10 +10,11 @@ DELPHI_DIR = Path(DELPHI_DIR)
 os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
 os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
 
-print(sys.path)
 root_path = Path("../data/transforms")
 
 MLFLOW_URI = os.getenv("MLFLOW_URI", DELPHI_DIR / "mlruns")
+
+ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "configs/attention_schemes.yaml").read_text() )
 
 import re
 import ast
@@ -121,37 +123,6 @@ def clone_run_to_new_experiment(
     return new_run_id
 
 
-# ————————————————————————————————————————————————————————————————————————————————————————————
-'''
-@dataclass
-class TrainBaseConfig:
-
-    ckpt_dir: str = "."
-    eval_interval: int = 2000
-    eval_iters: int = 200
-    eval_only: bool = False  # if True, script exits right after the first eval
-    init_from: str = "scratch"
-
-    seed: int = 42
-    gradient_accumulation_steps: int = 1  # used to simulate larger batch sizes
-
-    # if gradient_accumulation_steps > 1, this is the micro-batch size
-    batch_size: int = 128
-
-    # system
-    device: str = DEVICE
-    # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    dtype: str = "float32"
-    # 'bfloat16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-    compile: bool = False  # use PyTorch 2.0 to compile the model to be faster
-
-    train_data: dict = field(default_factory=dict)
-    val_data: dict = field(default_factory=dict)
-
-    model: dict = field(default_factory=dict)
-    optim: OptimConfig = field(default_factory=OptimConfig)
-    # log: TrainLogConfig = field(default_factory=TrainLogConfig)
-'''
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
 VAL_EVERY_NSAMPLES = 100000
@@ -503,7 +474,7 @@ class Trainer():
         
         logits, att = model(x, ages, subject_ids)
         
-        # This is necessary
+        # This is ugly but necessary at the moment
         domains        = model._trace['domains']
         targets        = model._trace['tokens'][:,1:]
         input_ages     = model._trace['ages'][:,:-1]
@@ -517,13 +488,11 @@ class Trainer():
         f_domains    = target_domains[predict_mask]
         local_ids    = targets[predict_mask]
         
-        # import ipdb; ipdb.set_trace()
         offsets_per_domain = self.get_offset_per_domain(model, domains_of_interest=self.predicted_domains)
         
         offsets = offsets_per_domain[f_domains]
         global_ids = offsets + local_ids
 
-        # import ipdb; ipdb.set_trace()
         loss_ce = model.cross_entropy_loss(f_logits, global_ids)
 
         age_diff = (target_ages - input_ages)[predict_mask]
@@ -924,16 +893,18 @@ def config_from_runid(runid):
     # ------------------------------------------------------------------------------------------------
     
     tracking_uri = Path(os.path.dirname(mlflow.get_tracking_uri()))
+
     ckpt_dir = tracking_uri / (artifact_uri + "/checkpoints")
-    print(ckpt_dir)
     ckpt_files = sorted(Path(ckpt_dir).glob("*.pt"))
     if not ckpt_files:
         raise FileNotFoundError(f"No checkpoints found for run {runid}")
     latest_ckpt = ckpt_files[-1]
+
     print(f"Loading latest checkpoint: {latest_ckpt}")
     delphi_cfg = DelphiConfig(**runinfo.data.params)
     model = Delphi(delphi_cfg).to(DEVICE)
     ckpt = torch.load(latest_ckpt)
+
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
     weights = ckpt['state_dict']
     model.load_state_dict(weights, strict=False)
@@ -944,6 +915,7 @@ def config_from_runid(runid):
         optimizer.load_state_dict(ckpt["optimizer_state"])
     if "scheduler_state" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state"])
+
     train_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['train_ids']).to("cuda")
     valid_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['valid_ids']).to("cuda")
     test_dataset  = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['test_ids']).to("cuda")
@@ -960,6 +932,19 @@ def config_from_runid(runid):
     return model, dataloaders, optimizer, scheduler, logged_params, previous_run_name
 
 
+def load_embed_config(cfg_path, tokens_path):
+
+    raw = yaml.safe_load(Path(cfg_path).read_text())
+
+    cfg = {}
+    for domain, params in raw.items():
+        p = dict(params)
+        if "path" in p:
+            p["path"] = tokens_path / p["path"]
+        cfg[domain] = EmbedConfig(**p)
+
+    return cfg
+
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
 def get_cli_args():
@@ -972,6 +957,7 @@ def get_cli_args():
     parser.add_argument("--n_embd",           default=120,  type=int)
     parser.add_argument("--test_fold",        default=1,    type=int)
     parser.add_argument("--subjects",         default=None, type=str)
+    parser.add_argument("--domain_config_yaml", default="config/domain_config_default.yaml")
     parser.add_argument("--domains",          default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
     parser.add_argument("--experiment_name",  default="drugs-predicted")
     parser.add_argument("--run_name",         default=None)
@@ -982,15 +968,14 @@ def get_cli_args():
     parser.add_argument("--dryrun", "--dry-run", "--dry_run", dest="dry_run", action="store_true", default=False)
 
     args = parser.parse_args()
-
     return args
 
 if __name__ == "__main__":    
     args =  get_cli_args()
     
 else:
-    args = EasyDict({
-        "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death, hla_alleles]:causal(mask_ties=True)"],
+    args = DEFAULT_ARGS = EasyDict({
+        "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,hla_alleles]:causal(mask_ties=True)"],
         "n_layer": 12,
         "test_fold": 3,
         "patience": 2,
@@ -999,58 +984,32 @@ else:
         "run_name": os.getenv("RUN_NAME", "default"),
     })
 
-if isinstance(args.attention_scheme, str):
-    args.attention_scheme = [args.attention_scheme]
+def parse_attention_scheme(attention_scheme, as_list=True):
+    if isinstance(args.attention_scheme, str):
+        if attention_scheme in SCHEMES.keys():
+            attention_scheme = SCHEMES[attention_scheme]["scheme"]
+        if as_list:
+            attention_scheme = [args.attention_scheme]
+        return attention_scheme
+    elif isinstance(attention_scheme, list):
+        return [parse_attention_scheme(scheme, as_list=False) for scheme in attention_scheme]
+
+args.attention_scheme = parse_attention_scheme(args.attention_scheme)
+
 
 # %%
-
 if __name__ == "__main__":
 
-  if not args.resume_run_id:
+  if (train_from_scratch := not args.resume_run_id):
 
-    ################################ FROM SCRATCH ################################
-
-    tokens_path = root_path / 'tokens'
-
-    default_cfg_per_domain = {
-    # 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
-      'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
-      'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
-      'cv_drugs':    EmbedConfig(projector="embed", path=tokens_path / 'cv_drugs',    predict=True),
-      'ns_drugs':    EmbedConfig(projector="embed", path=tokens_path / 'ns_drugs',    predict=True),
-      'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
-      "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
-      "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
-      "rare_variants":         EmbedConfig(projector="embed", path=tokens_path / 'rare_variants',         at_birth=True),
-      "padding":     EmbedConfig(projector="embed")    
-    }
-    
     domains = args.domains.split(",")
+
+    default_cfg_per_domain = load_embed_config(DELPHI_DIR / args.domain_config_yaml, root_path / 'tokens')
+
     # k, v with .items() doesn't work for some reason!
     domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in domains }
     
     assert all([k in default_cfg_per_domain for k in domains])
-    
-    # —————————————————————————————————————————————————————————————————————————————————————————————————————————
-    
-    train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
-    
-    if args.subjects is not None:
-        subject_ids = pd.read_csv(args.subjects, header=None)[0].tolist()
-        train_ids   = list(set(train_ids) & set(subject_ids))
-        val_ids     = list(set(val_ids) & set(subject_ids))
-        test_ids    = list(set(test_ids) & set(subject_ids))
-
-    dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[], required_domains=["diseases"])
-    
-    train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
-    valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
-    test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
-    
-    dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, 128, 128][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
-    
-    # —————————————————————————————————————————————————————————————————————————————————————————————————————————
-      
     assert len(args.attention_scheme) in {1, args.n_layer}, f"len of the --attention_scheme argument should be either 1 or args.n_layer (={args.n_layer})"
     
     if len(args.attention_scheme) == 1:
@@ -1058,23 +1017,19 @@ if __name__ == "__main__":
     elif args.n_layer == len(args.attention_scheme):
         attention_scheme = args.attention_scheme
     
-    config = DelphiConfig(
-        n_embd=args.n_embd,
-        n_layer=args.n_layer, 
-        token_dropout=0.1, 
-        domains=domain_cfg, 
-        attention_scheme=attention_scheme
-    )
-    
-    model  = Delphi(config).to(DEVICE)
-    torch.compile(model)
+    config = DelphiConfig( n_embd=args.n_embd, n_layer=args.n_layer, token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme)
+        
+    torch.compile(model := Delphi(config).to(DEVICE))
     
     optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
     optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
     
     assert args.run_name != 'default', f"You are using the 'default' value for run_name."
+
     logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
-    
+
+    mlflow.log_artifact("configs/embed_domains.yaml")
+
     logged_params = { "test_fold": args.test_fold, "batch_size": args.batch_size, "learning_rate": args.lr }
    
   else:
@@ -1092,7 +1047,8 @@ if __name__ == "__main__":
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-  trainer = Trainer(model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params)
+  trainer = Trainer( model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params )
+  
   trainer.train(max_epochs=1000)
 
 # %%
