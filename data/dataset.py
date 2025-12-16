@@ -156,13 +156,20 @@ class TokenDomain:
 
 class DelphiDataset:
 
-    def __init__(self, root: str, domains: dict, subjects: List[str] = None, exclusions: List[str] = [], n_samples=None, required_domains=['sex', 'diseases'], merge_namespaces=False, device=DEVICE):
+    def __init__(self, root: str, 
+        domains: dict, 
+        subjects: Union[str, List[str]] = None, 
+        exclusions: List[str] = [], 
+        n_samples=None, 
+        required_domains=['sex', 'diseases'], 
+        device=DEVICE):
+
         """
         Args:
             root: base data directory
             domains: list of domain names (e.g. ["diagnosis", "lifestyle", "sex", "death"])
             fold: if specified, restrict subjects to that fold
-            exclusions: list of exclusion list filenames under exclusion_lists/
+            exclusions: list of exclusion filenames under exclusion_lists/
         """
 
         self.root = Path(root)
@@ -171,10 +178,18 @@ class DelphiDataset:
         # Load the data        
         self.domains = EasyDict()
         for dname, dinfo in domains.items():
+            
             if dname == "padding":
                 continue
+
             datafile = self.root / "tokens" / dname
-            self.domains[dname] = TokenDomain(datafile, predict=dinfo.predict, age_jitter=dinfo.age_jitter, type=dinfo.type, at_birth=dinfo.at_birth) 
+            self.domains[dname] = TokenDomain(
+                datafile, 
+                predict=dinfo.predict, 
+                age_jitter=dinfo.age_jitter, 
+                type=dinfo.type, 
+                at_birth=dinfo.at_birth
+            )
 
         # ——————————————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
         if subjects is None:
@@ -220,19 +235,6 @@ and
             self.domains[dname] = filtered_domain
 
         # —————————————————————————————————————————————————————————————————————————————
-
-        # "re-index" categories (not the default behaviour, 
-        # which consists in keeping the tokens for each namespace separate):
-        if merge_namespaces:
-            all_cats = pd.Index([])
-            for dname, domain in self.domains.items():
-                all_cats = all_cats.union(domain.tokens['token_id'].cat.categories)        
-            for dname in self.domains:
-                self.domains[dname].tokens['token_id'] = self.domains[dname].tokens['token_id'].cat.set_categories(all_cats)                    
-            self.categories = all_cats.tolist()
-
-        # for dname, domain in self.domains.items():
-            # self.domains[dname].tokens = self.domains[dname].tokens.set_index("subject_id")
 
         # of internal use, for faster slicing
         self._subject_indices = self._precompute_subject_indices_per_domain()
@@ -633,29 +635,6 @@ def get_domain_id(domain_name):
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-'''
-def collate_fn_domains(batch):
-    
-    domains_dict = {}
-    for item in batch:
-        for dname, arr in item.items():
-            domains_dict.setdefault(dname, []).append(arr)
-    out = { d: torch.concat(lst, dim=0) for d, lst in domains_dict.items() }
-    
-    # infer device from any existing tensor in the batch
-    if len(out) > 0:
-        sample_device = next(iter(out.values())).device
-    else:
-        sample_device = torch.device("cpu")
-
-    # This is for compatibility with Delphi.forward, since it expects that the data 
-    # has exactly the same keys as the embedding module, which has a 'padding' domain (for regular GPT padding tokens and no-event tokens) 
-    if "padding" not in out:
-        out["padding"] = torch.empty((0, 3), dtype=torch.long, device=sample_device)
-    
-    return out
-'''
-
 from collections import defaultdict
 
 def collate_fn_domains(batch):
@@ -682,7 +661,6 @@ class FlexibleDataLoader(DataLoader):
             sampler=self.sampler,
             batch_sampler=None,
             num_workers=self.num_workers,
-            # collate_fn=self.collate_fn,
             pin_memory=self.pin_memory,
             drop_last=self.drop_last,
             timeout=self.timeout,
