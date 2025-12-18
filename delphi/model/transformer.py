@@ -1020,7 +1020,6 @@ class Delphi(torch.nn.Module):
 
     def get_offset_per_domain(self, domains_of_interest):
         
-        # domain_to_int = { k: i for i, k in enumerate(self.transformer.embed.domain_embed.keys()) } 
         vocab_lens = { 
             self.domain_to_int[k]: v.vocab_len 
             for k, v in self.transformer.embed.domain_embed.items() if k in domains_of_interest 
@@ -1096,7 +1095,7 @@ class Delphi(torch.nn.Module):
             input values:
               - x:          dict[domain, Tensor] where the tensor has data for batch_size subjects
               - ages:       dict[domain, Tensor]
-              - subjects:   dict[domain, Tensor]
+              - subject_ids:   dict[domain, Tensor]
               - embeddings: dict[domain, Tensor]
 
             return values: batches of 
@@ -1127,11 +1126,11 @@ class Delphi(torch.nn.Module):
             all_domains.append(d)
             all_subjects.append(s)
         
-        tokens_flat   = torch.cat(all_tokens)
-        ages_flat     = torch.cat(all_ages)
+        tokens_flat     = torch.cat(all_tokens)
+        ages_flat       = torch.cat(all_ages)
         embeddings_flat = torch.cat(all_embeddings)
-        domains_flat  = torch.cat(all_domains)
-        subjects_flat = torch.cat(all_subjects)
+        domains_flat    = torch.cat(all_domains)
+        subjects_flat   = torch.cat(all_subjects)
     
         unique_subjects = subjects_flat.unique(sorted=True)
         batch_tokens, batch_embeddings, batch_ages, batch_domains = [], [], [], []
@@ -1163,26 +1162,32 @@ class Delphi(torch.nn.Module):
             batch_domains.squeeze(1)
 
     
-    #/*********************************************************************************************************
-    ### ——————— FORWARD ——————— ###############################################################################
+    def _build_trace(self, x, ages, emb, subject_ids, domains):
 
-    def forward(self, 
-        x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor,
-        validation_loss_mode: bool = False, return_attention=False
-    ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
-
-        x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
-        
-        # TODO: check if this is still necessary
-        self._trace = dict(
+        return dict(
             tokens=x.detach(),
             ages=ages.detach(),
             emb=emb.detach(),
             subject_ids=subject_ids.detach(),
             domains=domains.detach()
         )
+
+
+    #/*********************************************************************************************************
+    ### ——————— FORWARD ——————— ###############################################################################
+
+    def forward(self, 
+        x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor, 
+        validation_loss_mode: bool = False, 
+        return_attention: bool = False
+    ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
+
+        x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
         
-        emb += self.transformer.age_embedding(ages)        
+        # TODO: check if this is still necessary
+        self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
+        
+        emb += self.transformer.age_embedding(ages)
 
         single_mask = self.transformer.attn_mask_builder[0][0].build(
             ages, domains, self.domain_to_int
@@ -1192,7 +1197,7 @@ class Delphi(torch.nn.Module):
                 expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
                     permute(1, 0, 2, 3, 4)        
         
-
+        
         # ——— BUILDING ATTENTION MASK —————————————————————————————————————————————————————————————————————————
         # group = AttentionMaskGroup(self.transformer.attn_mask_builder)
 
@@ -1211,15 +1216,16 @@ class Delphi(torch.nn.Module):
         # —————————————————————————————————————————————————————————————————————————————————————————————————————
 
         h, att = emb, []
-        for i, transformer_block in enumerate(self.transformer.h):            
-            h, _att = transformer_block(h, attn_mask[i])
+        for i, transformer_block in enumerate(self.transformer.h):
+            h, _att = transformer_block(h, attn_mask=attn_mask[i])
             att.append(_att)
         
         h = self.transformer.ln_f(h)        
+        
         logits = self.embedding_to_logits(h)
         
         return logits,\
-               (attention_matrices := torch.stack(att) if return_attention else None)
+                (attention_matrices := torch.stack(att) if return_attention else None)
 
     ### ———————— END FORWARD ———————— #########################################################################
     #*********************************************************************************************************/
@@ -1230,7 +1236,6 @@ class Delphi(torch.nn.Module):
            "loss_ce": self.cross_entropy_loss(targets),
            "loss_dt": self.time_to_event_loss(targets, targets_age), 
            "loss": loss_ce * self.config.ce_beta + loss_dt * self.config.dt_beta
-           # or "ce", "dt", "total"
         })
 
         return loss
@@ -1239,13 +1244,13 @@ class Delphi(torch.nn.Module):
     def get_max_ages_per_subject(self, ages, subject_ids):
 
         max_ages= {}
-        for subj in np.unique(subject_ids.diseases.cpu().numpy()):
+        for subj in np.unique(subject_ids['diseases'].cpu().numpy()):
             subj = int(subj)
-            death_age = ages.death[subject_ids.death == subj]
+            death_age = ages['death'][subject_ids['death'] == subj]
             if len(death_age):
                 max_ages[subj] = death_age.item()
                 continue
-            max_ages[subj] = ages.diseases[subject_ids.diseases == subj][-1].item()
+            max_ages[subj] = ages['diseases'][subject_ids['diseases'] == subj][-1].item()
         return max_ages
 
 
@@ -1267,8 +1272,6 @@ class Delphi(torch.nn.Module):
                     self.transformer.embed['padding'].PADDING_AGE
                 ) 
 
-                # ages['padding']   = ages['padding'].masked_fill(ages['padding']   > max_age_in_years * DAYS_PER_YEAR, PADDING_AGE)           # MASKING_AGE
-
         return tokens, ages, subject_ids
 
 
@@ -1284,7 +1287,7 @@ class Delphi(torch.nn.Module):
             gen = torch.Generator(device='cpu')
             gen.manual_seed(tokens.sum().item())
     
-        unique_subject_ids = torch.from_numpy(np.unique(subject_ids.diseases.cpu().numpy()))
+        unique_subject_ids = torch.from_numpy(np.unique(subject_ids['diseases'].cpu().numpy()))
 
         no_event_per_subject = {'tokens': [], 'ages':[], 'subject_ids': []}
         for subj_id in unique_subject_ids:

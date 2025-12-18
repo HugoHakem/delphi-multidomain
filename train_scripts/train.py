@@ -14,12 +14,13 @@ root_path = Path("../data/transforms")
 
 MLFLOW_URI = os.getenv("MLFLOW_URI", DELPHI_DIR / "mlruns")
 
-ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "configs/attention_schemes.yaml").read_text() )
+ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config/attention_schemes.yaml").read_text() )
 
 import re
 import ast
 from datetime import datetime
 
+from data.event_set import EventSet
 import numpy as np
 import pandas as pd
 
@@ -57,10 +58,7 @@ DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 RUN_NAME = os.getenv("RUN_NAME", "default")
 odir = f"output/{RUN_NAME}"
 
-# os.makedirs(odir, exist_ok=True)
-
 print(f"{sys.stdout.isatty()=}")
-
 USE_TQDM = sys.stdout.isatty()
 print(f"{USE_TQDM=}")
 
@@ -116,7 +114,7 @@ def clone_run_to_new_experiment(
     dst_dir = Path(dst_dir)
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
-    print(f"✅ Cloned run {old_run_id} → {new_run_id} (experiment: {new_experiment_name})")
+    print(f"Cloned run {old_run_id} → {new_run_id} (experiment: {new_experiment_name})")
     print(f"Artifacts copied from {src_dir} to {dst_dir}")
 
     mlflow.end_run()
@@ -334,7 +332,7 @@ class Trainer():
         ):
 
         '''
-
+        Trainer class, mimicking PytorchLightning trainer
         '''
 
         self.model           = model        
@@ -355,13 +353,12 @@ class Trainer():
         self.train_outputs,   self.valid_outputs, self.test_outputs = [], [], []            
 
         self.current_epoch  = start_epoch
-        self._valid_counter = 0
+        self._validation_counter = 0
         
         self.logger = logger
         self.val_loss = None
-        
         self.ema_alpha = 0.005
-        
+
         self.additional_mlflow_params = mlflow_params | { "ema_alpha": self.ema_alpha }
 
     # ——————————————————————————————————————————————————————————————————————————————
@@ -377,14 +374,6 @@ class Trainer():
     @property
     def domain_to_int(self):
         return { dname: i for i, dname in enumerate(self.model.transformer.embed.domain_embed.keys()) }
-
-
-    @property
-    def vocab_lens(self):
-        return { 
-            dname: self.model.transformer.embed.domain_embed[dname].weight.shape[0]
-            for dname in self.model.transformer.embed.domain_embed
-        }
 
 
     def get_subject_ids_per_partition(self):
@@ -454,24 +443,22 @@ class Trainer():
             self.epoch_end()
             
 
-
     def shared_step(self, batch, batch_idx, epoch, log_per_disease=False, return_logits=False, return_att=False, stage="training", add_prefix=None):
 
         model = self.model
 
-        # events = EventSet.from_batch(batch)
-        # events = events.\
-        #  compute_max_ages().\
-        #  insert_no_event_tokens(rate=5).\
-        #  mask_tokens_after_age().\
-        #  adjust_to_seqlen(96)
+        events = EventSet(batch).\
+            insert_no_event_tokens(rate=5, trim_right_padding=True).\
+            adjust_to_seqlen(256)
 
         x, ages, subject_ids = trainer.get_tensors_from_batch(batch)
         max_ages             = model.get_max_ages_per_subject(ages, subject_ids)
         x, ages, subject_ids = model.insert_no_event_tokens(x, ages, subject_ids)
         x, ages, subject_ids = model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-        x, ages, subject_ids = trainer.adjust_to_seqlen(x, ages, subject_ids, seqlen:=96)
+        x, ages, subject_ids = trainer.adjust_to_seqlen(x, ages, subject_ids, seqlen:=256)
         
+        # x, ages, emb, subject_ids, domains = model.to_tensor(x, ages, emb := model.transformer.embed(x), subject_ids)
+
         logits, att = model(x, ages, subject_ids)
         
         # This is ugly but necessary at the moment
@@ -526,7 +513,7 @@ class Trainer():
 
     def valid_epoch_end(self, loss_outputs):        
         
-        self._valid_counter += 1        
+        self._validation_counter += 1        
 
         return pd.concat([x['val_ce_loss_per_disease'] for x in loss_outputs]).\
             reset_index().\
@@ -636,7 +623,7 @@ class Trainer():
 
         loss_per_disease_df = self.valid_epoch_end(loss_outputs).reset_index()
         self.logger.log_df_as_artifact(df=loss_per_disease_df, filename=f"losses_epoch{self.current_epoch}_{self.val_step}.csv", artifact_path="val_loss_per_disease")
-        loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._valid_counter}.csv", index=False)
+        loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._validation_counter}.csv", index=False)
 
         mean_loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
 
@@ -805,7 +792,7 @@ class Trainer():
         subject_ids  = deepcopy(subject_ids)
      
         # Domains to consider for counting (exclude pad domain)
-        domains = [d for d in subject_ids.keys() if d != pad_domain]
+        # domains = [d for d in subject_ids.keys() if d != pad_domain]
     
         # Count total tokens per subject (excluding padding)
         if domains:
@@ -961,7 +948,7 @@ def get_cli_args():
     parser.add_argument("--domains",          default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
     parser.add_argument("--experiment_name",  default="drugs-predicted")
     parser.add_argument("--run_name",         default=None)
-    parser.add_argument("--batch_size",       default=16, type=int)
+    parser.add_argument("--batch_size",       default=256, type=int)
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
     parser.add_argument("--resume_run_id", type=str, default=None,
                     help="Resume training from the latest checkpoint of this MLflow run")
@@ -970,9 +957,10 @@ def get_cli_args():
     args = parser.parse_args()
     return args
 
+
 if __name__ == "__main__":    
     args =  get_cli_args()
-    
+
 else:
     args = DEFAULT_ARGS = EasyDict({
         "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,hla_alleles]:causal(mask_ties=True)"],
@@ -985,16 +973,15 @@ else:
     })
 
 def parse_attention_scheme(attention_scheme, as_list=True):
-    if isinstance(args.attention_scheme, str):
-        if attention_scheme in SCHEMES.keys():
-            attention_scheme = SCHEMES[attention_scheme]["scheme"]
+    if isinstance(attention_scheme, str):
+        if attention_scheme in ATTENTION_SCHEMES.keys():
+            attention_scheme = ATTENTION_SCHEMES[attention_scheme]["scheme"]
         if as_list:
-            attention_scheme = [args.attention_scheme]
+            attention_scheme = [attention_scheme]
         return attention_scheme
     elif isinstance(attention_scheme, list):
         return [parse_attention_scheme(scheme, as_list=False) for scheme in attention_scheme]
 
-args.attention_scheme = parse_attention_scheme(args.attention_scheme)
 
 
 # %%
@@ -1002,9 +989,12 @@ if __name__ == "__main__":
 
   if (train_from_scratch := not args.resume_run_id):
 
+    args.attention_scheme = parse_attention_scheme(args.attention_scheme)
+
     domains = args.domains.split(",")
 
-    default_cfg_per_domain = load_embed_config(DELPHI_DIR / args.domain_config_yaml, root_path / 'tokens')
+    domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
+    default_cfg_per_domain = load_embed_config(domain_config_yaml, root_path / 'tokens')
 
     # k, v with .items() doesn't work for some reason!
     domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in domains }
@@ -1017,6 +1007,26 @@ if __name__ == "__main__":
     elif args.n_layer == len(args.attention_scheme):
         attention_scheme = args.attention_scheme
     
+    # —————————————————————————————————————————————————————————————————————————————————————————————————————————
+    
+    train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
+    
+    if args.subjects is not None:
+        subject_ids = pd.read_csv(args.subjects, header=None)[0].tolist()
+        train_ids   = list( set(train_ids) & set(subject_ids) )
+        val_ids     = list( set(val_ids)   & set(subject_ids) )
+        test_ids    = list( set(test_ids)  & set(subject_ids) )
+
+    dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[], required_domains=["diseases"])
+    
+    train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
+    valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
+    test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
+    
+    dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, args.batch_size, args.batch_size][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
+    
+    # —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
     config = DelphiConfig( n_embd=args.n_embd, n_layer=args.n_layer, token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme)
         
     torch.compile(model := Delphi(config).to(DEVICE))
@@ -1028,7 +1038,7 @@ if __name__ == "__main__":
 
     logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
 
-    mlflow.log_artifact("configs/embed_domains.yaml")
+    mlflow.log_artifact(domain_config_yaml)
 
     logged_params = { "test_fold": args.test_fold, "batch_size": args.batch_size, "learning_rate": args.lr }
    
@@ -1043,6 +1053,7 @@ if __name__ == "__main__":
     logger.start(resume_run_id=new_run_id)
 
     #TODO: Add possibility to change some parameters, e.g. attention scheme, or add domains (e.g. genetic PCs and HLA alleles)
+
     print(f"Resuming from MLflow run {args.resume_run_id} ...")
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
