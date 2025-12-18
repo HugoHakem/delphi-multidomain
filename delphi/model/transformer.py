@@ -582,7 +582,7 @@ class DomainEmbedding(nn.Module):
         # ————————————————————————————————————————————————————————————————————————————————————
 
         if config.projector.lower() == "embed":
-            logging.info(f"DomainEmbedding for '{domain_name}': Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
+            # logging.info(f"DomainEmbedding for '{domain_name}': Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
             self.projector = nn.Embedding(config.input_size, n_embed)
 
         elif config.projector.lower() == "linear":
