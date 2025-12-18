@@ -2,6 +2,24 @@
 This repository contains an extension of the Delphi core codebase, allowing to easily add multi-domain data (apart from the usual diagnosis codes).
 It allows to define custom attention masking schemes within each domain and across domains.
 
+> [!NOTE]
+> This repository makes extensive use of Jupyter notebooks in `.py` format via **Jupytext**.
+> These files can be identified by `# %%` cell separators.
+>
+> This choice allows the same files to be run both as notebooks and as regular Python scripts, and improves readability and version control compared to `.ipynb` notebooks.
+>  
+> To install Jupytext:
+> ```bash
+> pip install jupytext
+> ```
+>
+> To convert a file to `.ipynb`:
+> ```bash
+> jupytext --to ipynb PATH_TO_FILE.py
+> ```
+
+
+
 ## Training (_to be completed_)
 
 ### Preparing the data for each domain
