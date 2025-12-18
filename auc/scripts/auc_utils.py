@@ -1,0 +1,149 @@
+import numpy as np
+import torch
+
+# ============================================================
+# 1. Bootstrapped AUC en GPU
+# ============================================================
+def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1):
+    """
+    Computes bootstrapped AUC estimates using PyTorch on CUDA.
+
+    Parameters:
+        case: 1D tensor of scores for positive cases
+        control: 1D tensor of scores for controls
+        n_bootstrap: Number of bootstrap replicates
+
+    Returns:
+        Tensor of shape (n_bootstrap,) containing AUC for each bootstrap replicate
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. This function requires a GPU.")
+
+    # Convert inputs to CUDA tensors
+    if not torch.is_tensor(case):
+        case = torch.tensor(case, device="cuda", dtype=torch.float32)
+    else:
+        case = case.to("cuda", dtype=torch.float32)
+
+    if not torch.is_tensor(control):
+        control = torch.tensor(control, device="cuda", dtype=torch.float32)
+    else:
+        control = control.to("cuda", dtype=torch.float32)
+
+    n_case = case.size(0)
+    n_control = control.size(0)
+    total = n_case + n_control
+
+    # Generate bootstrap samples
+    boot_idx_case = torch.randint(0, n_case, (n_bootstrap, n_case), device="cuda")
+    boot_idx_control = torch.randint(0, n_control, (n_bootstrap, n_control), device="cuda")
+
+    boot_case = case[boot_idx_case]
+    boot_control = control[boot_idx_control]
+
+    combined = torch.cat([boot_case, boot_control], dim=1)
+
+    # Mask to identify case entries
+    mask = torch.zeros((n_bootstrap, total), dtype=torch.bool, device="cuda")
+    mask[:, :n_case] = True
+
+    # Compute ranks and AUC
+    ranks = combined.argsort(dim=1).argsort(dim=1)
+    case_ranks_sum = torch.sum(ranks.float() * mask.float(), dim=1)
+    min_case_rank_sum = n_case * (n_case - 1) / 2.0
+    U = case_ranks_sum - min_case_rank_sum
+    aucs = U / (n_case * n_control)
+    return aucs.cpu().tolist()
+
+# ============================================================
+# 2. compute_midrank
+# ============================================================
+def compute_midrank(x):
+    """Computes midranks.
+    Args:
+       x - a 1D numpy array
+    Returns:
+       array of midranks
+    """
+    J = np.argsort(x)
+    Z = x[J]
+    N = len(x)
+    T = np.zeros(N, dtype=np.float32)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1)
+        i = j
+    T2 = np.empty(N, dtype=np.float32)
+    # +1 → ranks start from 1 in DeLong's formula
+    T2[J] = T + 1
+    return T2
+
+# ============================================================
+# 3. fastDeLong
+# ============================================================
+def fastDeLong(predictions_sorted_transposed, label_1_count):
+    """
+    Fast implementation of DeLong's algorithm for computing
+    covariance of AUC.
+
+    predictions_sorted_transposed: 2D numpy array 
+                                   [n_classifiers, n_examples]
+                                   sorted s.t positives come first
+    """
+    m = label_1_count
+    n = predictions_sorted_transposed.shape[1] - m
+    positive_examples = predictions_sorted_transposed[:, :m]
+    negative_examples = predictions_sorted_transposed[:, m:]
+    k = predictions_sorted_transposed.shape[0]
+
+    tx = np.empty([k, m], dtype=np.float32)
+    ty = np.empty([k, n], dtype=np.float32)
+    tz = np.empty([k, m + n], dtype=np.float32)
+
+    for r in range(k):
+        tx[r, :] = compute_midrank(positive_examples[r, :])
+        ty[r, :] = compute_midrank(negative_examples[r, :])
+        tz[r, :] = compute_midrank(predictions_sorted_transposed[r, :])
+
+    aucs = tz[:, :m].sum(axis=1) / m / n - float(m + 1.0) / 2.0 / n
+    v01 = (tz[:, :m] - tx[:, :]) / n
+    v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
+
+    sx = np.cov(v01)
+    sy = np.cov(v10)
+
+    delongcov = sx / m + sy / n
+    return aucs, delongcov
+
+# ============================================================
+# 4. compute_ground_truth_statistics
+# ============================================================
+def compute_ground_truth_statistics(ground_truth):
+    assert np.array_equal(np.unique(ground_truth), [0, 1])
+    order = (-ground_truth).argsort()
+    label_1_count = int(ground_truth.sum())
+    return order, label_1_count
+
+# ============================================================
+# 5. get_auc_delong_var
+# ============================================================
+def get_auc_delong_var(healthy_scores, diseased_scores):
+    """
+    Computes ROC AUC value and variance using DeLong's method.
+
+    healthy_scores: Values for class 0 (controls)
+    diseased_scores: Values for class 1 (cases)
+    """
+    ground_truth = np.array([1] * len(diseased_scores) + [0] * len(healthy_scores))
+    predictions = np.concatenate([diseased_scores, healthy_scores])
+
+    order, label_1_count = compute_ground_truth_statistics(ground_truth)
+    predictions_sorted_transposed = predictions[np.newaxis, order]
+
+    aucs, delongcov = fastDeLong(predictions_sorted_transposed, label_1_count)
+    assert len(aucs) == 1
+
+    return aucs[0], delongcov
