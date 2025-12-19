@@ -53,9 +53,9 @@ For instance:
 `"[sex,diseases,lifestyle,death,padding,hla_alleles,rare_variants]:causal(mask_ties=True)"`
 
 The corresponding 
-| From \ To        | hla_alleles | sex | diseases | lifestyle | death | padding |
+| From \ To        | HLA | sex | diseases | lifestyle | death | padding |
 |------------------|-------------|-----|----------|-----------|-------|---------|
-| **hla_alleles**  | · | · | · | · | · | · |
+| **HLA**  | · | · | · | · | · | · |
 | **sex**          | ← | · | · | · | · | · |
 | **diseases**     | ← | ← | ← | · | · | · |
 | **lifestyle**    | ← | ← | ← | ← | · | · |
@@ -70,9 +70,9 @@ nor to same-time tokens (`mask_ties=True`).
 On the other hand:
 `"[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,hla_alleles,padding]:causal(mask_ties=True)"`
 
-| From \ To        | hla_alleles | sex | diseases | lifestyle | death | padding |
+| From \ To        | HLA | sex | diseases | lifestyle | death | padding |
 |------------------|-------------|-----|----------|-----------|-------|---------|
-| **hla_alleles**  | ↔ | ↔ | · | · | · | · |
+| **HLA**  | ↔ | ↔ | · | · | · | · |
 | **sex**          | ↔ | ↔ | · | · | · | · |
 | **diseases**     | ← | ← | ← | · | · | · |
 | **lifestyle**    | ← | ← | ← | ← | · | · |
