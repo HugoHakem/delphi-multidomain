@@ -1,26 +1,30 @@
-## Multi-domain Delphi
-This repository contains an extension of the Delphi core codebase, allowing to easily add multi-domain data (apart from the usual diagnosis codes).
-It allows to define custom attention masking schemes within each domain and across domains.
+# Multi-domain Delphi
 
-> [!NOTE]
-> This repository makes extensive use of Jupyter notebooks in `.py` format via **Jupytext**.
-> These files can be identified by `# %%` cell separators.
->
-> This choice allows the same files to be run both as notebooks and as regular Python scripts, and improves readability and version control compared to `.ipynb` notebooks.
->  
-> To install Jupytext:
-> ```bash
-> pip install jupytext
-> ```
->
-> To convert a file to `.ipynb`:
-> ```bash
-> jupytext --to ipynb PATH_TO_FILE.py
-> ```
+This repository extends the **Delphi** core codebase to support **multi-domain longitudinal data**, beyond standard diagnosis codes.
+
+It focuses on:
+- Adding heterogeneous domains (e.g. diseases, drugs, lifestyle, HLA alleles, rare variants).
+- Defining **custom attention policies** within and across domains.
+- Scaling experiments via **Slurm job arrays** while tracking models with MLflow.
+
+## Table of contents
+
+- [Overview](#multi-domain-delphi)
+- [Training](#training)
+  - [Preparing the data for each domain](#preparing-the-data-for-each-domain)
+  - [Specifying the attention scheme](#specifying-the-attention-scheme)
+  - [Exemplar command](#exemplar-command)
+  - [Model tracking with MLflow](#model-tracking-with-mlflow)
+- [Evaluation](#evaluation)
+- [Model explainability](#model-explainability)
+- [Hyperparameter search with Slurm](#submitting-a-hyperparameter-search-as-slurm-job-array)
+- [Querying MLflow runs](#tips-for-querying-mlflow-runs)
+- [Developer notes](#notes-for-developers)
 
 
+## Training 
 
-## Training (_to be completed_)
+_To be completed_
 
 ### Preparing the data for each domain
 ```python
@@ -54,10 +58,10 @@ On the other hand:
 will allow bidirectional attention within the HLA allele and sex domains, however the rest of the tokens will be able to have causal attention with respect to the previous and also themselves.
 
 ### Exemplar command
-This is an exemplar training command, training with the usual domains (`diseases,lifestyle,sex,death`) plus the `rare_variants` domain:
+This is an exemplar training command, training with the usual domains (`diseases,lifestyle,sex,death,padding`) plus the `rare_variants` domain:
 ```
 python train.py \
-  --domains diseases,death,lifestyle,sex,rare_variants \
+  --domains diseases,death,lifestyle,sex,rare_variants,padding \
   --attention_scheme "[sex,diseases,lifestyle,death,padding,rare_variants]:causal(mask_ties=True)" \
   --n_layer 12 \
   --n_embd 240 \
@@ -98,7 +102,26 @@ mlflow runs list --exp-id $EXP_ID
 ```
 
 ## Notes for developers
+
+> **Note on Jupytext usage**
+> 
+> This repository makes extensive use of Jupyter notebooks in `.py` format via **Jupytext**.
+> These files can be identified by `# %%` cell separators.
+> 
+> This choice allows the same files to be run both as notebooks and as regular Python scripts, and improves readability and version control compared to `.ipynb` notebooks.
+> 
+> Install:
+> ```bash
+> pip install jupytext
+> ```
+> 
+> Convert to `.ipynb`:
+> ```bash
+> jupytext --to ipynb PATH_TO_FILE.py
+> ```
+
 _To be completed_
+
 This section will contain:
 - Notes on how to extend this codebase. 
 - Tips on unit tests.
