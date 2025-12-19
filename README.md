@@ -18,20 +18,11 @@ It allows to define custom attention masking schemes within each domain and acro
 > jupytext --to ipynb PATH_TO_FILE.py
 > ```
 
+
+
 ## Training (_to be completed_)
 
-### $k$-fold cross validation (CV)
-#### Horizontal splitting
-By default, the training script will use 70 / 10 / 20% for training / validation / testing.
-We recommend having a fixed list of 10 folds.
-Subject lists can be placed (one subject ID per line) into the folder `data/subject_lists`, with names `subset{fold}of10.csv` with `fold`$= {1,...,10}$.
-
-#### Longitudinal splitting
-There exists the possibility of passing a cutoff date, such that no token posterior to this date are included during training.
-If this option is used, then the subjects' date of birth has to be provided.
-
 ### Preparing the data for each domain
-
 ```python
 from pathlib import Path
 tokens_path = Path("./data/tokens")
@@ -46,7 +37,6 @@ domain_config = {
    "rare_variants": EmbedConfig(projector="embed", path=tokens_path / 'rare_variants',  at_birth=True),
 }
 ```
-
 Then you need to create a folder for the domain, e.g. `./data/tokens/rare_variants` with two files, named `tokens.csv` and `tokenizer.yaml`.
 - `tokens.csv` contains `subject_id`, `age` (in days) and `token_id`, one row per token (all subjects together).
 - `tokenizer.yaml` contains each token in order, and from this order the mapping to `token_id` is established.
@@ -74,20 +64,16 @@ python train.py \
   --experiment_name rare_variants
 ```
 
-### MLFlow logging
+### Model tracking with MLflow
 You can specify a custom MLflow location by setting the MLFLOW_URI environment variable, otherwise it's the `mlruns` folder within this repo's root directory.
 The previous command will create an MLflow experiment called `rare_variants`. 
 
 
 ## Evaluation
-_To be completed_
 
-- This section will contain instructions to conduct AUC calculation for each token of interest (we assume they are diseases in the following, but they could belong to any domain that is predicted during training).
-- The relevant scripts are in `auc/scripts`. Briefly, they are in charge of
-  1. Computing logits for all testing subjects, splitting into subject chunks and disease chunks.
-  2. Extracting indices for cases and controls in a sex- and age-specific manner, for each disease of interest. Case tokens are those tokens that precede the disease of interest and which belong to the relevant age bin. Control tokens are tokens that belong to the same age bin and subjects who never got the disease in their lifetime.
-  3. Filter logits for cases and controls and save them in parquet format, one per disease (across both sexes and all age bins).
-  4. Compute AUCs and possibly other metrics.
+
+## Model explainability
+
 
 ## Submitting a hyperparameter search as Slurm job array
 _To be completed_
@@ -95,9 +81,24 @@ This section will provide tips to explore different combinations of hyperparamet
 It requires generating a tabular file, where columns are command-line arguments of the `train.py` script, and the cells contain their values. Each row is a different run.
 Then a Slurm scripts reads this file line by line, building the command based on the configuration given by the row, and submitting it to a different GPU node.
 
+## Tips for querying MLflow runs
+
+```bash
+export MLFLOW_TRACKING_URI=$HOME/...
+
+# Examine your available experiments (try to use representative names when you create them)
+mlflow experiments search
+
+# Get runs for a given experiment
+export EXP_NAME=attention_schemes # an example
+export EXP_ID=$(mlflow experiments search | grep -w $EXP_NAME | awk '{print $1}')
+
+# or directly EXP_ID=... 
+mlflow runs list --exp-id $EXP_ID
+```
+
 ## Notes for developers
 _To be completed_
 This section will contain:
-- Some design criteria that we've tried to satisfy.
-- How to extend this codebase.
+- Notes on how to extend this codebase. 
 - Tips on unit tests.
