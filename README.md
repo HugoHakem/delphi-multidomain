@@ -48,14 +48,40 @@ Then you need to create a folder for the domain, e.g. `./data/tokens/rare_varian
 ### Specifying the attention scheme
 The attention scheme within and across domains is specified via a string command-line argument:
 
+#### Example 1: Fully causal attention (with tie-masking, i.e. no same-time attention)
 For instance:
 `"[sex,diseases,lifestyle,death,padding,hla_alleles,rare_variants]:causal(mask_ties=True)"`
 
-specifies that all tokens can only attend to tokens that are _strictly_ in their past (`mask_ties=True`).
+The corresponding 
+| From \ To        | hla_alleles | sex | diseases | lifestyle | death | padding |
+|------------------|-------------|-----|----------|-----------|-------|---------|
+| **hla_alleles**  | · | · | · | · | · | · |
+| **sex**          | ← | · | · | · | · | · |
+| **diseases**     | ← | ← | ← | · | · | · |
+| **lifestyle**    | ← | ← | ← | ← | · | · |
+| **death**        | ← | ← | ← | ← | ← | · |
+| **padding**      | ← | ← | ← | ← | ← | ← |
 
+In this configuration, all domains follow a strictly causal structure.
+Each domain may attend to **past tokens of itself and previous domains**, but never to the future
+nor to same-time tokens (`mask_ties=True`).
+
+#### Example 2 — Bidirectional HLA block + causal domains
 On the other hand:
 `"[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,hla_alleles,padding]:causal(mask_ties=True)"`
-will allow bidirectional attention within the HLA allele and sex domains, however the rest of the tokens will be able to have causal attention with respect to the previous and also themselves.
+
+| From \ To        | hla_alleles | sex | diseases | lifestyle | death | padding |
+|------------------|-------------|-----|----------|-----------|-------|---------|
+| **hla_alleles**  | ↔ | ↔ | · | · | · | · |
+| **sex**          | ↔ | ↔ | · | · | · | · |
+| **diseases**     | ← | ← | ← | · | · | · |
+| **lifestyle**    | ← | ← | ← | ← | · | · |
+| **death**        | ← | ← | ← | ← | ← | · |
+| **padding**      | ← | ← | ← | ← | ← | ← |
+
+Here, the HLA allele and sex domains form a **bidirectional static block**, allowing mutual
+contextualization of at-birth attributes. All downstream domains follow a causal structure,
+ensuring temporal consistency while allowing conditioning on static information.
 
 ### Exemplar command
 This is an exemplar training command, training with the usual domains (`diseases,lifestyle,sex,death,padding`) plus the `rare_variants` domain:
