@@ -24,6 +24,7 @@ from pathlib import Path
 
 from easydict import EasyDict
 from dataclasses import dataclass, field
+from tqdm import tqdm
 
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
@@ -47,22 +48,6 @@ device = 'cpu'
 BLOCK_SIZE = 128
 BATCH_SIZE = 512
 
-def build_domain_config(config, tokens_path: Path):
-
-    default_cfg = {
-    # 'genetic_pcs': EmbedConfig(projector="linear", path=tokens_path / 'genetic_pcs', type='continuous', at_birth=True),
-      'diseases':    EmbedConfig(projector="embed", path=tokens_path / 'diseases',    predict=True),
-      'death':       EmbedConfig(projector="embed", path=tokens_path / 'death',       predict=True),
-      'cv_drugs':    EmbedConfig(projector="embed", path=tokens_path / 'cv_drugs',    predict=True),
-      'ns_drugs':    EmbedConfig(projector="embed", path=tokens_path / 'ns_drugs',    predict=True),
-      'lifestyle':   EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',   age_jitter=True),  
-      "hla_alleles": EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles', at_birth=True),
-      "sex":         EmbedConfig(projector="embed", path=tokens_path / 'sex',         at_birth=True),
-      "padding":     EmbedConfig(projector="embed")    
-    }    
-
-    return {name: default_cfg[name] for name in config.domains}
-
 
 def split_subjects(subjects, n_chunks, chunk_id):
     indices = np.array_split(np.arange(len(subjects)), n_chunks)
@@ -77,24 +62,16 @@ def process_chunk(shard_subjects, shard_id, n_chunks, model, domain_cfg, root, o
     dataset    = DelphiDataset(domains=domain_cfg, root=root, subjects=shard_subjects).to("cpu")
     dataloader = DelphiDataloader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    all_rows = []
-    all_logits = []
-    offset = 0
+    all_rows, all_logits, offset = [], [], 0
 
     selected_domains = [ k for k, v in domain_cfg.items() if v.predict]
 
     with torch.no_grad():
-        for bi, batch in enumerate(dataloader):
+
+        for bi, batch in tqdm(enumerate(dataloader)):
             es = EventSet(batch)
             es = es.insert_no_event_tokens(rate=5)
-            es = es.adjust_to_seqlen(
-                seqlen=BLOCK_SIZE,
-                pad_domain="padding",
-                trim_domains={"diseases"},
-                PADDING_TOKEN=0,
-                PAD_AGE=-10000.0,
-                mode="fast"
-            )
+            es = es.adjust_to_seqlen(seqlen=BLOCK_SIZE, pad_domain="padding", trim_domains={"diseases"}, PADDING_TOKEN=0, PAD_AGE=-10000.0, mode="fast")
 
             tokens, ages, subject_ids_tensor = es.to_model_inputs()
 
@@ -102,15 +79,14 @@ def process_chunk(shard_subjects, shard_id, n_chunks, model, domain_cfg, root, o
 
             flat_parts = []
             for dom in selected_domains:
-                if dom not in logits_dict:
-                    raise ValueError(f"Domain '{dom}' not found in model output.")
-                x = logits_dict[dom]   # [B,L,D]
+                assert dom  in logits_dict, f"Domain '{dom}' not found in model output ({selected_domains})."
+                x = logits_dict[dom]   # [B, L, D]
                 B, L, D_dom = x.shape
                 flat_parts.append(x.reshape(B * L, D_dom))
 
-            flat_logits = torch.cat(flat_parts, dim=1)  # [B*L, sum(Ds)]
+            flat_logits = torch.cat(flat_parts, dim=1)  # [B * L, sum(Ds)]
 
-            df = es.merge_data(as_dataframe=True)
+            df = es.merge_domains(as_dataframe=True)
             df = df.sort_values(["subject_idx", "seq_idx"]).reset_index(drop=True)
 
             N = B * L
@@ -125,8 +101,7 @@ def process_chunk(shard_subjects, shard_id, n_chunks, model, domain_cfg, root, o
     shard_logits = torch.cat(all_logits, dim=0)
 
     if output_dir is not None:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(exist_ok=True)
+        (output_dir := Path(output_dir)).mkdir(exist_ok=True)
         df_path = output_dir / f"chunk_{shard_id}_of_{n_chunks}_df.parquet"
         logits_path = output_dir / f"chunk_{shard_id}_of_{n_chunks}_logits.pt"
         shard_df.to_parquet(df_path, index=False)
@@ -182,5 +157,7 @@ else:
 model, test_ids, ckpt_path, params, domain_cfg = reconstruct_model(args.runid, experiment_id)
 
 chunk_subjects = split_subjects(test_ids, args.n_chunks, args.chunk_index)
-process_chunk(chunk_subjects, args.chunk_index, args.n_chunks, model, domain_cfg, "./data/transforms", output_dir)
+processed_chunk = process_chunk(chunk_subjects, args.chunk_index, args.n_chunks, model, domain_cfg, "./data/transforms", args.output_dir)
+
+import ipdb; ipdb.set_trace()
 # %%
