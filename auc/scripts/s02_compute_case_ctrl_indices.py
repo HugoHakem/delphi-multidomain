@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 
 import argparse
-import numpy as np
-import pandas as pd
-import torch
 from pathlib import Path
 from tqdm import tqdm
-import mlflow
 import re
 import ast
 from easydict import EasyDict
 import os, sys
 
-DELPHI_DIR = f"{os.getenv('HOME')}/repos/delphi"
+import numpy as np
+import pandas as pd
+import torch
+import mlflow
 
-sys.path.insert(0, DELPHI_DIR)
-from delphi.model.transformer import Delphi, DelphiConfig, EmbedConfig
+if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
+    sys.path.insert(0, DELPHI_DIR)
+    
+from delphi.model.transformer import (
+    Delphi, 
+    DelphiConfig, 
+    EmbedConfig
+)
+
 from data.event_set import EventSet
 
 SEX_TOKENS = {"female": 0, "male": 1}
 AGE_RANGES = [(a, a+5) for a in range(0, 90, 5)]
-MLFLOW_URI = f"{os.environ['HOME']}/repos/delphi/train_scripts/mlruns"
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI")
 
 def infer_delphi_config_from_state_dict(sd):
 
@@ -39,7 +45,7 @@ def infer_delphi_config_from_state_dict(sd):
             cfg.n_embd = v.shape[1]
             break
 
-    # dominios detectados
+    # detected domains
     cfg.domains = []
     for k in sd:
         m = re.match(r"transformer\.embed\.domain_embed\.(\w+)\.projector\.weight", k)
@@ -49,7 +55,6 @@ def infer_delphi_config_from_state_dict(sd):
     return cfg
 
 
-# 2) Cargar run, checkpoint y reconstruir modelo
 def setup_mlflow():    
     mlflow.set_tracking_uri(uri:=MLFLOW_URI)
     return uri
@@ -121,6 +126,7 @@ def build_domain_config(config, tokens_path: Path):
 
     return {name: default_cfg[name] for name in config.domains}
 
+# Load run, checkpoint and reconstruct model
 def reconstruct_model(run_id):
 
     mlflow.set_tracking_uri(MLFLOW_URI)
@@ -202,23 +208,23 @@ def get_case_ctrl_prevtoken_indices(
     )
 
     case_subjects = subj_arr[case_mask]
-    case_seq      = seq_arr[case_mask]
+    case_seq      = global_arr[case_mask]
 
-    prev_subj = []
+    subj = []
     prev_seq  = []
 
     for s, t in zip(case_subjects, case_seq):
         if t > 0:
-            prev_subj.append(s)
+            subj.append(s)
             prev_seq.append(t - 1)
 
-    if len(prev_subj) == 0:
+    if len(subj) == 0:
         return np.array([], dtype=int), np.array([], dtype=int)
 
-    prev_subj = np.array(prev_subj)
+    subj = np.array(subj)
     prev_seq  = np.array(prev_seq)
 
-    prev_mask = (np.isin(subj_arr, prev_subj) & np.isin(seq_arr, prev_seq))
+    prev_mask = (np.isin(subj_arr, subj) & np.isin(seq_arr, prev_seq))
     case_prev_global_idx = global_arr[prev_mask]
 
     subjects_with_dis = np.unique(subj_arr[case_mask])
@@ -226,50 +232,26 @@ def get_case_ctrl_prevtoken_indices(
     all_subjects = np.unique(subj_arr)
     subjects_without_dis = np.setdiff1d(all_subjects, subjects_with_dis)
 
-    ctrl_mask = (
-        mask_sex
-        & mask_age
-        & mask_dom
-        & np.isin(subj_arr, subjects_without_dis)
-    )
+    mask_never_had_disease = np.isin(subj_arr, subjects_without_dis)
+    
+    ctrl_mask = ( mask_sex & mask_age & mask_dom & mask_never_had_disease )
 
     ctrl_global_idx = global_arr[ctrl_mask]
 
     return case_prev_global_idx, ctrl_global_idx
 
 
-def nested3_to_df(d):
-    rows = []
-    for disease, v1 in d.items():
-        for sex, v2 in v1.items():
-            for (a0, a1), (case_idx, ctrl_idx) in v2.items():
-                rows.append({
-                    "disease": disease,
-                    "sex": sex,
-                    "age_start": a0,
-                    "age_end": a1,
-                    "case_indices": case_idx,
-                    "ctrl_indices": ctrl_idx
-                })
-    return pd.DataFrame(rows)
+def get_predicted_domains(model):
+    return [ dom for dom, cfg in model.config.domains.items() if getattr(cfg, "predict", True) ]
 
 
-def main():
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--runid", required=True)
-    parser.add_argument("--chunk_index", type=int, required=True)     # DF/logits shard
-    parser.add_argument("--dchunk", type=int, required=True)          # domain token shard index
-    parser.add_argument("--n_dchunks", type=int, required=True)       # total domain shards
-    parser.add_argument("--logits_dir", type=str, default="/hps/nobackup/birney/users/bonazzola/auc/full_logits")
-    parser.add_argument("--output_dir", type=str, default="/hps/nobackup/birney/users/bonazzola/auc/indices")
-    parser.add_argument("--prediction_domains", type=str, default=None, nargs='+')
-    args = parser.parse_args()
+def main(args):
 
     runid, ci, dchunk, n_dchunks = args.runid, args.chunk_index, args.dchunk, args.n_dchunks
     
     mlflow.set_tracking_uri(MLFLOW_URI)
     runinfo = mlflow.get_run(runid)
+
     experiment_id = runinfo.info.experiment_id
 
     outdir = Path(args.output_dir) / runid
@@ -293,11 +275,9 @@ def main():
     
     print(f"[INFO] Found DF: {df_path}  → n_chunks = {n_chunks}")
     
-    df = pd.read_parquet(df_path)
-    df = df.assign(age=df.age_days)
+    df = pd.read_parquet(df_path).assign(age=df.age_days)
 
-    model, test_ids, params, experiment_id, ckpt_path = reconstruct_model(runid)
-    domain_cfg = model.config.domains  # EXACT order and predict flags
+    model, ... = reconstruct_model(runid)
 
     domain_to_id = df[['domain_id', 'domain']].drop_duplicates().set_index("domain").domain_id.to_dict()
     
@@ -307,11 +287,7 @@ def main():
     dom_sex = domain_to_id["sex"]
     
     if args.prediction_domains is None or len(args.prediction_domains) == 0:
-        prediction_domains = [
-            dom for dom, cfg in domain_cfg.items()
-            if getattr(cfg, "predict", True)
-        ]
-        print("[INFO] Using model-predicted domains:", prediction_domains)
+        print("[INFO] Using model-predicted domains:", prediction_domains := get_predicted_domains(model))
     else:
         prediction_domains = args.prediction_domains
         print("[INFO] Using user-specified domains:", prediction_domains)
@@ -354,7 +330,7 @@ def main():
     
                     ci_arr, co_arr = get_case_ctrl_prevtoken_indices(
                         df=df,
-                        disease_id=tok,         # not only diseases
+                        disease_id=tok, # not only diseases
                         sex_token_id=sex_token,
                         age_min=a0,
                         age_max=a1,
@@ -391,4 +367,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runid", required=True)
+    parser.add_argument("--chunk_index", type=int, required=True)     # DF/logits shard
+    parser.add_argument("--dchunk", type=int, required=True)          # domain token shard index
+    parser.add_argument("--n_dchunks", type=int, required=True)       # total domain shards
+    parser.add_argument("--logits_dir", type=str, default="/hps/nobackup/birney/users/bonazzola/auc/full_logits")
+    parser.add_argument("--output_dir", type=str, default="/hps/nobackup/birney/users/bonazzola/auc/indices")
+    parser.add_argument("--prediction_domains", type=str, default=None, nargs='+')
+    args = parser.parse_args()
+
+    main(args)
