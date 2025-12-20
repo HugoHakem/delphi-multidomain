@@ -4,11 +4,7 @@ import re
 from loguru import logger
 from easydict import EasyDict
 
-DELPHI_DIR = f"{os.getenv('HOME')}/repos/delphi"
-
-os.chdir(DELPHI_DIR)
-
-if DELPHI_DIR not in sys.path:
+if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
     sys.path.insert(0, DELPHI_DIR)
 
 import ast
