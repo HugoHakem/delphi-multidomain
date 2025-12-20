@@ -10,6 +10,11 @@ from easydict import EasyDict
 
 os.chdir( DELPHI_DIR := Path(__file__).resolve().parent.parent )
 
+from delphi.model.transformer import (
+    Delphi,
+    DelphiConfig
+)
+
 def fix_artifact_uri(artifact_uri):
     artifact_uri = re.sub(pattern="^file://", repl="", string=artifact_uri)
     artifact_uri = re.sub(pattern=".*/mlruns", repl="mlruns", string=artifact_uri)
@@ -181,8 +186,6 @@ def reconstruct_model(run_id, experiment_id):
 
     ckpt, ckpt_path = load_checkpoint(experiment_id, run_id)
 
-    import ipdb; ipdb.set_trace()
-    
     weights = ckpt["state_dict"]
     test_ids = ckpt["metadata"]["test_ids"]
 
@@ -193,7 +196,7 @@ def reconstruct_model(run_id, experiment_id):
     root_path = Path(f"{DELPHI_DIR}/data/transforms")
     tokens_path = root_path / "tokens"
     
-    domain_cfg = build_domain_config(cfg, tokens_path)
+    domain_cfg = get_domain_configs_from_string(params['domains'])
 
     delphi_cfg = DelphiConfig(
         n_embd=n_embd,
@@ -210,3 +213,6 @@ def reconstruct_model(run_id, experiment_id):
     model.eval()
 
     return model, test_ids, ckpt_path, params, domain_cfg
+
+def get_domain_configs_from_string(s):
+    return EasyDict(eval(s, {"PosixPath": Path, "__builtins__": {}}, {}))
