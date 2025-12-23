@@ -9,6 +9,7 @@ import mlflow
 from easydict import EasyDict
 
 os.chdir( DELPHI_DIR := Path(__file__).resolve().parent.parent )
+MLFLOW_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" ) )
 
 from delphi.model.transformer import (
     Delphi,
@@ -123,23 +124,26 @@ def infer_delphi_config_from_state_dict(sd):
 def setup_mlflow():
     
     global MLFLOW_URI
-
-    MLFLOW_URI = Path(f"{os.environ['HOME']}/repos/delphi/train_scripts/mlruns")
+    
     mlflow.set_tracking_uri(MLFLOW_URI)
     return MLFLOW_URI
 
 
-def load_run_info(run_id):
+def load_run_params(run_id):
 
-    run = mlflow.get_run(run_id)
-    params = run.data.params
-    attn_scheme = ast.literal_eval(params["attention_scheme"])
-    return params, attn_scheme
+    runinfo = mlflow.get_run(run_id)
+    params = runinfo.data.params    
+    params['attention_scheme'] = ast.literal_eval(params["attention_scheme"])
+    return params
+
+def get_experiment_id_from_runid(run_id):
+    return mlflow.get_run(run_id).info.experiment_id
 
 
-def load_checkpoint(experiment_id, run_id):
+def load_checkpoint(run_id):
     
     mlflow_uri = Path(mlflow.get_tracking_uri().replace("file:", ""))
+    experiment_id = get_experiment_id_from_runid(run_id)
     ckpt_path = get_last_epoch_checkpoint( mlflow_uri / experiment_id / run_id )[0]
     ckpt = torch.load(ckpt_path, map_location="cpu")
     return ckpt, ckpt_path
@@ -180,11 +184,13 @@ def get_last_epoch_checkpoint(run_dir: str):
     return best, best_epoch
 
 
-def reconstruct_model(run_id, experiment_id):
+def reconstruct_model(run_id):
     
-    params, attn_scheme = load_run_info(run_id)
+    params = load_run_params(run_id)
 
-    ckpt, ckpt_path = load_checkpoint(experiment_id, run_id)
+    attn_scheme = params['attention_scheme']
+    
+    ckpt, ckpt_path = load_checkpoint(run_id)
 
     weights = ckpt["state_dict"]
     test_ids = ckpt["metadata"]["test_ids"]
@@ -193,9 +199,6 @@ def reconstruct_model(run_id, experiment_id):
     n_layer = cfg["n_layer"]
     n_embd = cfg["n_embd"]
 
-    root_path = Path(f"{DELPHI_DIR}/data/transforms")
-    tokens_path = root_path / "tokens"
-    
     domain_cfg = get_domain_configs_from_string(params['domains'])
 
     delphi_cfg = DelphiConfig(

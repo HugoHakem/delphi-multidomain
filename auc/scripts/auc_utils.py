@@ -1,9 +1,8 @@
 import numpy as np
+from scipy.stats import mannwhitneyu
 import torch
 
-# ============================================================
-# 1. Bootstrapped AUC en GPU
-# ============================================================
+
 def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1):
     """
     Computes bootstrapped AUC estimates using PyTorch on CUDA.
@@ -55,9 +54,7 @@ def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1):
     aucs = U / (n_case * n_control)
     return aucs.cpu().tolist()
 
-# ============================================================
-# 2. compute_midrank
-# ============================================================
+
 def compute_midrank(x):
     """Computes midranks.
     Args:
@@ -81,9 +78,7 @@ def compute_midrank(x):
     T2[J] = T + 1
     return T2
 
-# ============================================================
-# 3. fastDeLong
-# ============================================================
+
 def fastDeLong(predictions_sorted_transposed, label_1_count):
     """
     Fast implementation of DeLong's algorithm for computing
@@ -118,18 +113,14 @@ def fastDeLong(predictions_sorted_transposed, label_1_count):
     delongcov = sx / m + sy / n
     return aucs, delongcov
 
-# ============================================================
-# 4. compute_ground_truth_statistics
-# ============================================================
+
 def compute_ground_truth_statistics(ground_truth):
     assert np.array_equal(np.unique(ground_truth), [0, 1])
     order = (-ground_truth).argsort()
     label_1_count = int(ground_truth.sum())
     return order, label_1_count
 
-# ============================================================
-# 5. get_auc_delong_var
-# ============================================================
+
 def get_auc_delong_var(healthy_scores, diseased_scores):
     """
     Computes ROC AUC value and variance using DeLong's method.
@@ -147,3 +138,53 @@ def get_auc_delong_var(healthy_scores, diseased_scores):
     assert len(aucs) == 1
 
     return aucs[0], delongcov
+
+
+def delong_auc(case, ctrl):
+    """Compute AUC + variance using DeLong."""
+    if len(case) == 0 or len(ctrl) == 0:
+        return None, None
+
+    labels = np.array([1] * len(case) + [0] * len(ctrl))
+    scores = np.concatenate([case, ctrl])
+
+    order = (-labels).argsort()
+    m = labels.sum()
+
+    preds_sorted = scores[np.newaxis, order]
+    auc, cov = fastDeLong(preds_sorted, m)
+
+    return auc, cov # [0][0]
+
+
+def compute_all_stats(case, ctrl, do_bootstrap=False, n_bootstrap=200):
+    case = np.asarray(case, float)
+    ctrl = np.asarray(ctrl, float)
+
+    if len(case) == 0 or len(ctrl) == 0:
+        return {
+            "auc_delong": None, "auc_delong_var": None,
+            "mann_u": None, "mann_p": None,
+            "auc_bootstrap_mean": None, "auc_bootstrap_std": None,
+        }
+
+    auc_d, auc_var = delong_auc(case, ctrl)
+
+    u, p = mannwhitneyu(case, ctrl, alternative="two-sided")
+
+    if do_bootstrap and torch.cuda.is_available():
+        boots = optimized_bootstrapped_auc_gpu(case, ctrl, n_bootstrap)
+        auc_b_mean = float(np.mean(boots))
+        auc_b_std = float(np.std(boots))
+    else:
+        auc_b_mean = None
+        auc_b_std = None
+
+    return {
+        "auc_delong": auc_d,
+        "auc_delong_var": auc_var,
+        "mann_u": float(u),
+        "mann_p": float(p),
+        "auc_bootstrap_mean": auc_b_mean,
+        "auc_bootstrap_std": auc_b_std,
+    }

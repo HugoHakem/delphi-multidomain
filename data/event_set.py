@@ -873,9 +873,7 @@ class EventSet:
         if df_controls.empty:
             return np.zeros((0,2), dtype=int), df
     
-        control_df = df_controls.groupby("subject_id", group_keys=False).apply(
-            lambda g: g.sample(1)
-        )
+        control_df = df_controls.groupby("subject_id", group_keys=False).apply( lambda g: g.sample(1) )
     
         control_rows = control_df[["subject_idx","seq_idx"]].to_numpy()
     
@@ -890,10 +888,8 @@ class EventSet:
           - seq_index_map           : maps (subject_idx, age_days, token_id) → seq_idx
         """
         # 1) Assign subject_idx
-        self.subject_ids = sorted(list(set().union(*[
-            arr[:,0].cpu().numpy().tolist() for arr in self.domains.values()
-        ])))
-        self.subject_id_to_batch_idx = {sid: i for i, sid in enumerate(self.subject_ids)}
+        self.subject_ids = sorted(list(set().union(*[arr[:,0].cpu().numpy().tolist() for arr in self.domains.values()])))
+        self.subject_id_to_batch_idx = { sid: i for i, sid in enumerate(self.subject_ids) }
     
         # 2) Build seq_idx per subject by sorting all tokens globally
         rows = []
@@ -911,6 +907,8 @@ class EventSet:
             (int(r.subject_idx), float(r.age_days), int(r.token_id)) : int(i)
             for i, r in df.iterrows()
         }
+
+        return self.subject_ids, self.subject_id_to_batch_idx, self.seq_index_map
 
 
 

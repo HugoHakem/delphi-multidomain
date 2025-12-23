@@ -1,40 +1,26 @@
 # %%
 import os, sys
-import re
+from pathlib import Path
+from tqdm import tqdm
+
 from loguru import logger
 from easydict import EasyDict
 
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
     sys.path.insert(0, DELPHI_DIR)
 
-import ast
 import argparse
+
+from tqdm import tqdm
+import numpy as np
+import pandas as pd
 import torch
 torch.set_grad_enabled(False)
 
-from tqdm import tqdm
-import pandas as pd
-import numpy as np
-
-from pathlib import Path
-
-from easydict import EasyDict
-from dataclasses import dataclass, field
-from tqdm import tqdm
-
 from data.dataset import DelphiDataset, DelphiDataloader
-from utils.cv_utils import get_data_partitions
-from delphi.model.transformer import (
-    Delphi,
-    EmbedConfig,
-    DelphiConfig,
-)
 from data.event_set import EventSet
 
 from utils.utils import (
-    load_run_info,
-    load_checkpoint,
-    get_last_epoch_checkpoint,
     reconstruct_model,
     setup_mlflow
 )
@@ -43,6 +29,9 @@ device = 'cpu'
 
 BLOCK_SIZE = 128
 BATCH_SIZE = 512
+
+TOKEN_DETAILS_FILE_PATTERN = "chunk_{shard_id}_of_{n_chunks}_df.parquet"
+LOGITS_FILE_PATTERN = "chunk_{shard_id}_of_{n_chunks}_logits.pt"
 
 
 def split_subjects(subjects, n_chunks, chunk_id):
@@ -62,52 +51,49 @@ def process_chunk(shard_subjects, shard_id, n_chunks, model, domain_cfg, root, o
 
     selected_domains = [ k for k, v in domain_cfg.items() if v.predict]
 
-    with torch.no_grad():
+    for bi, batch in tqdm(enumerate(dataloader)):
+        es = EventSet(batch)
+        es = es.insert_no_event_tokens(rate=5)
+        es = es.adjust_to_seqlen(seqlen=BLOCK_SIZE, pad_domain="padding", trim_domains={"diseases"}, PADDING_TOKEN=0, PAD_AGE=-10000.0, mode="fast")
 
-        for bi, batch in tqdm(enumerate(dataloader)):
-            es = EventSet(batch)
-            es = es.insert_no_event_tokens(rate=5)
-            es = es.adjust_to_seqlen(seqlen=BLOCK_SIZE, pad_domain="padding", trim_domains={"diseases"}, PADDING_TOKEN=0, PAD_AGE=-10000.0, mode="fast")
+        tokens, ages, subject_ids_tensor = es.to_model_inputs()
 
-            tokens, ages, subject_ids_tensor = es.to_model_inputs()
+        logits_dict, _ = model(tokens, ages, subject_ids_tensor)
 
-            logits_dict, _ = model(tokens, ages, subject_ids_tensor)
+        flat_parts = []
+        for dom in selected_domains:
+            assert dom  in logits_dict, f"Domain '{dom}' not found in model output ({selected_domains})."
+            x = logits_dict[dom]   # [B, L, D]
+            B, L, D_dom = x.shape
+            flat_parts.append(x.reshape(B * L, D_dom))
 
-            flat_parts = []
-            for dom in selected_domains:
-                assert dom  in logits_dict, f"Domain '{dom}' not found in model output ({selected_domains})."
-                x = logits_dict[dom]   # [B, L, D]
-                B, L, D_dom = x.shape
-                flat_parts.append(x.reshape(B * L, D_dom))
+        flat_logits = torch.cat(flat_parts, dim=1)  # [B * L, sum(Ds)]
 
-            flat_logits = torch.cat(flat_parts, dim=1)  # [B * L, sum(Ds)]
+        df = es.merge_domains(as_dataframe=True)
+        df = df.sort_values(["subject_idx", "seq_idx"]).reset_index(drop=True)
 
-            df = es.merge_domains(as_dataframe=True)
-            df = df.sort_values(["subject_idx", "seq_idx"]).reset_index(drop=True)
+        N = B * L
+        df["global_idx"] = range(offset, offset + N)
 
-            N = B * L
-            df["global_idx"] = range(offset, offset + N)
+        all_rows.append(df)
+        all_logits.append(flat_logits)
 
-            all_rows.append(df)
-            all_logits.append(flat_logits)
-
-            offset += N
+        offset += N
 
     shard_df = pd.concat(all_rows, ignore_index=True)
-    shard_logits = torch.cat(all_logits, dim=0)
+    shard_logits = torch.cat(all_logits, dim=0)    
 
     if output_dir is not None:
         (output_dir := Path(output_dir)).mkdir(exist_ok=True)
-        df_path = output_dir / f"chunk_{shard_id}_of_{n_chunks}_df.parquet"
-        logits_path = output_dir / f"chunk_{shard_id}_of_{n_chunks}_logits.pt"
+        df_path = output_dir / TOKEN_DETAILS_FILE_PATTERN.format(shard_id=shard_id, n_chunks=n_chunks)
+        logits_path = output_dir / LOGITS_FILE_PATTERN.format(shard_id=shard_id, n_chunks=n_chunks)
         shard_df.to_parquet(df_path, index=False)
         torch.save(shard_logits, logits_path)
 
+    print(f"Chunk {shard_id} listo ({len(shard_df)} filas)", flush=True)    
     return shard_df, shard_logits
 
-    print(f"Chunk {shard_id} listo ({len(shard_df)} filas)", flush=True)
-
-
+    
 def running_in_notebook():
     try:
         from IPython import get_ipython
@@ -116,7 +102,7 @@ def running_in_notebook():
         return False
 
 
-if False: # not running_in_notebook():
+if not running_in_notebook():
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunk_index", type=int, default=0)

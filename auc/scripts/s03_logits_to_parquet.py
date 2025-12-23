@@ -9,32 +9,36 @@ from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from auc_utils import compute_all_stats
+from s01_compute_logits_per_chunk          import LOGITS_FILE_PATTERN
+from scripts.s02_compute_case_ctrl_indices import INDICES_FILE_PATTERN
 
-# ---------------------------------------------------------------
-# LOAD HELPERS
-# ---------------------------------------------------------------
+INDICES_FILE_PATTERN = INDICES_FILE_PATTERN.format(ci="*", n_chunks="*", dchunk="*", n_dchunks="*")
+LOGITS_FILE_PATTERN  = LOGITS_FILE_PATTERN.format(ci="*", n_chunks="*", dchunk="*", n_dchunks="*")
 
-def load_logits(runid, logits_root="outputs"):
+
+def load_logits(runid, logits_root):
     """
     Carga logits por chunk_index → {chunk_idx: tensor[T, D]}
     """
     base = Path(logits_root) / runid
     out = {}
 
-    files = sorted(base.glob("chunk_*_logits.pt"))
+    files = sorted(base.glob(LOGITS_FILE_PATTERN))
     print(f"[INFO] Logits found: {len(files)} files")
 
     for f in tqdm(files, desc="Loading logits"):
         ci = int(f.stem.split("_")[1])
         out[ci] = torch.load(f, map_location="cpu")
+
     return out
 
 
-def load_indices(runid, indices_root="indices"):
+def load_indices(runid, indices_root):
     """
     Concatena TODOS los parquets de índices del run.
     """
-    files = sorted(Path(indices_root).glob(f"indices_runid_{runid}__*.parquet"))
+    files = sorted(Path(indices_root).glob(f"{runid}/{INDICES_FILE_PATTERN}"))
     if not files:
         raise RuntimeError(f"No index files found for run {runid}")
 
@@ -42,11 +46,7 @@ def load_indices(runid, indices_root="indices"):
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-# ---------------------------------------------------------------
-# MAIN MERGE LOGIC
-# ---------------------------------------------------------------
-
-def collect_logits_merged(runid, indices_root="indices_2", logits_root="outputs"):
+def collect_logits_merged(runid, indices_root, logits_root):
     """
     Junta logits por (disease, sex, age_start, age_end).
     Cada key acumula datos de múltiples chunks.
@@ -95,10 +95,7 @@ def collect_logits_merged(runid, indices_root="indices_2", logits_root="outputs"
     
             # Inicializar el entry si no existe
             if key not in merged:
-                merged[key] = {
-                    "case": [],
-                    "ctrl": [],
-                }
+                merged[key] = { "case": [], "ctrl": [] }
     
             merged[key]["case"].extend(case_vals)
             merged[key]["ctrl"].extend(ctrl_vals)
@@ -106,57 +103,69 @@ def collect_logits_merged(runid, indices_root="indices_2", logits_root="outputs"
     return merged
 
 
-
-# ---------------------------------------------------------------
-# SAVE TO PARQUET
-# ---------------------------------------------------------------
-
-def save_merged_as_parquet(runid, merged, outdir="logits_merged"):
-    Path(outdir).mkdir(exist_ok=True, parents=True)
-
+def save_merged_as_parquet(runid, merged, outdir):
+    
     rows = []
     for (domain, token_id, sex, a0, a1), vals in merged.items():
-        rows.append({
-            "runid": runid,
-            "domain": domain,
-            "token_id": token_id,
-            "sex": sex,
-            "age_start": a0,
-            "age_end": a1,
-            "n_case": len(vals["case"]),
-            "n_ctrl": len(vals["ctrl"]),
-            "case_logits": vals["case"],
-            "ctrl_logits": vals["ctrl"],
+        rows.append({ 
+          "runid": runid, "domain": domain, "token_id": token_id, "sex": sex, "age_start": a0, "age_end": a1,
+          "n_case": len(vals["case"]), "n_ctrl": len(vals["ctrl"]), "case_logits": vals["case"], "ctrl_logits": vals["ctrl"],
         })
 
     df = pd.DataFrame(rows)
 
-    outpath = Path(outdir) / f"logits_{runid}.parquet"
+    ( outdir := Path(outdir) / runid ).mkdir(exist_ok=True, parents=True)        
+    outpath = outdir / "logits.parquet"
     df.to_parquet(outpath, compression="zstd", engine="pyarrow")
-
     print(f"[OK] Saved merged logits → {outpath}")
-    return outpath
+    return df, outpath
 
-
-# ---------------------------------------------------------------
-# CLI ENTRYPOINT
-# ---------------------------------------------------------------
 
 def main():
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--runid", required=True)
     parser.add_argument("--indices_root", default="/hps/nobackup/birney/users/bonazzola/auc/indices")
     parser.add_argument("--logits_root", default="/hps/nobackup/birney/users/bonazzola/auc/full_logits")
-    parser.add_argument("--outdir", default="/hps/nobackup/birney/users/bonazzola/auc/logits_merged")
+    parser.add_argument("--logits_merged_outdir", default="/hps/nobackup/birney/users/bonazzola/auc/logits_merged")
+    parser.add_argument("--auc_output_dir", default="auc_results")
+    parser.add_argument("--bootstrap", action="store_true")
+    parser.add_argument("--n_bootstrap", type=int, default=200)
     args = parser.parse_args()
 
-    merged = collect_logits_merged(
-        args.runid,
-        indices_root=args.indices_root,
-        logits_root=args.logits_root
-    )
+    # Merge logits
+    merged = collect_logits_merged( args.runid, indices_root=args.indices_root, logits_root=args.logits_root )    
 
-    save_merged_as_parquet(args.runid, merged, outdir=args.outdir)
+    logits_df, output_path = save_merged_as_parquet(args.runid, merged, outdir=args.logits_merged_outdir)
+
+    # Compute AUCs
+    ( auc_output_dir := Path(args.auc_output_dir) / args.runid ).mkdir(exist_ok=True, parents=True)
+
+    results = []
+
+    for _, row in tqdm(logits_df.iterrows(), total=logits_df.shape[0]):
+        
+        token = row["domain"], row["token_id"]
+        sex = row["sex"]
+        age_bin = row["age_start"], row["age_end"]
+        
+        print("[INFO] Computing AUC / Mann–Whitney for ...")
+
+        case_logits, ctrl_logits = row["case_logits"], row["ctrl_logits"]
+        
+        stats = compute_all_stats( case_logits, ctrl_logits, do_bootstrap=args.bootstrap, n_bootstrap=args.n_bootstrap )
+
+        results.append({ 
+            "runid": args.runid, 
+            "domain": token[0], "token_id": token[1], 
+            "sex": sex, "age_start": age_bin[0], "age_end": age_bin[1], 
+            "n_case": row["n_case"], "n_ctrl": row["n_ctrl"],
+            **stats
+        })
+
+    out_df = pd.DataFrame(results)
+    out_path = auc_output_dir / f"aucs.csv"
+    out_df.to_csv(out_path, index=False)
 
 
 if __name__ == "__main__":
