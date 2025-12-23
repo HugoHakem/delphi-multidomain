@@ -77,7 +77,7 @@ def get_case_ctrl_prevtoken_indices(df, disease_id, sex_token_id, age_min, age_m
     all_subjects = np.unique(subj_arr)
     subjects_without_dis = np.setdiff1d(all_subjects, subjects_with_dis)
     mask_never_had_disease = np.isin(subj_arr, subjects_without_dis)
-    # ctrl_mask = ( mask_sex & mask_age & mask_dom & mask_never_had_disease )
+    
     ctrl_mask = ( mask_sex & mask_age & mask_never_had_disease )
     ctrl_global_idx = global_arr[ctrl_mask]
 
@@ -88,31 +88,17 @@ def get_predicted_domains(model):
     return [ dom for dom, cfg in model.config.domains.items() if getattr(cfg, "predict", True) ]
 
 
+def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
 
-def main(args):
+    runid       = args.runid 
+    ci          = args.chunk_index
+    dchunk      = args.dchunk 
+    n_dchunks   = args.n_dchunks
 
-    runid, ci, dchunk, n_dchunks = args.runid, args.chunk_index, args.dchunk, args.n_dchunks
+    tokens_file = args.tokens_file 
+    output_file = args.output_file
     
-    mlflow.set_tracking_uri(MLFLOW_URI)
-    ( outdir := Path(args.output_dir) / runid).mkdir(exist_ok=True, parents=True )
-    logits_dir = Path(args.logits_dir) # / runid
-    
-    pattern = f"{runid}_chunk_{ci}_of_*_df.parquet"
-    print(logits_dir / pattern)
-    matches = list(logits_dir.glob(pattern))
-    
-    assert len(matches) > 0, f"No DF file found for chunk_index={ci} in {logits_dir} for pattern {pattern}"
-    
-    if len(matches) > 1:
-        print("[WARN] Multiple matches found, using first:", matches)
-    
-    df_path = matches[0]    
-    fname_parts = df_path.stem.split("_")  
-    n_chunks = int(fname_parts[4])
-    
-    print(f"[INFO] Found DF: {df_path}  → n_chunks = {n_chunks}")    
-    
-    df = pd.read_parquet(df_path).assign(age=lambda df: df.age_days)
+    df = pd.read_parquet(tokens_file).assign(age=lambda df: df.age_days)
 
     model, _, _, _, _ = reconstruct_model(runid)
     domain_to_id = df[['domain_id', 'domain']].drop_duplicates().set_index("domain").domain_id.to_dict()   
@@ -158,21 +144,22 @@ def main(args):
     df_out = pd.DataFrame(rows)
     df_out["chunk_index"] = ci
     df_out["dchunk"] = dchunk
-        
-    indices_file = indices_file_pattern.format(ci=ci, n_chunks=n_chunks, dchunk=dchunk, n_dchunks=n_dchunks)
-    df_out.to_parquet(outfile := outdir / indices_file)
-    print("[OK] saved:", outfile)
+
+    if output_file is not None:
+        df_out.to_parquet(output_file)
+    
+    return df_out
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--runid", required=True)
+    parser.add_argument("--tokens_file", type=str)
+    parser.add_argument("--output_file", type=str)
     parser.add_argument("--chunk_index", type=int, required=True)     # DF/logits shard
-    parser.add_argument("--dchunk", type=int, required=True)          # domain token shard index
-    parser.add_argument("--n_dchunks", type=int, required=True)       # total domain shards
-    parser.add_argument("--logits_dir", type=str, default="/hps/nobackup/birney/users/bonazzola/auc/full_logits")
-    parser.add_argument("--output_dir", type=str, default="/hps/nobackup/birney/users/bonazzola/auc/indices")
+    parser.add_argument("--dchunk",      type=int, required=True)     # domain token shard index
+    parser.add_argument("--n_dchunks",   type=int, required=True)     # total domain shards
     parser.add_argument("--prediction_domains", type=str, default=None, nargs='+')
     args = parser.parse_args()
 
