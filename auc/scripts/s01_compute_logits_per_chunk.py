@@ -125,14 +125,3 @@ torch.save(logits.reshape(-1, vocab_len), logits_file)
 
 print(f"Chunk {shard_id} ready ({len(tokens_df)} rows)", flush=True)  
 print(f"Files created {logits_file} and {tokens_file}", flush=True)  
-
-# if output_dir is not None:
-    # (output_dir := Path(output_dir)).mkdir(exist_ok=True)
-    # df_path = output_dir / token_details_file
-    # logits_path = output_dir / logits_file
-    # tokens_.to_parquet(df_path, index=False)
-    # torch.save(flat_logits, logits_path)
-# 
-    # print(f"Chunk {shard_id} ready ({len(shard_df)} rows)", flush=True)  
-
-# %%
