@@ -6,6 +6,12 @@ from torch.nn import functional as F
 
 from dataclasses import fields, is_dataclass, dataclass, field, asdict
 
+from pathlib import Path
+import sys
+
+if ( DELPHI_DIR := Path(__file__).resolve().parent.parent.parent ) not in sys.path:
+    sys.path.insert(0, str(DELPHI_DIR))
+
 from typing import Optional, List, Tuple, Union
 
 import inspect
@@ -627,7 +633,6 @@ class DomainEmbedding(nn.Module):
 
     @property
     def vocab_len(self):
-        # if self.config.lower() == "pretrained":
         return self.projector.weight.shape[0]
 
 
@@ -1000,7 +1005,10 @@ class Delphi(torch.nn.Module):
     def set_valid_loss_mode(self, validation_loss_mode):
         self.validation_loss_mode = validation_loss_mode
 
-    
+    @property
+    def domain_cfg(self):
+        return self.config.domains
+
     @property
     def predicted_domains(self):
         return [ dname for dname, config in self.config.domains.items() if config.predict ]
@@ -1310,6 +1318,37 @@ class Delphi(torch.nn.Module):
             
         return tokens, ages, subject_ids
     
+    
+    def run_inference(self, dataset, batch_size, block_size):
+        
+        from tqdm import tqdm
+        from data.dataset import DelphiDataset, DelphiDataloader
+        from data.event_set import EventSet
+
+        dataloader = DelphiDataloader(dataset, batch_size=batch_size, shuffle=False)
+
+        all_logits = []
+        for bi, batch in tqdm(enumerate(dataloader)):
+            
+            es = EventSet(batch)
+            es = es.insert_no_event_tokens(rate=5)
+            es = es.adjust_to_seqlen(seqlen=block_size, pad_domain="padding", trim_domains={"diseases"}, PADDING_TOKEN=0, PAD_AGE=-10000.0, mode="fast")
+            logits_dict, _ = self(*es.to_model_inputs())    
+            
+            logits_all_domains = []
+
+            for dom in self.predicted_domains:
+                assert dom  in logits_dict, f"Domain '{dom}' not found in model output ({model.predicted_domains})."
+                x = logits_dict[dom]   # [B, L, D]
+                B, L, D_dom = x.shape
+                logits_all_domains.append(x) # .reshape(B * L, D_dom))
+                
+            logits_all_domains = torch.cat(logits_all_domains, dim=-1)  # [B * L, sum(Ds)]
+            all_logits.append(logits_all_domains)
+    
+        logits = torch.cat(all_logits, dim=0)    
+        return logits
+
 
     @classmethod
     def from_checkpoint(cls, ckpt_path, device=None):

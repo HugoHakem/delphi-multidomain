@@ -2,8 +2,6 @@
 import os, sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
-os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
 
 import time
 from contextlib import nullcontext
@@ -15,8 +13,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Iterator, Optional, List, Dict, Set
 from easydict import EasyDict
 import yaml
+
 import warnings
-from omegaconf import OmegaConf
 import logging
 
 import numpy as np
@@ -66,7 +64,6 @@ class TokenDomain:
 
         self.tokens    = self._load_tokens(os.path.join(path, "tokens.csv"), subjects=subjects)
         self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))        
-        
         self.aggregation_strategy = aggregation_strategy
 
         if aggregation_strategy is not None:
@@ -96,11 +93,18 @@ class TokenDomain:
         if self.type == "categorical" and "token_id" not in df.columns:
             raise ValueError(f"Invalid tokens file {path}, must contain token_id since type==categorical")
             
-        if "age" not in df.columns:
-            if self.at_birth:
-                df["age"] = 0
-            else:
-                df["age"] = None
+        if self.at_birth:
+            if "age" in df.columns:
+                if (df["age"] != 0).any():
+                    warnings.warn(
+                        "at_birth=True but non-zero ages found in dataframe. "
+                        "All ages will be overwritten to 0.",
+                        UserWarning
+                    )                    
+                    df["age"] = 0
+
+        # else:
+            # df["age"] = None
 
         if subjects is not None:
             df = df.query("subject_id in @subjects")
@@ -173,7 +177,7 @@ class DelphiDataset:
         """
 
         self.root = Path(root)
-        self.device = device
+        self._device = device
 
         # Load the data        
         self.domains = EasyDict()
@@ -239,6 +243,11 @@ and
         # of internal use, for faster slicing
         self._subject_indices = self._precompute_subject_indices_per_domain()
            
+
+    @property
+    def device(self):
+        device = [ self.domains[dname].tokens.device for dname in self.domains ][0]
+        return device
 
     @property
     def subjects(self):
@@ -363,126 +372,6 @@ and
         return out
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-
-
-def get_batch(
-    ix, data, p2i, 
-    select='left', index='patient', padding='regular',
-    block_size=48, device='', lifestyle_augmentations=False, 
-    no_event_token_rate=5, cut_batch=False, return_subject_ids=False
-    ):
-    
-    MASKING_TOKEN, MASKING_AGE = -1, -10000    
-    
-    # TODO: move this to tokenizer
-    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3, 11
-
-    # Define the columns of the data array    
-    SUBJECT_ID_COLUMN, AGE_COLUMN, TOKEN_COLUMN = 0, 1, 2
-
-    subject_start_and_count = torch.tensor(np.array([p2i[int(i)] for i in ix]))
-    if return_subject_ids:
-        subject_ids = torch.tensor(np.array([data[int(subject_index[0]), SUBJECT_ID_COLUMN] for subject_index in subject_start_and_count]))        
-        
-    ix = torch.tensor(np.array(ix))
-
-    gen = torch.Generator(device='')
-    gen.manual_seed(ix.sum().item())  # we want some things be random, but also deterministic
-
-    if index == 'patient':
-        if select == 'left':
-            traj_start_idx = subject_start_and_count[:, 0]
-        elif select == 'right':
-            traj_start_idx = torch.clamp(subject_start_and_count[:, 0] + subject_start_and_count[:, 1] - block_size - 1, 0, data.shape[0])
-        elif select == 'random':
-            traj_start_idx = subject_start_and_count[:, 0] + (torch.randint(2**63-1, (len(ix),), generator=gen) % torch.clamp(subject_start_and_count[:, 1] - block_size, 1))
-            traj_start_idx = torch.clamp(traj_start_idx, 0, data.shape[0])
-        else:
-            raise NotImplementedError
-    else:
-        raise NotImplementedError
-
-    traj_start_idx = torch.clamp(traj_start_idx, 0, data.shape[0] - block_size - 1)
-    traj_start_idx = traj_start_idx.numpy()
-
-    batch_idx = np.arange(block_size + 1)[None, :] + traj_start_idx[:, None]
-
-    mask = torch.from_numpy(data[:, SUBJECT_ID_COLUMN][batch_idx].astype(np.int64))
-    mask = mask == torch.tensor(data[p2i[ix.numpy()][:, SUBJECT_ID_COLUMN], SUBJECT_ID_COLUMN][:, None].astype(np.int64)).to(mask.dtype)
-
-    tokens = torch.from_numpy(data[:, TOKEN_COLUMN][batch_idx].astype(np.int64))
-    ages   = torch.from_numpy(data[:, AGE_COLUMN][batch_idx].astype(np.float32))
-
-    # augment lifestyle tokens to avoid immortality bias
-    if lifestyle_augmentations:
-        lifestyle_idx = (tokens >= LIFESTYLE_MIN_INDEX) * (tokens <= LIFESTYLE_MAX_INDEX)
-        n_lifestyles_tokens = lifestyle_idx.sum()
-        if n_lifestyles_tokens:
-            ages[lifestyle_idx] += torch.randint(-20*365, 365*40, (n_lifestyles_tokens,), generator=gen).float()
-
-    tokens = tokens.masked_fill(~mask, MASKING_TOKEN)
-    ages   = ages.masked_fill(~mask, MASKING_AGE)
-    
-    # insert a "no event" token every 5 years on average
-    if (padding.lower() == 'none' or padding is None or no_event_token_rate == 0 or no_event_token_rate is None):
-        pad = torch.ones(len(ix), 0)
-    elif padding == 'regular':
-        pad = torch.arange(0, 100 * DAYS_PER_YEAR, DAYS_PER_YEAR * no_event_token_rate) * torch.ones(len(ix), 1) + 1
-    elif padding == 'random':
-        pad = torch.randint(1, 100 * DAYS_PER_YEAR, (len(ix), int(100 / no_event_token_rate)), generator=gen)
-    else:
-        raise NotImplementedError
-    
-    m = ages.max(1, keepdim=True).values
-
-    # stack "no event" tokens with real tokens
-    tokens = torch.hstack([tokens, torch.zeros_like(pad, dtype=torch.int)])
-    ages = torch.hstack([ages, pad])
-
-    # mask out "no event" tokens that are too far in the future (i.e. after the last real token)
-    tokens = tokens.masked_fill(ages > m, MASKING_TOKEN)
-    ages = ages.masked_fill(ages > m, MASKING_AGE)
-
-    # sort everything so that things are correctly ordered about stacking
-    s = torch.argsort(ages, 1)
-    tokens = torch.gather(tokens, 1, s)
-    ages = torch.gather(ages, 1, s)
-
-    # a technical detail: the token 0 is reserved for padding, so we shift all tokens by one
-    tokens = tokens + 1
-
-    # cut the padded tokens if possible
-    if cut_batch:
-        cut_margin = torch.min(torch.sum(tokens == 0, 1))
-        tokens = tokens[:, cut_margin:]
-        ages = ages[:, cut_margin:]
-
-    # cut to maintain the block size
-    if tokens.shape[1] > block_size + 1:
-        cut_margin = tokens.shape[1] - block_size - 1
-        tokens = tokens[:, cut_margin:]
-        ages = ages[:, cut_margin:]
-
-    # shift by one to generate targets
-    x, y = tokens[:, :-1], tokens[:, 1:]
-    a, b = ages[:, :-1]  , ages[:, 1:]
-
-    # if the first token is a "no event" token, mask it and the corresponding target
-    x = x.masked_fill((x == 0) * (y == 1), 0)
-    y = y.masked_fill(x == 0, 0)
-    b = b.masked_fill(x == 0, MASKING_AGE)
-
-    if device == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, a, y, b = [i.pin_memory().to(device, non_blocking=True) for i in [x, a, y, b]]
-    else:
-        x, a, y, b = x.to(device), a.to(device), y.to(device), b.to(device)
-
-    if return_subject_ids:
-        return x, a, y, b, subject_ids
-    else:           
-        return x, a, y, b
-
 
 def select_window(subject_start_and_count, block_size, data, mode="left", gen=None):
     """Choose start index of trajectory window for each subject."""
@@ -635,7 +524,7 @@ def get_domain_id(domain_name):
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-from collections import defaultdict
+
 
 def collate_fn_domains(batch):
     domains = defaultdict(list)
@@ -672,22 +561,17 @@ class FlexibleDataLoader(DataLoader):
         )
 
 
-
 class DelphiDataloader(FlexibleDataLoader):
     
-    def __init__(self, dataset, block_size=48, device="", return_dictionary=True, **kwargs):
-        
-        if return_dictionary:
-            collate_fn = collate_fn_domains
-        else:
-            collate_fn = lambda b: collate_fn(b, block_size=block_size, device=device),
-        
-        super().__init__(
-            dataset,
-            collate_fn=collate_fn,
-            **kwargs
-        )
+    def __init__(self, dataset, block_size=48, device=None, return_dictionary=True, **kwargs):
 
+        self.device = dataset.device if device is None else device
+        #if return_dictionary:
+        collate_fn = collate_fn_domains
+        # collate_fn = lambda b: collate_fn(b, block_size=block_size, device=self.device)
+        super().__init__(dataset, collate_fn=collate_fn, **kwargs)
+        # else:
+        
     
     def get_tensors_from_batch(self, batch, device=None):
         

@@ -16,7 +16,10 @@ from scripts.s02_compute_case_ctrl_indices import INDICES_FILE_PATTERN
 INDICES_FILE_PATTERN = INDICES_FILE_PATTERN.format(ci="*", n_chunks="*", dchunk="*", n_dchunks="*")
 LOGITS_FILE_PATTERN  = LOGITS_FILE_PATTERN.format(ci="*", n_chunks="*", dchunk="*", n_dchunks="*")
 
+<<<<<<< Updated upstream
 
+=======
+>>>>>>> Stashed changes
 def load_logits(runid, logits_root):
     """
     Carga logits por chunk_index → {chunk_idx: tensor[T, D]}
@@ -46,6 +49,12 @@ def load_indices(runid, indices_root):
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
+<<<<<<< Updated upstream
+=======
+# def get_global_token_id(domain, local_token_id):
+
+
+>>>>>>> Stashed changes
 def collect_logits_merged(runid, indices_root, logits_root):
     """
     Junta logits por (disease, sex, age_start, age_end).
@@ -74,6 +83,8 @@ def collect_logits_merged(runid, indices_root, logits_root):
     
             domain   = row["domain"]                # string: "diseases", "death", ...
             token_id = int(row["token_id"])         # columna dentro del dominio
+            global_token_id = get_global_token_id(domain, token_id)
+
             sex      = row["sex"]
             a0       = int(row["age_start"])
             a1       = int(row["age_end"])
@@ -135,6 +146,7 @@ def main():
 
     # Merge logits
     merged = collect_logits_merged( args.runid, indices_root=args.indices_root, logits_root=args.logits_root )    
+<<<<<<< Updated upstream
 
     logits_df, output_path = save_merged_as_parquet(args.runid, merged, outdir=args.logits_merged_outdir)
 
@@ -166,8 +178,37 @@ def main():
     out_df = pd.DataFrame(results)
     out_path = auc_output_dir / f"aucs.csv"
     out_df.to_csv(out_path, index=False)
+=======
+    logits_df, output_path = save_merged_as_parquet(args.runid, merged, outdir=args.logits_merged_outdir)
 
+    # Compute AUCs
+    ( auc_output_dir := Path(args.auc_output_dir) / args.runid ).mkdir(exist_ok=True, parents=True)
+>>>>>>> Stashed changes
+
+    results = []
+    for _, row in tqdm(logits_df.iterrows(), total=logits_df.shape[0]):
+        
+        token = row["domain"], row["token_id"]
+        sex = row["sex"]
+        age_bin = row["age_start"], row["age_end"]
+        
+        print("[INFO] Computing AUC / Mann–Whitney for ...")
+
+        case_logits, ctrl_logits = row["case_logits"], row["ctrl_logits"]
+        
+        stats = compute_all_stats( case_logits, ctrl_logits, do_bootstrap=args.bootstrap, n_bootstrap=args.n_bootstrap )
+
+        results.append({ 
+            "runid": runid, 
+            "domain": token[0], "token_id": token[1], 
+            "sex": sex, "age_start": age_bin[0], "age_end": age_bin[1], 
+            "n_case": row["n_case"], "n_ctrl": row["n_ctrl"],
+            **stats
+        })
+
+    out_df = pd.DataFrame(results)
+    out_path = auc_output_dir / f"aucs.csv"
+    out_df.to_csv(out_path, index=False)
 
 if __name__ == "__main__":
     main()
-

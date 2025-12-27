@@ -3,24 +3,12 @@ import os, sys
 from pathlib import Path
 import yaml
 
-DELPHI_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, DELPHI_DIR)
-DELPHI_DIR = Path(DELPHI_DIR)
-
-os.environ["DELPHI_DATA_DIR"] = os.getenv("DELPHI_DATA_DIR", "../data")
-os.environ["DELPHI_CKPT_DIR"] = os.getenv("DELPHI_CKPT_DIR", "../output/checkpoints")
-
-root_path = Path("../data/transforms")
-
-MLFLOW_URI = os.getenv("MLFLOW_URI", DELPHI_DIR / "mlruns")
-
-ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config/attention_schemes.yaml").read_text() )
+DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 import re
 import ast
 from datetime import datetime
 
-from data.event_set import EventSet
 import numpy as np
 import pandas as pd
 
@@ -42,18 +30,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 from collections import defaultdict
 
+if ( DELPHI_DIR := Path(__file__).resolve().parent ) not in sys.path:
+    sys.path.insert(0, str(DELPHI_DIR))
+
+root_path = DELPHI_DIR / "data/transforms"
+
+ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config/attention_schemes.yaml").read_text() )
+MLFLOW_URI = os.getenv("MLFLOW_URI", DELPHI_DIR / "mlruns")
+
+from data.event_set import EventSet
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
 from utils.profiling import profile_and_print
 
 from delphi.optim import OptimConfig, configure_optimizers
-from delphi.model.transformer import (
+from delphi.model.transformer import ( 
     Delphi,
     EmbedConfig,
     DelphiConfig,
 )
-
-DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 RUN_NAME = os.getenv("RUN_NAME", "default")
 odir = f"output/{RUN_NAME}"
@@ -364,12 +359,20 @@ class Trainer():
     # ——————————————————————————————————————————————————————————————————————————————
    
     @property
+    def device(self):
+        return self.model.device
+
+    @property
+    def domain_cfg(self):
+        return self.model.config.domains
+
+    @property
     def predicted_domains(self):
-        return [ dname for dname, config in self.model.config.domains.items() if config.predict ]
+        return [ dname for dname, config in self.domain_cfg.items() if config.predict ]
 
     @property
     def predicted_domains_as_int(self):
-        return torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(DEVICE)
+        return torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(self.device)
 
     @property
     def domain_to_int(self):
@@ -845,10 +848,8 @@ def config_from_runid(runid):
     # Retrieve run info (contains experiment ID and tags)
     runinfo = mlflow.get_run(runid)
     
-    # experiment_id = runinfo.info.experiment_id
-    # experiment_name = mlflow.get_experiment(experiment_id).name
+    artifact_uri = re.sub(".*mlruns", "mlruns", runinfo.info.artifact_uri)
     
-    artifact_uri = re.sub(".*mlruns", "mlruns", runinfo.info.artifact_uri)                
     if "batch_size" in runinfo.data.params:
         batch_size = int(runinfo.data.params.pop("batch_size"))
     else:
@@ -973,6 +974,7 @@ else:
     })
 
 def parse_attention_scheme(attention_scheme, as_list=True):
+    
     if isinstance(attention_scheme, str):
         if attention_scheme in ATTENTION_SCHEMES.keys():
             attention_scheme = ATTENTION_SCHEMES[attention_scheme]["scheme"]

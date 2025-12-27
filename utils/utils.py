@@ -2,13 +2,15 @@ import numpy as np
 import pandas as pd
 import torch
 import re
-import os
+import os, sys
 import ast 
 from pathlib import Path
 import mlflow
 from easydict import EasyDict
 
-os.chdir( DELPHI_DIR := Path(__file__).resolve().parent.parent )
+DELPHI_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, DELPHI_DIR)
+
 MLFLOW_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" ) )
 
 from delphi.model.transformer import (
@@ -215,7 +217,7 @@ def reconstruct_model(run_id):
     model.to("cpu")
     model.eval()
 
-    return model, test_ids, ckpt_path, params, domain_cfg
+    return model, test_ids, ckpt_path, params
 
 def get_domain_configs_from_string(s):
     return EasyDict(eval(s, {"PosixPath": Path, "__builtins__": {}}, {}))

@@ -17,6 +17,7 @@ if ( DELPHI_DIR := Path(__file__).resolve().parent.parent.parent ) not in sys.pa
     sys.path.insert(0, str(DELPHI_DIR))
     
 from data.event_set import EventSet
+from utils.utils import reconstruct_model
 
 from utils.utils import reconstruct_model
 
@@ -77,7 +78,7 @@ def get_case_ctrl_prevtoken_indices(df, disease_id, sex_token_id, age_min, age_m
     all_subjects = np.unique(subj_arr)
     subjects_without_dis = np.setdiff1d(all_subjects, subjects_with_dis)
     mask_never_had_disease = np.isin(subj_arr, subjects_without_dis)
-    
+    # ctrl_mask = ( mask_sex & mask_age & mask_dom & mask_never_had_disease )
     ctrl_mask = ( mask_sex & mask_age & mask_never_had_disease )
     ctrl_global_idx = global_arr[ctrl_mask]
 
@@ -100,7 +101,7 @@ def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
     
     df = pd.read_parquet(tokens_file).assign(age=lambda df: df.age_days)
 
-    model, _, _, _, _ = reconstruct_model(runid)
+    model, _, _, _ = reconstruct_model(runid)
     domain_to_id = df[['domain_id', 'domain']].drop_duplicates().set_index("domain").domain_id.to_dict()   
     print("[INFO] domain_to_id =", domain_to_id)
 
@@ -130,7 +131,7 @@ def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
             continue
     
         all_tokens = np.arange(max_token + 1)
-        my_tokens = np.array_split(all_tokens, n_dchunks)[dchunk]
+        my_tokens = np.array_split(all_tokens, n_dchunks)[dchunk-1]
     
         print(f"[INFO] chunk={ci}, dchunk={dchunk}, domain={dom}, tokens={len(my_tokens)}")
     
@@ -149,6 +150,10 @@ def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
         df_out.to_parquet(output_file)
     
     return df_out
+        
+    #indices_file = indices_file_pattern.format(ci=ci, n_chunks=n_chunks, dchunk=dchunk, n_dchunks=n_dchunks)
+    #df_out.to_parquet(outfile := outdir / indices_file)
+    #print("[OK] saved:", outfile)
 
 
 if __name__ == "__main__":
@@ -163,6 +168,5 @@ if __name__ == "__main__":
     parser.add_argument("--prediction_domains", type=str, default=None, nargs='+')
     args = parser.parse_args()
 
-    main(args)
+    main(args.runid, args.chunk_index, args.dchunk, args.n_dchunks, args.tokens_file, args.output_file)
     
-# %%
