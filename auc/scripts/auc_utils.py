@@ -2,10 +2,6 @@ import numpy as np
 from scipy.stats import mannwhitneyu
 import torch
 
-<<<<<<< Updated upstream
-
-=======
->>>>>>> Stashed changes
 def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1):
     """
     Computes bootstrapped AUC estimates using PyTorch on CUDA.
@@ -190,8 +186,4 @@ def compute_all_stats(case, ctrl, do_bootstrap=False, n_bootstrap=200):
         "mann_p": float(p),
         "auc_bootstrap_mean": auc_b_mean,
         "auc_bootstrap_std": auc_b_std,
-<<<<<<< Updated upstream
     }
-=======
-    }
->>>>>>> Stashed changes

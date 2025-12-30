@@ -10,24 +10,19 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from auc_utils import compute_all_stats
-from s01_compute_logits_per_chunk          import LOGITS_FILE_PATTERN
-from scripts.s02_compute_case_ctrl_indices import INDICES_FILE_PATTERN
 
-INDICES_FILE_PATTERN = INDICES_FILE_PATTERN.format(ci="*", n_chunks="*", dchunk="*", n_dchunks="*")
-LOGITS_FILE_PATTERN  = LOGITS_FILE_PATTERN.format(ci="*", n_chunks="*", dchunk="*", n_dchunks="*")
+# This has to match the pattern from auc-calculation.nf
+INDICES_FILE_PATTERN = "indices_*_*.parquet"
+LOGITS_FILE_PATTERN  = "logits_*_of_100.pt"
 
-<<<<<<< Updated upstream
-
-=======
->>>>>>> Stashed changes
 def load_logits(runid, logits_root):
     """
     Carga logits por chunk_index → {chunk_idx: tensor[T, D]}
     """
-    base = Path(logits_root) / runid
+    basedir = Path(logits_root) / runid
     out = {}
-
-    files = sorted(base.glob(LOGITS_FILE_PATTERN))
+    print(basedir)
+    files = sorted(basedir.glob(LOGITS_FILE_PATTERN))
     print(f"[INFO] Logits found: {len(files)} files")
 
     for f in tqdm(files, desc="Loading logits"):
@@ -41,7 +36,10 @@ def load_indices(runid, indices_root):
     """
     Concatena TODOS los parquets de índices del run.
     """
-    files = sorted(Path(indices_root).glob(f"{runid}/{INDICES_FILE_PATTERN}"))
+
+    basedir = Path(indices_root) / runid
+    files = sorted(basedir.glob(f"{INDICES_FILE_PATTERN}"))
+
     if not files:
         raise RuntimeError(f"No index files found for run {runid}")
 
@@ -49,12 +47,6 @@ def load_indices(runid, indices_root):
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-<<<<<<< Updated upstream
-=======
-# def get_global_token_id(domain, local_token_id):
-
-
->>>>>>> Stashed changes
 def collect_logits_merged(runid, indices_root, logits_root):
     """
     Junta logits por (disease, sex, age_start, age_end).
@@ -139,19 +131,22 @@ def main():
     parser.add_argument("--indices_root", default="/hps/nobackup/birney/users/bonazzola/auc/indices")
     parser.add_argument("--logits_root", default="/hps/nobackup/birney/users/bonazzola/auc/full_logits")
     parser.add_argument("--logits_merged_outdir", default="/hps/nobackup/birney/users/bonazzola/auc/logits_merged")
-    parser.add_argument("--auc_output_dir", default="auc_results")
+    parser.add_argument("--auc_output_file")
     parser.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--n_bootstrap", type=int, default=200)
     args = parser.parse_args()
 
     # Merge logits
-    merged = collect_logits_merged( args.runid, indices_root=args.indices_root, logits_root=args.logits_root )    
-<<<<<<< Updated upstream
+    merged = collect_logits_merged( 
+        args.runid,
+        indices_root=args.indices_root,
+        logits_root=args.logits_root
+    )    
 
-    logits_df, output_path = save_merged_as_parquet(args.runid, merged, outdir=args.logits_merged_outdir)
-
-    # Compute AUCs
-    ( auc_output_dir := Path(args.auc_output_dir) / args.runid ).mkdir(exist_ok=True, parents=True)
+    logits_df, output_path = save_merged_as_parquet(
+        args.runid, merged, 
+        outdir=args.logits_merged_outdir
+    )
 
     results = []
 
@@ -176,39 +171,10 @@ def main():
         })
 
     out_df = pd.DataFrame(results)
-    out_path = auc_output_dir / f"aucs.csv"
-    out_df.to_csv(out_path, index=False)
-=======
-    logits_df, output_path = save_merged_as_parquet(args.runid, merged, outdir=args.logits_merged_outdir)
+    
+    Path(args.auc_output_file).parent.mkdir(exist_ok=True, parents=True)
+    out_df.to_csv(args.auc_output_file, index=False)
 
-    # Compute AUCs
-    ( auc_output_dir := Path(args.auc_output_dir) / args.runid ).mkdir(exist_ok=True, parents=True)
->>>>>>> Stashed changes
-
-    results = []
-    for _, row in tqdm(logits_df.iterrows(), total=logits_df.shape[0]):
-        
-        token = row["domain"], row["token_id"]
-        sex = row["sex"]
-        age_bin = row["age_start"], row["age_end"]
-        
-        print("[INFO] Computing AUC / Mann–Whitney for ...")
-
-        case_logits, ctrl_logits = row["case_logits"], row["ctrl_logits"]
-        
-        stats = compute_all_stats( case_logits, ctrl_logits, do_bootstrap=args.bootstrap, n_bootstrap=args.n_bootstrap )
-
-        results.append({ 
-            "runid": runid, 
-            "domain": token[0], "token_id": token[1], 
-            "sex": sex, "age_start": age_bin[0], "age_end": age_bin[1], 
-            "n_case": row["n_case"], "n_ctrl": row["n_ctrl"],
-            **stats
-        })
-
-    out_df = pd.DataFrame(results)
-    out_path = auc_output_dir / f"aucs.csv"
-    out_df.to_csv(out_path, index=False)
 
 if __name__ == "__main__":
     main()

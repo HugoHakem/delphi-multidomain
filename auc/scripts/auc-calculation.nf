@@ -2,6 +2,8 @@
 nextflow.enable.dsl = 2
 
 params.outdir = "/hps/nobackup/birney/users/bonazzola/auc/work"
+params.n_subject_chunks = 100
+params.n_disease_chunks = 10
 
 process computeLogits {
 
@@ -53,7 +55,7 @@ process computeIndicesPerDiseaseAgeSex {
 
     script:
     """
-    mkdir -p indices/${runid}
+    mkdir -p ${params.outdir}/indices/${runid}
     python ${indices_py} \
         --runid ${runid} \
         --tokens_file ${tokens} \
@@ -64,41 +66,39 @@ process computeIndicesPerDiseaseAgeSex {
     """    
 }
 
-process extractLogits {
+process extractLogitsComputeAUC {
 
-    publishDir 'results/extracted', mode: 'copy'
+    tag "${runid}__${disease_chunk}_of_${n_disease_chunks}"
+
+    executor 'slurm'
+    cpus 1
+    memory '8 GB'
+    time '0.1h'
+
+    // publishDir 'results/extracted', mode: 'copy'
 
     input:
         tuple val(runid), val(disease_chunk), path(logits), path(indices)
     output:
-        tuple val(runid), val(disease_chunk), path("extracted_${runid}_${subject_chunk}_${disease_chunk}.txt")
+        tuple val(runid), val(disease_chunk), path("indices/${runid}/aucs.csv")
 
     script:
     """
+    mkdir -p ${params.outdir}/auc/${runid}
+    python s03_logits_to_parquet.py \
+      --runid ${runid} \
+      --indices_root ${indices} \
+      --logits_root ${logits} \
+      --logits_merged_outdir \
+      --auc_output_dir "indices/${runid}/aucs.csv" \
+      --bootstrap \
+      --n_bootstrap 200 
+
     echo "extract run=${runid} subject=${subject_chunk} disease=${disease_chunk}" \
         > extracted_${runid}_${subject_chunk}_${disease_chunk}.txt
     """
 }
 
-process computeAUCs {
-
-    publishDir 'results/auc', mode: 'copy'
-
-    input:
-        tuple val(runid), val(disease_chunk), path(extracted_files)
-
-    output:
-        path "auc_${runid}_${disease_chunk}.txt"
-
-    script:
-    """
-    echo "AUC run=${runid} disease=${disease_chunk}" \
-        > auc_${runid}_${disease_chunk}.txt
-    """
-}
-
-params.n_subject_chunks = 100
-params.n_disease_chunks = 10
 
 workflow {
 
@@ -129,9 +129,8 @@ workflow {
     indices_ch = computeIndicesPerDiseaseAgeSex(indices_py, indices_input_ch, params.n_disease_chunks)
 
     // 3) logit extraction
-    // runid, disease_chunk_ch, extracted_logits_ch = extractLogits(runid_ch, disease_chunk_ch, logits_ch, indices_ch)
-
-    // 4) AUC: sync por (runid, disease)
-    // computeAUCs(runid, disease_chunk_ch, extracted_logits_ch)
+    runid, disease_chunk_ch, extracted_logits_ch = extractLogitsComputeAUC(
+        runid_ch, disease_chunk_ch, logits_ch, indices_ch
+    )
 
 }

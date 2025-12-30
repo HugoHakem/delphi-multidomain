@@ -19,8 +19,6 @@ if ( DELPHI_DIR := Path(__file__).resolve().parent.parent.parent ) not in sys.pa
 from data.event_set import EventSet
 from utils.utils import reconstruct_model
 
-from utils.utils import reconstruct_model
-
 SEX_TOKENS = {"female": 0, "male": 1}
 AGE_RANGES = [(a, a+5) for a in range(0, 90, 5)]
 MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI")
@@ -43,7 +41,6 @@ def get_case_ctrl_prevtoken_indices(df, disease_id, sex_token_id, age_min, age_m
     subj_arr    = df["subject_idx"].to_numpy()
     token_arr   = df["token_id"].to_numpy()
     dom_arr     = df["domain_id"].to_numpy()
-    # seq_arr     = df["seq_idx"].to_numpy()
     global_arr  = df["global_idx"].to_numpy()
 
     subj2sex = get_subject_sex(df, dom_sex)
@@ -151,10 +148,6 @@ def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
     
     return df_out
         
-    #indices_file = indices_file_pattern.format(ci=ci, n_chunks=n_chunks, dchunk=dchunk, n_dchunks=n_dchunks)
-    #df_out.to_parquet(outfile := outdir / indices_file)
-    #print("[OK] saved:", outfile)
-
 
 if __name__ == "__main__":
 

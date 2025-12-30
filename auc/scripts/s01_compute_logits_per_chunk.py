@@ -101,27 +101,31 @@ else:
     n_chunks = 10
     runid    = "10a09e55a89d440298155eb74a1cc6b1"
     output_dir = "test_logits"
+    tokens_file = TOKENS_FILE_PATTERN.format(shard_id=shard_id, n_chunks=n_chunks)
+    logits_file = LOGITS_FILE_PATTERN.format(shard_id=shard_id, n_chunks=n_chunks)
 
 # —————————————————————————————————————————————————————————————————————————————————————
 
-print(f"Processing chunk {shard_id}", flush=True)
-
-model, test_ids, _, _ = reconstruct_model(runid)
-model.to(device)
-shard_subjects = split_subjects(test_ids, n_chunks, shard_id-1)
-
-dataset = DelphiDataset(domains=model.domain_cfg, root=DELPHI_DIR / "data/transforms", subjects=shard_subjects).to(device)
-
-Path(tokens_file).parent.mkdir(exist_ok=True, parents=True)
-Path(logits_file).parent.mkdir(exist_ok=True, parents=True)
-
-logits    = model.run_inference(dataset, batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
-tokens_df = token_df_from_dataloder(dataset, batch_size=BATCH_SIZE)
-
-tokens_df.to_parquet(tokens_file, index=False)
-
-vocab_len = logits.shape[-1]
-torch.save(logits.reshape(-1, vocab_len), logits_file)
-
-print(f"Chunk {shard_id} ready ({len(tokens_df)} rows)", flush=True)  
-print(f"Files created {logits_file} and {tokens_file}", flush=True)  
+if __name__ == "__main__":
+    
+    print(f"Processing chunk {shard_id}", flush=True)
+    
+    model, test_ids, _, _ = reconstruct_model(runid)
+    model.to(device)
+    shard_subjects = split_subjects(test_ids, n_chunks, shard_id-1)
+    
+    dataset = DelphiDataset(domains=model.domain_cfg, root=DELPHI_DIR / "data/transforms", subjects=shard_subjects).to(device)
+    
+    Path(tokens_file).parent.mkdir(exist_ok=True, parents=True)
+    Path(logits_file).parent.mkdir(exist_ok=True, parents=True)
+    
+    logits    = model.run_inference(dataset, batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
+    tokens_df = token_df_from_dataloder(dataset, batch_size=BATCH_SIZE)
+    
+    tokens_df.to_parquet(tokens_file, index=False)
+    
+    vocab_len = logits.shape[-1]
+    torch.save(logits.reshape(-1, vocab_len), logits_file)
+    
+    print(f"Chunk {shard_id} ready ({len(tokens_df)} rows)", flush=True)  
+    print(f"Files created {logits_file} and {tokens_file}", flush=True)  
