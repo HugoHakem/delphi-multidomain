@@ -20,19 +20,19 @@ process computeLogits {
         val(n_chunks)
 
     output:
-        tuple val(runid), val(subject_chunk), path("logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt"), path("tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet") 
+        tuple val(runid), val(subject_chunk), val(n_chunks)
 
     script:
     """
-    mkdir -p ${params.outdir}/logits/${runid}
-    mkdir -p ${params.outdir}/tokens/${runid}
-
     python ${logits_py} \
         --chunk_index ${subject_chunk} \
         --n_chunks ${n_chunks} \
         --runid ${runid} \
-        --logits_file logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt \
-        --tokens_file tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet
+        --logits_file ${params.outdir}/logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt \
+        --tokens_file ${params.outdir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet
+    
+    test -s ${params.outdir}/logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt
+    test -s ${params.outdir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet
     """    
 }
 
@@ -47,22 +47,22 @@ process computeIndicesPerDiseaseAgeSex {
 
     input:
         path indices_py
-        tuple val(runid), val(subject_chunk), path(logits), path(tokens), val(disease_chunk)
+        tuple val(runid), val(subject_chunk), val(disease_chunk)
         val(n_disease_chunks)
 
     output:
-        tuple val(runid), val(disease_chunk), path("indices/${runid}/indices_${subject_chunk}_${disease_chunk}.parquet")
+        tuple val(runid), val(subject_chunk), val(disease_chunk), val(n_disease_chunks)
 
     script:
     """
-    mkdir -p ${params.outdir}/indices/${runid}
     python ${indices_py} \
         --runid ${runid} \
-        --tokens_file ${tokens} \
-        --output "indices/${runid}/indices_${subject_chunk}_${disease_chunk}.parquet" \
+        --tokens_file ${params.outdir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet \
+        --output_file ${params.outdir}/indices/${runid}/indices_${subject_chunk}_${disease_chunk}.parquet \
         --chunk_index ${subject_chunk} \
         --dchunk ${disease_chunk} \
         --n_dchunks ${n_disease_chunks}
+    test -s ${params.outdir}/indices/${runid}/indices_${subject_chunk}_${disease_chunk}.parquet
     """    
 }
 
@@ -78,24 +78,26 @@ process extractLogitsComputeAUC {
     // publishDir 'results/extracted', mode: 'copy'
 
     input:
-        tuple val(runid), val(disease_chunk), path(logits), path(indices)
+        tuple val(runid), val(subject_chunk), val(disease_chunk), val(n_disease_chunks) 
+        path(indices),
+        path(logits)
     output:
-        tuple val(runid), val(disease_chunk), path("indices/${runid}/aucs.csv")
+        tuple val(runid), val(disease_chunk), path("aucs/${runid}/aucs.csv")
 
     script:
     """
-    mkdir -p ${params.outdir}/auc/${runid}
+    # mkdir -p ${params.outdir}/auc/${runid}
     python s03_logits_to_parquet.py \
       --runid ${runid} \
       --indices_root ${indices} \
       --logits_root ${logits} \
-      --logits_merged_outdir \
-      --auc_output_dir "indices/${runid}/aucs.csv" \
+      --logits_merged_outdir ${params.outdir}/logits_merged/${runid} \
+      --auc_output_dir "aucs/${runid}/aucs.csv" \
       --bootstrap \
       --n_bootstrap 200 
 
-    echo "extract run=${runid} subject=${subject_chunk} disease=${disease_chunk}" \
-        > extracted_${runid}_${subject_chunk}_${disease_chunk}.txt
+    # echo "extract run=${runid} subject=${subject_chunk} disease=${disease_chunk}" \
+    #     > extracted_${runid}_${subject_chunk}_${disease_chunk}.txt
     """
 }
 
@@ -105,15 +107,15 @@ workflow {
     Channel.fromPath('runs.csv')
            .splitCsv(header: true)
            .map { row -> row.runid }
-           //.view { kk -> "Run ID: $kk"}
+           .view { kk -> "Run ID: $kk"}
            .set { runid_ch }
 
     Channel.from(1..<params.n_subject_chunks+1)
-           //.view(subject_chunk_index -> "Subject index: $subject_chunk_index")    
+           .view(subject_chunk_index -> "Subject index: $subject_chunk_index")    
            .set { subject_chunk_ch }
 
     Channel.from(1..<params.n_disease_chunks+1)
-           //.view(disease_chunk_index -> "Disease index: $disease_chunk_index")    
+           .view(disease_chunk_index -> "Disease index: $disease_chunk_index")    
            .set { disease_chunk_ch }
 
     
@@ -128,8 +130,10 @@ workflow {
     indices_input_ch = logits_ch.combine(disease_chunk_ch)
     indices_ch = computeIndicesPerDiseaseAgeSex(indices_py, indices_input_ch, params.n_disease_chunks)
 
+    per_run_disease_ch = indices_ch.groupTuple(by: [0,2])
+ 
     // 3) logit extraction
-    runid, disease_chunk_ch, extracted_logits_ch = extractLogitsComputeAUC(
+    auc_ch = extractLogitsComputeAUC(
         runid_ch, disease_chunk_ch, logits_ch, indices_ch
     )
 

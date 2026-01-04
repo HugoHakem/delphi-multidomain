@@ -88,14 +88,6 @@ def get_predicted_domains(model):
 
 def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
 
-    runid       = args.runid 
-    ci          = args.chunk_index
-    dchunk      = args.dchunk 
-    n_dchunks   = args.n_dchunks
-
-    tokens_file = args.tokens_file 
-    output_file = args.output_file
-    
     df = pd.read_parquet(tokens_file).assign(age=lambda df: df.age_days)
 
     model, _, _, _ = reconstruct_model(runid)
@@ -142,8 +134,8 @@ def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
     df_out = pd.DataFrame(rows)
     df_out["chunk_index"] = ci
     df_out["dchunk"] = dchunk
-
     if output_file is not None:
+        Path(output_file).parent.mkdir(exist_ok=True, parents=True)
         df_out.to_parquet(output_file)
     
     return df_out
