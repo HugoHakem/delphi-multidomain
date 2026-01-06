@@ -8,19 +8,22 @@ from pathlib import Path
 from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
+import sys
 
+if ( DELPHI_DIR := Path(__file__).resolve().parent.parent.parent ) not in sys.path:
+    sys.path.insert(0, str(DELPHI_DIR))
+
+from utils.utils import reconstruct_model
 from auc_utils import compute_all_stats
 
 # This has to match the pattern from auc-calculation.nf
-INDICES_FILE_PATTERN = "indices_*_*.parquet"
-LOGITS_FILE_PATTERN  = "logits_*_of_100.pt"
-
-def load_logits(runid, logits_root):
+def load_logits(runid, logits_root, LOGITS_FILE_PATTERN):
     """
     Carga logits por chunk_index → {chunk_idx: tensor[T, D]}
     """
-    basedir = Path(logits_root) / runid
+    basedir = Path(logits_root)
     out = {}
+    print("LOGITS")
     print(basedir)
     files = sorted(basedir.glob(LOGITS_FILE_PATTERN))
     print(f"[INFO] Logits found: {len(files)} files")
@@ -32,13 +35,15 @@ def load_logits(runid, logits_root):
     return out
 
 
-def load_indices(runid, indices_root):
+def load_indices(runid, indices_root, INDICES_FILE_PATTERN):
     """
     Concatena TODOS los parquets de índices del run.
     """
 
-    basedir = Path(indices_root) / runid
-    files = sorted(basedir.glob(f"{INDICES_FILE_PATTERN}"))
+    basedir = Path(indices_root)
+    print("INDICES")
+    print(basedir)
+    files = sorted(basedir.glob(INDICES_FILE_PATTERN))
 
     if not files:
         raise RuntimeError(f"No index files found for run {runid}")
@@ -47,17 +52,31 @@ def load_indices(runid, indices_root):
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
 
-def collect_logits_merged(runid, indices_root, logits_root):
+def get_offset_per_domain(model):
+    
+    offset_per_domain = np.array([0] + list(model.vocab_lens.values())).cumsum()[:-1]
+    offset_per_domain = torch.tensor(offset_per_domain)
+    return offset_per_domain
+
+
+def get_global_token_id(model, domain, token_id, offset_per_domain):
+    return offset_per_domain[model.predicted_domains_to_int[domain]] + token_id
+
+
+def collect_logits_merged(runid, indices_root, logits_root, indices_file_pattern, logits_file_pattern):
+    
     """
     Junta logits por (disease, sex, age_start, age_end).
     Cada key acumula datos de múltiples chunks.
     Devuelve un dict con vectores concatenados.
     """
 
-    indices_root = Path(indices_root) / runid
-    idx_df = load_indices(runid, indices_root)
-    logits_by_chunk = load_logits(runid, logits_root)
+    indices_root = Path(indices_root)
+    idx_df = load_indices(runid, indices_root, indices_file_pattern)
+    logits_by_chunk = load_logits(runid, logits_root, logits_file_pattern)
 
+    model, _, _, _ = reconstruct_model(runid)
+    offset_per_domain = get_offset_per_domain(model)
     merged = {}   # key → {"case": list, "ctrl": list}
 
     # Group indices by chunk_index para minimizar cargas
@@ -75,7 +94,7 @@ def collect_logits_merged(runid, indices_root, logits_root):
     
             domain   = row["domain"]                # string: "diseases", "death", ...
             token_id = int(row["token_id"])         # columna dentro del dominio
-            global_token_id = get_global_token_id(domain, token_id)
+            global_token_id = get_global_token_id(model, domain, token_id, offset_per_domain)
 
             sex      = row["sex"]
             a0       = int(row["age_start"])
@@ -128,19 +147,23 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--runid", required=True)
-    parser.add_argument("--indices_root", default="/hps/nobackup/birney/users/bonazzola/auc/indices")
-    parser.add_argument("--logits_root", default="/hps/nobackup/birney/users/bonazzola/auc/full_logits")
-    parser.add_argument("--logits_merged_outdir", default="/hps/nobackup/birney/users/bonazzola/auc/logits_merged")
+    parser.add_argument("--indices_root")
+    parser.add_argument("--logits_root")
+    parser.add_argument("--indices_file_pattern")
+    parser.add_argument("--logits_file_pattern")
+    parser.add_argument("--logits_merged_outdir")
     parser.add_argument("--auc_output_file")
     parser.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--n_bootstrap", type=int, default=200)
     args = parser.parse_args()
 
     # Merge logits
-    merged = collect_logits_merged( 
+    merged = collect_logits_merged(
         args.runid,
         indices_root=args.indices_root,
-        logits_root=args.logits_root
+        logits_root=args.logits_root,
+        indices_file_pattern=args.indices_file_pattern, 
+        logits_file_pattern=args.logits_file_pattern
     )    
 
     logits_df, output_path = save_merged_as_parquet(
@@ -155,9 +178,6 @@ def main():
         token = row["domain"], row["token_id"]
         sex = row["sex"]
         age_bin = row["age_start"], row["age_end"]
-        
-        print("[INFO] Computing AUC / Mann–Whitney for ...")
-
         case_logits, ctrl_logits = row["case_logits"], row["ctrl_logits"]
         
         stats = compute_all_stats( case_logits, ctrl_logits, do_bootstrap=args.bootstrap, n_bootstrap=args.n_bootstrap )

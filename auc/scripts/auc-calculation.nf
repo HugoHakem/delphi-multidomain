@@ -2,9 +2,11 @@
 nextflow.enable.dsl = 2
 
 params.outdir = "/hps/nobackup/birney/users/bonazzola/auc/work"
+output_dir = "/hps/nobackup/birney/users/bonazzola/auc/"
 params.n_subject_chunks = 100
 params.n_disease_chunks = 10
 
+// Process 1
 process computeLogits {
 
     tag "${runid}__${subject_chunk}_of_${n_chunks}"
@@ -13,11 +15,11 @@ process computeLogits {
     cpus 1
     memory '16 GB'
     time '0.1h'
+    errorStrategy 'ignore'
 
     input:
         path logits_py
-        tuple val(runid), val(subject_chunk)
-        val(n_chunks)
+        tuple val(runid), val(subject_chunk), val(n_chunks)
 
     output:
         tuple val(runid), val(subject_chunk), val(n_chunks)
@@ -28,27 +30,29 @@ process computeLogits {
         --chunk_index ${subject_chunk} \
         --n_chunks ${n_chunks} \
         --runid ${runid} \
-        --logits_file ${params.outdir}/logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt \
-        --tokens_file ${params.outdir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet
+        --logits_file ${output_dir}/logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt \
+        --tokens_file ${output_dir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet
     
-    test -s ${params.outdir}/logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt
-    test -s ${params.outdir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet
+    test -s ${output_dir}/logits/${runid}/logits_${subject_chunk}_of_${n_chunks}.pt
+    test -s ${output_dir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet
     """    
 }
 
+// Process 2
 process computeIndicesPerDiseaseAgeSex {
 
-    tag "${runid}__${subject_chunk}__${disease_chunk}_of_${n_disease_chunks}"
+    tag "${runid}__${subject_chunk}_of_${n_chunks}__${disease_chunk}_of_${n_disease_chunks}"
 
     executor 'slurm'
     cpus 1
     memory '8 GB'
-    time '0.1h'
+    queueSize = 1000
+    time '0.2h'
+    submitRateLimit = "100/1sec"
 
     input:
         path indices_py
-        tuple val(runid), val(subject_chunk), val(disease_chunk)
-        val(n_disease_chunks)
+        tuple val(runid), val(subject_chunk), val(n_chunks), val(disease_chunk), val(n_disease_chunks)
 
     output:
         tuple val(runid), val(subject_chunk), val(disease_chunk), val(n_disease_chunks)
@@ -57,84 +61,95 @@ process computeIndicesPerDiseaseAgeSex {
     """
     python ${indices_py} \
         --runid ${runid} \
-        --tokens_file ${params.outdir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet \
-        --output_file ${params.outdir}/indices/${runid}/indices_${subject_chunk}_${disease_chunk}.parquet \
+        --tokens_file ${output_dir}/tokens/${runid}/tokens_${subject_chunk}_of_${n_chunks}.parquet \
+        --output_file ${output_dir}/indices/${runid}/indices__${subject_chunk}_of_${n_chunks}__${disease_chunk}_of_${n_disease_chunks}.parquet \
         --chunk_index ${subject_chunk} \
         --dchunk ${disease_chunk} \
         --n_dchunks ${n_disease_chunks}
-    test -s ${params.outdir}/indices/${runid}/indices_${subject_chunk}_${disease_chunk}.parquet
+
+    test -s ${output_dir}/indices/${runid}/indices__${subject_chunk}_of_${n_chunks}__${disease_chunk}_of_${n_disease_chunks}.parquet
     """    
 }
 
+// Process 3
 process extractLogitsComputeAUC {
 
     tag "${runid}__${disease_chunk}_of_${n_disease_chunks}"
 
     executor 'slurm'
-    cpus 1
-    memory '8 GB'
-    time '0.1h'
+    cpus 4
+    memory '128 GB'
+    time '0.2h'
 
-    // publishDir 'results/extracted', mode: 'copy'
+    queueSize = 1000
+    submitRateLimit = "100/1sec"
+    maxRetries = 5
+    errorStrategy = { ( task.exitStatus == 0 ) ? "retry" : "terminate" }
 
     input:
-        tuple val(runid), val(subject_chunk), val(disease_chunk), val(n_disease_chunks) 
-        path(indices),
-        path(logits)
+        path auc_py
+        tuple val(runid), val(disease_chunk), val(n_disease_chunks)
+
     output:
-        tuple val(runid), val(disease_chunk), path("aucs/${runid}/aucs.csv")
+        val(runid)
 
     script:
     """
     # mkdir -p ${params.outdir}/auc/${runid}
-    python s03_logits_to_parquet.py \
+    python $auc_py \
       --runid ${runid} \
-      --indices_root ${indices} \
-      --logits_root ${logits} \
-      --logits_merged_outdir ${params.outdir}/logits_merged/${runid} \
-      --auc_output_dir "aucs/${runid}/aucs.csv" \
+      --indices_root ${output_dir}/indices/${runid} \
+      --logits_root ${output_dir}/logits/${runid} \
+      --logits_merged_outdir ${output_dir}/logits_merged/${runid} \
+      --indices_file_pattern "indices__*_of_${params.n_subject_chunks}__${disease_chunk}_of_${n_disease_chunks}.parquet" \
+      --logits_file_pattern "logits_*_of_${params.n_subject_chunks}.pt" \
+      --auc_output_file ${output_dir}/aucs/${runid}/aucs__${disease_chunk}_of_${n_disease_chunks}.csv \
       --bootstrap \
       --n_bootstrap 200 
 
-    # echo "extract run=${runid} subject=${subject_chunk} disease=${disease_chunk}" \
-    #     > extracted_${runid}_${subject_chunk}_${disease_chunk}.txt
+    test -s ${output_dir}/aucs/${runid}/aucs__${disease_chunk}_of_${n_disease_chunks}.csv
     """
 }
 
 
 workflow {
 
+    // 0) channels
     Channel.fromPath('runs.csv')
            .splitCsv(header: true)
            .map { row -> row.runid }
-           .view { kk -> "Run ID: $kk"}
            .set { runid_ch }
 
     Channel.from(1..<params.n_subject_chunks+1)
-           .view(subject_chunk_index -> "Subject index: $subject_chunk_index")    
            .set { subject_chunk_ch }
 
     Channel.from(1..<params.n_disease_chunks+1)
-           .view(disease_chunk_index -> "Disease index: $disease_chunk_index")    
            .set { disease_chunk_ch }
 
-    
-    runid_subject_ch = runid_ch.combine(subject_chunk_ch)
+    // ###########################################################################
 
     // 1) logits
     logits_py = file("s01_compute_logits_per_chunk.py")
-    logits_ch = computeLogits(logits_py, runid_subject_ch, params.n_subject_chunks)
+
+    n_subject_chunks = Channel.value(params.n_subject_chunks)
+    runid_subject_ch = runid_ch.combine(subject_chunk_ch).combine(n_subject_chunks)
+    logits_ch = computeLogits( logits_py, runid_subject_ch )
 
     // 2) subject × disease
     indices_py = file("s02_compute_case_ctrl_indices.py")
-    indices_input_ch = logits_ch.combine(disease_chunk_ch)
-    indices_ch = computeIndicesPerDiseaseAgeSex(indices_py, indices_input_ch, params.n_disease_chunks)
+    n_disease_chunks = Channel.value(params.n_disease_chunks)
+    indices_input_ch = logits_ch.combine(disease_chunk_ch).combine(n_disease_chunks)
+    
+    // indices_input_ch.view( idx -> "Computing indices for: $idx")
 
-    per_run_disease_ch = indices_ch.groupTuple(by: [0,2])
- 
+    indices_ch = computeIndicesPerDiseaseAgeSex( indices_py, indices_input_ch )
+
     // 3) logit extraction
-    auc_ch = extractLogitsComputeAUC(
-        runid_ch, disease_chunk_ch, logits_ch, indices_ch
-    )
+    auc_py = file("s03_extract_logits_compute_auc.py")
+    per_run_disease_ch = indices_ch.groupTuple(by: 0).map{ runid, subject_chunk, disease_chunk, n_disease_chunks -> runid }
+    per_run_disease_ch = indices_ch.groupTuple(by: [0, 2]).map{ runid, subject_chunk, disease_chunk, n_disease_chunks -> [runid, disease_chunk, n_disease_chunks[0]] }
+    // per_run_ch.view( runid -> "Processing AUC for run ID: $runid")
+    
+    auc_ch = extractLogitsComputeAUC( auc_py, per_run_disease_ch )
 
 }
