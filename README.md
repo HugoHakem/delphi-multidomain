@@ -100,10 +100,20 @@ The previous command will create an MLflow experiment called `rare_variants`.
 
 
 ## Evaluation
+A Nextflow pipeline is available to compute AUCs on a Slurm cluster. The objective is to parallelize the logit computation across many CPUs.
+Note that it generates bulky intermediate logit files.
+
+```
+module load nextflow
+
+cd auc/scripts
+nextflow run auc-calculation.nf
+```
+
+This will produce a set of AUC files, split by chunks of diseases.
 
 
 ## Model explainability
-
 
 ## Submitting a hyperparameter search as Slurm job array
 _To be completed_
