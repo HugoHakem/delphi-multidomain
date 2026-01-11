@@ -7,6 +7,7 @@ import ast
 from pathlib import Path
 import mlflow
 from easydict import EasyDict
+import yaml
 
 DELPHI_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, DELPHI_DIR)
@@ -15,8 +16,28 @@ MLFLOW_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" ) )
 
 from delphi.model.transformer import (
     Delphi,
+    EmbedConfig,
     DelphiConfig
 )
+
+
+def load_embed_config(cfg_path, tokens_path):
+
+    from delphi.model.transformer import EmbedConfig
+
+    raw = yaml.safe_load(Path(cfg_path).read_text())
+
+    cfg = {}
+    for domain, params in raw.items():
+        p = dict(params)
+        if "path" in p:
+            p["path"] = tokens_path / p["path"]
+        cfg[domain] = EmbedConfig(**p)
+
+    return cfg
+
+
+
 
 def fix_artifact_uri(artifact_uri):
     artifact_uri = re.sub(pattern="^file://", repl="", string=artifact_uri)
@@ -58,8 +79,8 @@ def get_top_counts(data, labels, top_n=200, ignored_tokens=[]):
 
 
 def get_wte(model):
-   wte = model.transformer.wte.weight.detach().numpy()
-   return pd.DataFrame(wte, index=[ id_to_token[i] for i in range(-1, len(id_to_token)-1) ])
+    wte = model.transformer.wte.weight.detach().numpy()
+    return pd.DataFrame(wte, index=[ id_to_token[i] for i in range(-1, len(id_to_token)-1) ])
 
 
 def get_best_ckpt(runinfo):
@@ -138,6 +159,7 @@ def load_run_params(run_id):
     params['attention_scheme'] = ast.literal_eval(params["attention_scheme"])
     return params
 
+
 def get_experiment_id_from_runid(run_id):
     return mlflow.get_run(run_id).info.experiment_id
 
@@ -184,6 +206,88 @@ def get_last_epoch_checkpoint(run_dir: str):
         raise RuntimeError("No checkpoint contained an epoch number.")
 
     return best, best_epoch
+
+
+
+# ----------------------------------------------------------------------------------------------------
+
+def config_from_runid(runid):
+
+    VAL_BATCH_SIZE = 256
+
+    # Retrieve run info (contains experiment ID and tags)
+    runinfo = mlflow.get_run(runid)
+    
+    artifact_uri = re.sub(".*mlruns", "mlruns", runinfo.info.artifact_uri)
+    
+    if "batch_size" in runinfo.data.params:
+        batch_size = int(runinfo.data.params.pop("batch_size"))
+    else:
+        batch_size = 16
+
+    if "test_fold" in runinfo.data.params:
+        test_fold = runinfo.data.params.pop("test_fold")
+    else:
+        test_fold = 0
+    
+    if "learning_rate" in runinfo.data.params:
+        learning_rate = runinfo.data.params.pop("learning_rate")
+
+    # ------------------------------------------------------------------------------------------------
+    runinfo.data.params.pop("ema_alpha")
+    runinfo.data.params['attention_scheme'] = ast.literal_eval(runinfo.data.params['attention_scheme'])            
+    s = runinfo.data.params['domains']        
+    s_clean = re.sub(r"PosixPath\(([^)]+)\)", r"\1", s)
+    runinfo.data.params['domains'] = s_clean
+    runinfo.data.params['domains'] = ast.literal_eval(runinfo.data.params['domains'])
+    runinfo.data.params['domains'] = { k: EmbedConfig(**v) for k, v in runinfo.data.params['domains'].items() }
+    for param, value in runinfo.data.params.items():
+        if "drop"in param:
+            runinfo.data.params[param] = float(value)
+        if param in {"n_embd", "n_head", "n_layer", "block_size", "n_layer"}:
+            runinfo.data.params[param] = int(value)
+        if param in {"zero_inflate", "bias"}:
+            runinfo.data.params[param] = True if runinfo.data.params[param] == "True" else False                    
+    # ------------------------------------------------------------------------------------------------
+    
+    tracking_uri = Path(os.path.dirname(mlflow.get_tracking_uri()))
+
+    ckpt_dir = tracking_uri / (artifact_uri + "/checkpoints")
+    ckpt_files = sorted(Path(ckpt_dir).glob("*.pt"))
+    if not ckpt_files:
+        raise FileNotFoundError(f"No checkpoints found for run {runid}")
+    latest_ckpt = ckpt_files[-1]
+
+    print(f"Loading latest checkpoint: {latest_ckpt}")
+    delphi_cfg = DelphiConfig(**runinfo.data.params)
+    model = Delphi(delphi_cfg).to(DEVICE)
+    ckpt = torch.load(latest_ckpt)
+
+    start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
+    weights = ckpt['state_dict']
+    model.load_state_dict(weights, strict=False)
+    torch.compile(model)
+    
+    optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)                      
+    if "optimizer_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    if "scheduler_state" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+
+    train_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['train_ids']).to("cuda")
+    valid_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['valid_ids']).to("cuda")
+    test_dataset  = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['test_ids']).to("cuda")
+    
+    dataloaders = [
+        train_loader := DelphiDataloader(train_dataset, batch_size=batch_size),
+        valid_loader := DelphiDataloader(valid_dataset, batch_size=VAL_BATCH_SIZE), 
+        test_loader  := DelphiDataloader(test_dataset,  batch_size=VAL_BATCH_SIZE)
+    ]    
+
+    previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
+    logged_params = { "test_fold": test_fold, "batch_size": batch_size }    
+
+    return model, dataloaders, optimizer, scheduler, logged_params, previous_run_name
 
 
 def reconstruct_model(run_id):

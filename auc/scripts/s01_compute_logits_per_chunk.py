@@ -30,9 +30,7 @@ from utils.utils import reconstruct_model
 
 device = 'cpu'
 
-BLOCK_SIZE = 128
-BATCH_SIZE = 16
-
+BLOCK_SIZE, BATCH_SIZE = 128, 16
 TOKENS_FILE_PATTERN = "chunk_{shard_id}_of_{n_chunks}_df.parquet"
 LOGITS_FILE_PATTERN = "chunk_{shard_id}_of_{n_chunks}_logits.pt"
 
@@ -84,16 +82,8 @@ if not running_in_notebook():
     shard_id = args.chunk_index
     n_chunks = args.n_chunks
     runid    = args.runid
-
-    if args.logits_file is None:
-        logits_file = LOGITS_FILE_PATTERN.format(shard_id=shard_id, n_chunks=n_chunks)
-    else:
-        logits_file = args.logits_file
-
-    if args.tokens_file is None:
-        tokens_file = TOKENS_FILE_PATTERN.format(shard_id=shard_id, n_chunks=n_chunks)
-    else:
-        tokens_file = args.tokens_file
+    logits_file = args.logits_file
+    tokens_file = args.tokens_file
 
 else:
 
