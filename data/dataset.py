@@ -10,7 +10,7 @@ from ast import literal_eval
 from pprint import pprint
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Iterator, Optional, List, Dict, Set
+from typing import Iterator, Optional, List, Dict, Set, Any, Tuple
 from easydict import EasyDict
 import yaml
 
@@ -253,8 +253,220 @@ class TokenDomain:
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————    
 
+class DelphiDataset:
+
+    def __init__(self, 
+        root: str, 
+        domains: dict, 
+        subjects: Union[str, List[str]] = None, 
+        exclusions: List[str] = [], 
+        n_samples=None, 
+        required_domains=['sex', 'diseases'], 
+        device=DEVICE):
+
+        """
+        Args:
+            root: base data directory
+            domains: list of domain names (e.g. ["diagnosis", "lifestyle", "sex", "death"])
+            fold: if specified, restrict subjects to that fold
+            exclusions: list of exclusion filenames under exclusion_lists/
+        """
+
+        self.root = Path(root)
+        self._device = device
+
+        # Load the data        
+        self.domains = EasyDict()
+        for dname, dinfo in domains.items():
+            
+            if dname == "padding":
+                continue
+
+            datafile = self.root / "tokens" / dname
+            self.domains[dname] = TokenDomain(
+                dname,
+                datafile, 
+                predict=dinfo.predict, 
+                age_jitter=dinfo.age_jitter, 
+                type=dinfo.type, 
+                at_birth=dinfo.at_birth
+            )
+
+        # ——————————————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
+        if subjects is None:
+            raise ValueError("You must provide either subject IDs or paths to subject lists.")
+
+        # detect if subjects are files or IDs
+        if isinstance(subjects, (str, Path)):
+            subjects = [subjects]
+
+        if all(isinstance(s, (str, Path)) and os.path.exists(s) for s in subjects):
+            # subjects are file paths
+            included_subjects = pd.concat([
+                pd.read_csv(self.root / subj_file, names=["subject_id"]) for subj_file in subjects
+            ])
+        else:
+            # assume it's a list/array of IDs
+            included_subjects = pd.DataFrame({"subject_id": subjects})
+
+        self.included_subjects = included_subjects
+        self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
+        self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
+        self._subjects = self.filter_subj_for_required_domains(self._subjects, required_domains)        
+
+        if n_samples is not None:
+            self._subjects = self._subjects.sample(n_samples)
+        
+        self._subjects = set(self._subjects.subject_id.to_list())
+
+        # —————————————————————————————————————————————————————————————————————————————
+
+        # Now we filter each domain for the final list of allowed subjects
+        for dname in self.domains:
+            filtered_domain = self.domains[dname].filter_subjects(self.subjects)            
+            
+            assert len(filtered_domain) != 0, f"""\n{'—'*80}
+Error: Domain '{dname}' has no tokens. 
+Here are a few original subjects and a few allowed subjects to help you troubleshoot:
+{self.subjects[:10]}
+and
+{self.domains[dname]}
+{'—'*80}
+"""
+            self.domains[dname] = filtered_domain
+
+        # —————————————————————————————————————————————————————————————————————————————
+
+        # of internal use, for faster slicing
+        self._subject_indices = self._precompute_subject_indices_per_domain()
+           
+
+    @property
+    def device(self):
+        device = [ self.domains[dname].tokens.device for dname in self.domains ][0]
+        return device
+
+    @property
+    def subjects(self):
+        if not hasattr(self, "_subjects_as_list"):
+            self._subjects_as_list = list(self._subjects)
+        return self._subjects_as_list
 
 
+    # This returns all data (all subjects and domains) merged into a single dataframe
+    def merge_data(self):
+        return pd.concat([ self.domains[dname].tokens for dname in self.domains ]).\
+            sort_index().\
+            sort_values(['age'])
+            
+            # set_index('subject_id')
+
+
+    def list_domains(self):
+        return list(self.domains.keys())
+
+
+    def filter_subj_for_required_domains(self, subjects: pd.DataFrame, required_domains: List[str]) -> pd.DataFrame:
+        
+        """
+        Keep only subjects that have at least one token in all required domains.
+        """
+        
+        for dname in required_domains:
+            if dname not in self.domains:
+                logging.debug(f"Required domain '{dname}' not found in self.domains. Returning empty DataFrame.")
+                return subjects.iloc[0:0]
+
+            # Get set of subjects present in this domain
+            # domain_subjects = self.domains[dname].tokens["subject_id"].astype(str).unique()
+            domain_subjects = self.domains[dname]._as_dataframe["subject_id"].astype(str).unique()
+            logging.debug(f"Domain '{dname}': {len(domain_subjects)} unique subjects.")
+
+            # Intersect with current subject list
+            before_count = len(subjects)
+            subjects = subjects[subjects["subject_id"].astype(str).isin(domain_subjects)]
+            after_count = len(subjects)
+            logging.debug(
+                f"Filtered by domain '{dname}': {before_count} → {after_count} subjects remaining."
+            )
+
+        return subjects
+
+
+    def get_excluded_subjects(self, exclusion_files):
+        
+        self.excluded_subjects = set()
+        for excl in exclusion_files:
+            excl_path = os.path.join(root, excl)
+            if os.path.exists(excl_path):
+                ids = open(excl_path).read().strip().splitlines()
+                self.excluded_subjects |= set(map(str, ids))        
+        return self.excluded_subjects
+ 
+
+    def get_subject_events(self, subject_id: str) -> Dict[str, pd.DataFrame]:
+        
+        """
+        Return all events for a subject, per domain.
+        """        
+        subject_events = {}
+        for dname, domain in self.domains.items():            
+            try:
+                start, count = self._subject_indices[dname][subject_id]
+                tokens_subj  = domain.tokens[start:(start+count)]
+            except KeyError as e:
+                tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
+            subject_events[dname] = tokens_subj         
+
+        return subject_events
+
+
+    @staticmethod
+    def is_ukb_id(index):
+        return index > 1000000
+
+
+    def __len__(self):
+        return len(self.subjects)        
+
+
+    def to(self, device):
+        for dname in self.domains:
+            self.domains[dname].tokens = self.domains[dname].tokens.to(device)
+        return self
+
+
+    def _precompute_subject_indices_per_domain(self):
+
+        '''
+        pre-computes indices for each subject in each domain for fast slicing
+        returns something like:
+          { 'domain_1' : {
+                id_1: (0, 18), <- (start_index, token_count)
+                id_2: (18, 17), ... }
+            'domain_2' : {
+                id_1: (0, 4),
+                id_2: (4, 6), ... }
+            }
+        '''
+
+        subject_indices = {}
+        for domain in self.list_domains():
+            ids, counts = np.unique(self.domains[domain].subject_ids, return_counts=True)
+            counts = np.array([0] + counts.tolist())
+            pp = [ (int(x), int(y)) for x, y in zip(np.cumsum(counts)[:-1], counts[1:])]
+            subject_indices[domain] = { int(id): pp[i] for i, id in enumerate(ids) }
+        
+        self._subject_indices = subject_indices
+        return self._subject_indices
+
+
+    def __getitem__(self, index):
+
+        if not self.is_ukb_id(index) and isinstance(index, int):
+            index = self.subjects[index]
+        out = self.get_subject_events(index)
+        return out
       
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
