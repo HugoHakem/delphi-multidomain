@@ -663,13 +663,10 @@ class DomainEmbedding(nn.Module):
 
         if self.config.projector.lower() == "pretrained":
             h = self.embed(x)
-            # logger.info(f"After pretrained lookup: {tuple(x.shape)}")
             out = self.projector(h)
-            # logger.info(f"After projection: {tuple(out.shape)}")
             return out
 
         out = self.projector(x)
-        # logger.info(f"After projector: {tuple(out.shape)}")
         return out
 
 # ———————————————————— Final embedding to logits ——————————————————————————————————————————————————
@@ -718,8 +715,6 @@ class MultiDomainEmbedding(nn.Module):
             for domain_name in self.domain_embed:                
                 token_emb = self.domain_embed[domain_name](x[domain_name])
                 emb[domain_name] = token_emb
-                # if domain_name == "padding":
-                    # import ipdb; ipdb.set_trace()
         else:
             token_emb = self.token_embedding(x)
             token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
@@ -1010,12 +1005,22 @@ class Delphi(torch.nn.Module):
         return self.config.domains
 
     @property
+    def domains(self):
+        return list(self.config.domains.keys())
+
+    @property
     def predicted_domains(self):
         return [ dname for dname, config in self.config.domains.items() if config.predict ]
 
+    #TODO: check this. There's a possible confusion here.
+    #Do we want to use the space of all domains or only that of predicted domains to assign integers?
     @property
     def predicted_domains_as_int(self):
-        return torch.tensor([ self.domain_to_int[dname] for dname in self.predicted_domains]).to(self.device)
+        return torch.tensor([ i for i, dname in enumerate(self.predicted_domains)]).to(self.device)
+
+    @property
+    def predicted_domains_to_int(self):
+        return { dname: i for i, dname in enumerate(self.predicted_domains) }
 
     @property
     def domain_to_int(self):
@@ -1025,17 +1030,12 @@ class Delphi(torch.nn.Module):
     def device(self):
         return next(self.parameters()).device
     
+    @property
+    def vocab_lens(self):
+        if not hasattr(self, "_vocab_lens"):
+            self._vocab_lens = { self.domain_to_int[k]: v.vocab_len for k, v in self.transformer.embed.domain_embed.items() }
+        return self._vocab_lens
 
-    def get_offset_per_domain(self, domains_of_interest):
-        
-        vocab_lens = { 
-            self.domain_to_int[k]: v.vocab_len 
-            for k, v in self.transformer.embed.domain_embed.items() if k in domains_of_interest 
-        }
-        offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
-        offsets_per_domain = torch.tensor(offsets_per_domain).to(self.device)
-        return offsets_per_domain    
-   
 
     #### LOSSES ########################################################################
     def cross_entropy_loss(self, logits, targets, agg=None):
@@ -1190,12 +1190,19 @@ class Delphi(torch.nn.Module):
         return_attention: bool = False
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
 
-        x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
         
-        # TODO: check if this is still necessary
-        self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
-        
+        if not hasattr(self, "_sample_tensors"):
+            x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
+            self._sample_tensors = x, ages, emb, subject_ids, domains
+            
+            # TODO: check if this is still necessary
+            self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
+        else:
+            x, ages, emb, subject_ids, domains = self._sample_tensors
+                    
         emb += self.transformer.age_embedding(ages)
+
+        logger.debug(f"Allocated memory: {torch.cuda.memory_allocated() / 1e9} GB")
 
         single_mask = self.transformer.attn_mask_builder[0][0].build(
             ages, domains, self.domain_to_int
@@ -1205,11 +1212,10 @@ class Delphi(torch.nn.Module):
                 expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
                     permute(1, 0, 2, 3, 4)        
         
-        
         # ——— BUILDING ATTENTION MASK —————————————————————————————————————————————————————————————————————————
         # group = AttentionMaskGroup(self.transformer.attn_mask_builder)
 
-        #TODO: passing domain2id on every call doesn't seem right. Try to pass it in the constructor if possible.
+        # TODO: passing domain2id on every call doesn't seem right. Try to pass it in the constructor if possible.
         # attn_view = group.build(ages, domains, self.domain_to_int)
 
         # attn_mask = torch.stack([ 
@@ -1225,7 +1231,8 @@ class Delphi(torch.nn.Module):
 
         h, att = emb, []
         for i, transformer_block in enumerate(self.transformer.h):
-            h, _att = transformer_block(h, attn_mask=attn_mask[i])
+            # h, _att = transformer_block(h, attn_mask=attn_mask[i])
+            h, _att = transformer_block(h, None)
             att.append(_att)
         
         h = self.transformer.ln_f(h)        
@@ -1338,7 +1345,7 @@ class Delphi(torch.nn.Module):
             logits_all_domains = []
 
             for dom in self.predicted_domains:
-                assert dom  in logits_dict, f"Domain '{dom}' not found in model output ({model.predicted_domains})."
+                assert dom  in logits_dict, f"Domain '{dom}' not found in model output ({self.predicted_domains})."
                 x = logits_dict[dom]   # [B, L, D]
                 B, L, D_dom = x.shape
                 logits_all_domains.append(x) # .reshape(B * L, D_dom))
@@ -1400,22 +1407,32 @@ class Delphi(torch.nn.Module):
         return model
 
     
-    def add_token_domain(self, new_token_domain):
-        raise NotImplementedError("add_token_domain method not yet implemented.")
-
     def get_embedding_at_age(self, x, ages, readout_age):
         raise NotImplementedError
 
 
-    # TODO: incorporate this
-    # Still not tested and not in use
-    def local_to_global_ids(self, local_ids, domains_of_interest):
+    def get_offset_per_domain(self, domains_of_interest=None):
+        
+        offsets_per_domain = np.array([0] + list(self.vocab_lens.values())).cumsum()[:-1]
+        offsets_per_domain = torch.tensor(offsets_per_domain).to(self.device)
+        return offsets_per_domain
 
-        vocab_lens = { self.domain_to_int[k]: v.vocab_len for k, v in self.transformer.embed.domain_embed.items() if k in domains_of_interest }
-        offsets_per_domain = np.array([0] + list(vocab_lens.values())).cumsum()[:-1]
-        offsets_per_domain = torch.tensor(offsets_per_domain).to(DEVICE)
-        local_ids = targets[torch.isin(target_domains, domains_of_interest_int.to(local_ids.device))]
-        f_domains = target_domains[mask]
-        offsets = offsets_per_domain[f_domains]
+
+    @property
+    def offsets_per_domain(self):
+        if not hasattr(self, "_offsets_per_domain"):
+            self._offsets_per_domain = self.get_offset_per_domain()
+        return self._offsets_per_domain
+
+        
+    def local_to_global_ids(self, domain_ids, local_ids):
+
+        # local_ids = targets[ torch.isin(domain_ids, self.predicted_domains_as_int) ]
+        # f_domains = domain_ids[mask]
+        offsets = self.offsets_per_domain[domain_ids]
         global_ids = offsets + local_ids
         return global_ids
+
+
+    def add_token_domain(self, new_token_domain):
+        raise NotImplementedError("add_token_domain method not yet implemented.")
