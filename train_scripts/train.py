@@ -25,7 +25,6 @@ root_path = DELPHI_DIR / "data/transforms"
 ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config/attention_schemes.yaml").read_text() )
 MLFLOW_URI = os.getenv("MLFLOW_URI", DELPHI_DIR / "mlruns")
 
-# from data.event_set import EventSet
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
 from utils.profiling import profile_and_print
@@ -111,6 +110,7 @@ class ProcessedArgs:
     domain_config_yaml: Path
 
 
+# Still not in use
 def process_args(args, root_path) -> ProcessedArgs:
 
     # ---- attention scheme ----
@@ -173,55 +173,13 @@ def process_args(args, root_path) -> ProcessedArgs:
 
 if __name__ == "__main__":
 
-    if not args.resume_run_id:
-
-        pa = process_args(args, root_path)
-
-        train_dataset = DelphiDataset(
-            subjects=pa.train_ids,
-            **pa.dataset_config
-        ).to(DEVICE)
-
-        valid_dataset = DelphiDataset(
-            subjects=pa.val_ids,
-            **pa.dataset_config
-        ).to(DEVICE)
-
-        test_dataset = DelphiDataset(
-            subjects=pa.test_ids,
-            **pa.dataset_config
-        ).to(DEVICE)
-
-        dataloaders = [
-            DelphiDataloader(d, batch_size=args.batch_size)
-            for d in (train_dataset, valid_dataset, test_dataset)
-        ]
-
-        config = DelphiConfig(
-            n_embd=args.n_embd,
-            n_layer=args.n_layer,
-            token_dropout=0.1,
-            domains=pa.domain_cfg,
-            attention_scheme=pa.attention_scheme,
-        )
-
-        model = torch.compile(Delphi(config).to(DEVICE))
-
-
-
-if __name__ == "__main__":
-
   if (train_from_scratch := not args.resume_run_id):
 
     args.attention_scheme = parse_attention_scheme(args.attention_scheme)
-
     domains = args.domains.split(",")
-
     domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
     default_cfg_per_domain = load_embed_config(domain_config_yaml, root_path / 'tokens')
-
-    # k, v with .items() doesn't work for some reason!
-    domain_cfg = { k: default_cfg_per_domain[k] for k in default_cfg_per_domain for k in domains }
+    domain_cfg = { k: v for k, v in default_cfg_per_domain.items() if k in domains }
     
     assert all([k in default_cfg_per_domain for k in domains])
     assert len(args.attention_scheme) in {1, args.n_layer}, f"len of the --attention_scheme argument should be either 1 or args.n_layer (={args.n_layer})"
@@ -246,11 +204,11 @@ if __name__ == "__main__":
     valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
     test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)    
     dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, args.batch_size, args.batch_size][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
-    
     # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
     config = DelphiConfig( n_embd=args.n_embd, n_layer=args.n_layer, token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme)
     torch.compile(model := Delphi(config).to(DEVICE))
+
     optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
     optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
     
@@ -278,8 +236,7 @@ if __name__ == "__main__":
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-  trainer = Trainer( model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM )
-  
+  trainer = Trainer( model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM ) 
   trainer.train(max_epochs=1000)
 
 # %%

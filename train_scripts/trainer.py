@@ -234,6 +234,15 @@ class MLFlowLogger:
         """
         return urlparse(uri).path if uri.startswith("file://") else uri
 
+    def build_state_dict(self, model, optimizer, scheduler=None, metadata=None):
+
+        return { 
+            "state_dict": model.state_dict(), 
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler else None,
+            "metadata": metadata
+        }
+
 
     def save_model(self, model, optimizer, scheduler=None, metadata=None, filename=None):
         """
@@ -257,14 +266,7 @@ class MLFlowLogger:
         # Create a temporary checkpoint
         tmp_dir = tempfile.mkdtemp()
         tmp_path = Path(tmp_dir) / filename
-        torch.save({
-            "state_dict": model.state_dict(), 
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict() if scheduler else None,
-            "metadata": metadata
-            }, 
-            tmp_path
-        )
+        torch.save( self.build_state_dict(model, optimizer, scheduler, metadata), tmp_path )
     
         # Log to MLflow artifacts
         artifact_path = "checkpoints"
@@ -376,13 +378,13 @@ class Trainer():
                     self.optimizer,
                     self.scheduler,                    
                     metadata={
-                      "epoch": epoch, 
-                      "val_loss": float(self.mean_val_loss.cpu()),
-                      "train_loss": float(train_loss["train_total"].cpu()),
-                      "n_params": sum(p.numel() for p in self.model.parameters()),
-                      "timestamp": datetime.now().isoformat(timespec="seconds"),
-                      "attention_scheme": getattr(self.model.config, "attention_scheme", None),
-                      "date_cutoff": None,  # placeholder - to be set later when needed
+                        "epoch": epoch, 
+                        "val_loss": float(self.mean_val_loss.cpu()),
+                        "train_loss": float(train_loss["train_total"].cpu()),
+                        "n_params": sum(p.numel() for p in self.model.parameters()),
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "attention_scheme": getattr(self.model.config, "attention_scheme", None),
+                        "date_cutoff": None,  # placeholder - to be set later when needed
                     } | self.get_subject_ids_per_partition(),
                     filename=f"best_model_epoch{self.current_epoch}_trainloss_{train_loss['train_total']}_{timestamp}.pt"
                 )
@@ -394,6 +396,7 @@ class Trainer():
 
             self.epoch_end()
             
+
     def prepare_input(self, batch):
 
         x, ages, subject_ids = self.get_tensors_from_batch(batch)
@@ -405,6 +408,11 @@ class Trainer():
 
 
     def prepare_input_simplified(self):
+        
+        '''
+        Sample only one input tensor from the training loader and reuse it
+        for profiling purposes
+        '''
 
         if not hasattr(self, "_sample_input_tensor"):
             sample_batch = next(iter(self.train_loader))
@@ -416,9 +424,12 @@ class Trainer():
 
         model = self.model
 
-        x, ages, subject_ids = self.prepare_input_simplified()
-        # x, ages, subject_ids = self.prepare_input(batch)
-
+        # x, ages, subject_ids = self.prepare_input_simplified()
+        x, ages, subject_ids = self.prepare_input(batch)
+        # x    = { k: v.detach() for k, v in x.items()}
+        # ages = { k: v.detach() for k, v in ages.items()}
+        # subject_ids = { k: v.detach() for k, v in subject_ids.items()}
+        
         # events = EventSet(batch).\
         #    insert_no_event_tokens(rate=5, trim_right_padding=True).\
         #    adjust_to_seqlen(256)
@@ -427,7 +438,6 @@ class Trainer():
 
         logits, att = model(x, ages, subject_ids)
 
-        # self.compute_loss(logits, )
         # This is ugly but necessary at the moment
         domains        = model._trace['domains']
         targets        = model._trace['tokens'][:,1:]
@@ -453,7 +463,7 @@ class Trainer():
         
         prefix = "" if add_prefix is None else add_prefix + "_"
 
-        loss = EasyDict({                
+        loss = EasyDict({
             f'{prefix}ce_loss':       loss_ce,            
             f'{prefix}time_loss':     time_loss,
             f'{prefix}ce_ema_loss':   torch.lerp(outputs[-1][f'{prefix}ce_ema_loss'], loss_ce, weight=0.002) if outputs else loss_ce,
@@ -526,7 +536,7 @@ class Trainer():
             self.optimizer.zero_grad()
             loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
             
-            loss['train_total'].backward(retain_graph=True)
+            loss['train_total'].backward()#retain_graph=True)
             self.optimizer.step()
             self.scheduler.step() 
 

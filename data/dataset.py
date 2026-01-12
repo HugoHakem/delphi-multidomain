@@ -31,6 +31,8 @@ from typing import Union, Callable
 DAYS_PER_YEAR = 365.25
 DEVICE = os.getenv("DEVICE", 'cuda' if torch.cuda.is_available() else 'cpu')
 
+logger = logging.getLogger(__name__)
+
 # ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 class TokenDomain:
@@ -86,6 +88,16 @@ class TokenDomain:
         If `aggregation_strategy` is provided.
     """
 
+    REQUIRED_FILES = {
+        "tokens": "tokens.csv",
+        "tokenizer": "tokenizer.yaml",
+    }
+
+    BASE_COLUMNS = {"subject_id"}
+    CATEGORICAL_COLUMNS = {"token_id"}
+    CONTINUOUS_COLUMNS = {"values"}
+    AGE_COLUMN = "age"
+
     def __init__(self,
             name: str,
             path: Union[str, Path],
@@ -100,16 +112,6 @@ class TokenDomain:
         """
         Load a single domain: tokenizer.yaml + tokens.csv
         """
-
-        REQUIRED_FILES = {
-            "tokens": "tokens.csv",
-            "tokenizer": "tokenizer.yaml",
-        }
-
-        BASE_COLUMNS = {"subject_id"}
-        CATEGORICAL_COLUMNS = {"token_id"}
-        CONTINUOUS_COLUMNS = {"values"}
-        AGE_COLUMN = "age"
 
         self.path = path
         self.predict = predict
@@ -134,6 +136,9 @@ class TokenDomain:
     def tokenizer_path(self) -> Path:
         return self.path / self.REQUIRED_FILES["tokenizer"]
 
+    @property
+    def subject_ids(self):
+        return self.tokens[:, 0].cpu().numpy()
 
     def _check_required_files(self) -> None:
         missing = [
@@ -147,6 +152,7 @@ class TokenDomain:
                 f"Missing required files in domain '{self.path}': {missing}"
             )
 
+
     def _expected_columns(self) -> set:
         cols = set(self.BASE_COLUMNS)
 
@@ -157,6 +163,7 @@ class TokenDomain:
 
         cols.add(self.AGE_COLUMN)
         return cols
+
 
     def _validate_schema(self, df: pd.DataFrame, path: Path) -> None:
         expected = self._expected_columns()
@@ -185,8 +192,8 @@ class TokenDomain:
                 return pd.DataFrame(columns=["subject_id", "values", "age"])
         
         df = pd.read_csv(path)
-        
-        # enforce schema        
+
+        # enforce schema
         if "subject_id" not in df.columns:
             raise ValueError(f"Invalid tokens file {path}, must contain subject_id")
         if self.type == "categorical" and "token_id" not in df.columns:
@@ -219,11 +226,6 @@ class TokenDomain:
         return self
 
 
-    @property
-    def subject_ids(self):
-        return self.tokens[:, 0].cpu().numpy()
-
-   
     def __len__(self):
         return len(self._as_dataframe)
 
@@ -292,6 +294,13 @@ class DelphiDataset:
                 at_birth=dinfo.at_birth
             )
 
+        logger.info(
+            "Initializing DelphiDataset | root=%s | domains=%s | required_domains=%s",
+            str(self.root),
+            list(domains.keys()),
+            required_domains
+        )
+
         # ——————————————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
         if subjects is None:
             raise ValueError("You must provide either subject IDs or paths to subject lists.")
@@ -310,11 +319,26 @@ class DelphiDataset:
             included_subjects = pd.DataFrame({"subject_id": subjects})
 
         self.included_subjects = included_subjects
+        logger.info("Included subjects: %d", len(self.included_subjects))
+    
         self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
+        logger.info(
+            "Excluding %d subjects using files: %s",
+            len(self.excluded_subjects),
+            exclusions
+        )
+
         self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
         self._subjects = self.filter_subj_for_required_domains(self._subjects, required_domains)        
 
+        logger.info(
+            "Subjects after required domain filtering (%s): %d",
+            required_domains,
+            len(self._subjects)
+         )
+ 
         if n_samples is not None:
+            logger.info("Subsampling subjects to n_samples=%d", n_samples)
             self._subjects = self._subjects.sample(n_samples)
         
         self._subjects = set(self._subjects.subject_id.to_list())
@@ -358,8 +382,6 @@ and
         return pd.concat([ self.domains[dname].tokens for dname in self.domains ]).\
             sort_index().\
             sort_values(['age'])
-            
-            # set_index('subject_id')
 
 
     def list_domains(self):
