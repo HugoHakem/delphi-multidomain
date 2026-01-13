@@ -323,6 +323,9 @@ class Trainer():
 
         self.use_tqdm = use_tqdm
 
+        self.ce_ema = None
+        self.time_ema = None
+
     # ——————————————————————————————————————————————————————————————————————————————
    
     @property
@@ -397,13 +400,20 @@ class Trainer():
             self.epoch_end()
             
 
-    def prepare_input(self, batch):
+    def prepare_input(self, batch, seqlen=128):
 
         x, ages, subject_ids = self.get_tensors_from_batch(batch)
-        max_ages             = self.model.get_max_ages_per_subject(ages, subject_ids)
-        x, ages, subject_ids = self.model.insert_no_event_tokens(x, ages, subject_ids)
-        x, ages, subject_ids = self.model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-        x, ages, subject_ids = self.adjust_to_seqlen(x, ages, subject_ids, seqlen:=48)
+                
+        #TODO: check if something breaks when len(unique(subject_ids)) != batch_size (i.e. in the last batch)
+        max_ages             = self.model.get_max_ages_per_subject(ages, subject_ids, self.train_loader.batch_size)
+        
+        import ipdb; ipdb.set_trace()
+        
+        x, ages, subject_ids = self.model.insert_no_event_tokens(x, ages, subject_ids, max_ages)
+        
+        # x, ages, subject_ids = self.model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
+
+        x, ages, subject_ids = self.adjust_to_seqlen(x, ages, subject_ids, seqlen)
         return x, ages, subject_ids
 
 
@@ -425,16 +435,8 @@ class Trainer():
         model = self.model
 
         # x, ages, subject_ids = self.prepare_input_simplified()
-        x, ages, subject_ids = self.prepare_input(batch)
-        # x    = { k: v.detach() for k, v in x.items()}
-        # ages = { k: v.detach() for k, v in ages.items()}
-        # subject_ids = { k: v.detach() for k, v in subject_ids.items()}
         
-        # events = EventSet(batch).\
-        #    insert_no_event_tokens(rate=5, trim_right_padding=True).\
-        #    adjust_to_seqlen(256)
-
-        # x, ages, emb, subject_ids, domains = model.to_tensor(x, ages, emb := model.transformer.embed(x), subject_ids)
+        x, ages, subject_ids = self.prepare_input(batch)
 
         logits, att = model(x, ages, subject_ids)
 
@@ -464,11 +466,9 @@ class Trainer():
         prefix = "" if add_prefix is None else add_prefix + "_"
 
         loss = EasyDict({
-            f'{prefix}ce_loss':       loss_ce,            
-            f'{prefix}time_loss':     time_loss,
-            f'{prefix}ce_ema_loss':   torch.lerp(outputs[-1][f'{prefix}ce_ema_loss'], loss_ce, weight=0.002) if outputs else loss_ce,
-            f'{prefix}time_ema_loss': torch.lerp(outputs[-1][f'{prefix}time_ema_loss'], time_loss, weight=0.002) if outputs else time_loss,
-            f'{prefix}total':         loss_ce + time_loss,            
+            f'{prefix}ce_loss': loss_ce,
+            f'{prefix}time_loss': time_loss,
+            f'{prefix}total': loss_ce + time_loss,
         })
 
         if log_loss_per_disease:
@@ -478,12 +478,30 @@ class Trainer():
 
             loss[f'{prefix}ce_loss_per_disease'] = loss_ce_per_disease
 
-
         if return_att and return_logits: return loss, logits, att 
         elif return_logits:              return loss, logits
         elif return_att:                 return loss, att
         else:                            return loss
 
+        with torch.no_grad():
+            ce_val = loss['train_ce_loss'].detach()
+            time_val = loss['train_time_loss'].detach()
+        
+            ce_ema = ce_val if ce_ema is None else (1 - self.ema_alpha) * ce_ema + self.ema_alpha * ce_val
+            time_ema = time_val if time_ema is None else (1 - self.ema_alpha) * time_ema + self.ema_alpha * time_val
+
+
+        self.train_outputs.append({
+            'train_ce_loss': ce_val,
+            'train_time_loss': time_val,
+            'train_ce_ema_loss': ce_ema,
+            'train_time_ema_loss': time_ema,
+            'train_total': ce_val + time_val,
+        })
+
+
+        
+      
 
     def valid_epoch_end(self, loss_outputs):        
         
@@ -519,48 +537,86 @@ class Trainer():
         
 
 
+    
+
     def train_epoch(self, n_batches=None, eval_every=None):
 
         self.val_step = 0
         ce_ema, time_ema = None, None
+
+        def _assert_no_grad_tensors(tag, obj, max_print=20):
+            import torch
+            found = []
+            if isinstance(obj, dict):
+                items = obj.items()
+            elif isinstance(obj, (list, tuple)):
+                items = enumerate(obj)
+            else:
+                return
+        
+            for k, v in items:
+                if torch.is_tensor(v) and v.grad_fn is not None:
+                    found.append((k, type(v), str(v.grad_fn)))
+                elif isinstance(v, (dict, list, tuple)):
+                    # shallow scan only (evita recursion infinita)
+                    for kk, vv in (v.items() if isinstance(v, dict) else enumerate(v)):
+                        if torch.is_tensor(vv) and vv.grad_fn is not None:
+                            found.append((f"{k}.{kk}", type(vv), str(vv.grad_fn)))
+        
+            if found:
+                print(f"\n[FOUND grad tensors in {tag}]")
+                for row in found[:max_print]:
+                    print("  ", row)
+                raise RuntimeError(f"Grad tensors leaked into {tag}")
 
         pbar = tqdm(
             total=len(self.train_loader) if n_batches == "all" else n_batches, 
             disable=not self.use_tqdm
         )
 
-        batch = next(iter(self.train_loader))
         for i, batch in enumerate(self.train_loader):
-        # for i, _ in enumerate(range(len(self.train_loader))):
             
             self.optimizer.zero_grad()
             loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
-            
-            loss['train_total'].backward()#retain_graph=True)
+                        
+            # justo antes de backward:
+            _assert_no_grad_tensors("self.train_outputs", self.train_outputs)
+            _assert_no_grad_tensors("self.valid_outputs", self.valid_outputs)
+            if hasattr(self.model, "_trace"):
+                _assert_no_grad_tensors("model._trace", self.model._trace)
+
+            loss['train_total'].backward()
+
             self.optimizer.step()
             self.scheduler.step() 
 
             with torch.no_grad():
                 ce_val = loss['train_ce_loss'].detach()
                 time_val = loss['train_time_loss'].detach()
-                ce_ema = ce_val if ce_ema is None else (1 - self.ema_alpha) * ce_ema + self.ema_alpha * ce_val
-                time_ema = time_val if time_ema is None else (1 - self.ema_alpha) * time_ema + self.ema_alpha * time_val
-        
+            
+                self.ce_ema = ce_val if self.ce_ema is None else \
+                    (1 - self.ema_alpha) * self.ce_ema + self.ema_alpha * ce_val
+            
+                self.time_ema = time_val if self.time_ema is None else \
+                    (1 - self.ema_alpha) * self.time_ema + self.ema_alpha * time_val
+            
             self.train_outputs.append({
                 'train_ce_loss': ce_val,
                 'train_time_loss': time_val,
-                'train_ce_ema_loss': ce_ema,
-                'train_time_ema_loss': time_ema,
+                'train_ce_ema_loss': self.ce_ema,
+                'train_time_ema_loss': self.time_ema,
                 'train_total': ce_val + time_val,
             })
             
-            if eval_every is not None and (i % eval_every) == 0:
-                self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=self.n_val_batches)
-                self.val_step += 1                        
+            
+            # if eval_every is not None and (i % eval_every) == 0:
+                # self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=self.n_val_batches)
+                # self.val_step += 1                        
     
+            current_loss = self.train_outputs[-1]
             pbar.set_postfix({
-                "train_cce_loss":  f"{loss['train_ce_loss'].item():.3f} ({loss['train_ce_ema_loss'].item():.3f})", 
-                "train_time_loss": f"{loss['train_time_loss'].item():.3f} ({loss['train_time_ema_loss'].item():.3f})"
+                "train_cce_loss":  f"{current_loss['train_ce_loss'].item():.3f}   ({current_loss['train_ce_ema_loss'].item():.3f})", 
+                "train_time_loss": f"{current_loss['train_time_loss'].item():.3f} ({current_loss['train_time_ema_loss'].item():.3f})"
             })
 
             pbar.update(self.train_loader.batch_size)
@@ -583,12 +639,12 @@ class Trainer():
             loss_outputs = []
             for i, batch in enumerate(self.valid_loader):
 
-                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_loss_per_disease=True, stage="validation", add_prefix="val")
+                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_loss_per_disease=False, stage="validation", add_prefix="val")
                 loss_outputs.append(loss)
             
                 pbar.set_postfix({
-                    "val_cce":      f"{loss['val_ce_loss'].item():.3f} ({loss['val_ce_ema_loss'].item():.3f})", 
-                    "val_time_loss":    f"{loss['val_time_loss'].item():.3f} ({loss['val_time_ema_loss'].item():.3f})"
+                    "val_cce":      f"{loss['val_ce_loss'].item():.3f}", 
+                    "val_time_loss":    f"{loss['val_time_loss'].item():.3f}"
                 })
             
                 pbar.update(self.valid_loader.batch_size)

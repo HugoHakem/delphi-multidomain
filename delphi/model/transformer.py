@@ -27,6 +27,8 @@ from pathlib import Path
 
 DAYS_PER_YEAR = 365.25
 
+import warnings
+
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
 
 class AttentionMaskBuilder(nn.Module):
@@ -1099,6 +1101,73 @@ class Delphi(torch.nn.Module):
         
     def to_tensor(self, x, ages, embeddings, subject_ids):
 
+        all_tokens, all_embeddings, all_ages, all_domains, all_subjects = [], [], [], [], []
+    
+        for domain_idx, dname in enumerate(x.keys()):
+            t = x[dname]
+            a = ages[dname]
+            e = embeddings[dname]
+            s = subject_ids[dname]
+    
+            n = t.shape[0]
+            d = torch.full((n,), domain_idx, device=t.device, dtype=torch.long)
+    
+            all_tokens.append(t)
+            all_ages.append(a)
+            all_embeddings.append(e)
+            all_domains.append(d)
+            all_subjects.append(s)
+    
+        tokens_flat     = torch.cat(all_tokens)
+        ages_flat       = torch.cat(all_ages)
+        embeddings_flat = torch.cat(all_embeddings)
+        domains_flat    = torch.cat(all_domains)
+        subjects_flat   = torch.cat(all_subjects)
+    
+        # sort once by (subject, age)
+        order = torch.argsort(ages_flat, stable=True)
+        # 2) primaria: subject (estable, preserva el orden por age dentro de cada subject)
+        order = order[torch.argsort(subjects_flat[order], stable=True)]
+    
+        tokens_flat     = tokens_flat[order]
+        ages_flat       = ages_flat[order]
+        embeddings_flat = embeddings_flat[order]
+        domains_flat    = domains_flat[order]
+        subjects_flat   = subjects_flat[order]
+            
+        # group by subject
+        unique_subjects, counts = torch.unique_consecutive(
+            subjects_flat, return_counts=True
+        )
+    
+        if not all([x == 128 for x in counts]):
+            print(subjects_flat)
+            print(unique_subjects)
+            print(counts)
+
+        # split
+        batch_tokens     = torch.split(tokens_flat, counts.tolist())
+        batch_ages       = torch.split(ages_flat, counts.tolist())
+        batch_embeddings = torch.split(embeddings_flat, counts.tolist())
+        batch_domains    = torch.split(domains_flat, counts.tolist())
+    
+        # stack → (B, T, *)
+        batch_tokens     = torch.nn.utils.rnn.pad_sequence(batch_tokens, batch_first=True)
+        batch_ages       = torch.nn.utils.rnn.pad_sequence(batch_ages, batch_first=True)
+        batch_embeddings = torch.nn.utils.rnn.pad_sequence(batch_embeddings, batch_first=True)
+        batch_domains    = torch.nn.utils.rnn.pad_sequence(batch_domains, batch_first=True)
+    
+        return (
+            batch_tokens.int(),
+            batch_ages,
+            batch_embeddings,
+            unique_subjects,
+            batch_domains,
+        )
+
+
+    def to_tensor_deprecated(self, x, ages, embeddings, subject_ids):
+
         '''
             input values:
               - x:          dict[domain, Tensor] where the tensor has data for batch_size subjects
@@ -1191,26 +1260,41 @@ class Delphi(torch.nn.Module):
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
 
         
-        if not hasattr(self, "_sample_tensors"):
-            x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
-            self._sample_tensors = x, ages, emb, subject_ids, domains
+        # if not hasattr(self, "_sample_tensors"):
+        #     x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
+        #     self._sample_tensors = x, ages, emb, subject_ids, domains
+        #     
+        #     # TODO: check if this is still necessary
+        #     self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
+        # else:
+        #     x, ages, emb, subject_ids, domains = self._sample_tensors
             
-            # TODO: check if this is still necessary
-            self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
-        else:
-            x, ages, emb, subject_ids, domains = self._sample_tensors
+        # print(f"{x['padding'].shape=}")
+        # print(f"{ages['padding'].shape=}")
+        # print(f"{subject_ids['padding'].shape=}")
+
+        # print(f"{subject_ids['diseases'].shape=}")
+        # print(f"{torch.unique(subject_ids['diseases'])}")
+        
+        xx, _, _, _, _ = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
+        x, ages, emb, subject_ids, domains = self.to_tensor_deprecated(x, ages, emb := self.transformer.embed(x), subject_ids)
+
+        # print(f"{x.shape=}")
+        # print(f"{xx.shape=}")
+        
+        self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
                     
         emb += self.transformer.age_embedding(ages)
+        
+        # print(f"Allocated memory: {torch.cuda.memory_allocated() / 1e9} GB")
 
-        logger.debug(f"Allocated memory: {torch.cuda.memory_allocated() / 1e9} GB")
-
-        single_mask = self.transformer.attn_mask_builder[0][0].build(
-            ages, domains, self.domain_to_int
-        )  # (B, L-1, L-1)
-
-        attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
-                expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
-                    permute(1, 0, 2, 3, 4)        
+        # single_mask = self.transformer.attn_mask_builder[0][0].build(
+        #     ages, domains, self.domain_to_int
+        # )  # (B, L-1, L-1)
+# 
+        # attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
+        #         expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
+        #             permute(1, 0, 2, 3, 4)        
         
         # ——— BUILDING ATTENTION MASK —————————————————————————————————————————————————————————————————————————
         # group = AttentionMaskGroup(self.transformer.attn_mask_builder)
@@ -1255,8 +1339,46 @@ class Delphi(torch.nn.Module):
 
         return loss
 
+    def get_max_ages_per_subject(self, ages, subject_ids, n_subjects):
+    
+        device = ages['diseases'].device     
 
-    def get_max_ages_per_subject(self, ages, subject_ids):
+        # concatenar
+        all_subjects = torch.cat([
+            subject_ids['diseases'],
+            subject_ids['death'],
+        ]).long()
+
+        unique_subjects, subject_ids_local = torch.unique(
+            all_subjects,
+            return_inverse=True
+        )
+    
+        all_ages = torch.cat([
+            ages['diseases'],
+            ages['death'],
+        ]).float()
+    
+        max_age = torch.full(
+            (n_subjects,),
+            -torch.inf,
+            device=device,
+            dtype=all_ages.dtype,
+        )
+    
+        # print(subject_ids_local)
+        max_age.scatter_reduce_(
+            0,
+            subject_ids_local,
+            all_ages,
+            reduce="amax",
+            include_self=True,
+        )
+    
+        return max_age
+
+
+    def get_max_ages_per_subject_deprecated(self, ages, subject_ids):
 
         max_ages= {}
         for subj in np.unique(subject_ids['diseases'].cpu().numpy()):
@@ -1266,31 +1388,163 @@ class Delphi(torch.nn.Module):
                 max_ages[subj] = death_age.item()
                 continue
             max_ages[subj] = ages['diseases'][subject_ids['diseases'] == subj][-1].item()
+
         return max_ages
 
 
-    def mask_tokens_after_age(self, tokens, ages, subject_ids, max_ages):
- 
-        for dname in tokens:
-            if dname == "genetic_pcs":
-                continue
+
+    def _subject_allows_no_events(self, max_age: float, padding: str) -> bool:
+
+        if padding in [None, "none"]:
+            return False
+        if not np.isfinite(max_age):
+            return False
+        return True
+
+
+    def _generate_no_event_ages(
+        self,
+        max_age: float,
+        padding: str,
+        no_event_token_rate: float,
+        device,
+        gen=None,
+    ):
+        """
+        Returns a 1D tensor of ages (float, days), or None if no no-events apply.
+        """
+    
+        if padding == "regular":
+            start = DAYS_PER_YEAR
+            step = DAYS_PER_YEAR * no_event_token_rate
+    
+            # empty rank -> no no-events
+            if max_age <= start or step <= 0:
+                return None
+    
+            return torch.arange(
+                start,
+                max_age,
+                step,
+                device=device,
+                dtype=torch.float,
+            )
+    
+        elif padding == "random":
+            step = DAYS_PER_YEAR * no_event_token_rate
+            if step <= 0:
+                return None
+    
+            n_pad = int(max_age // step)
+            if n_pad <= 0:
+                return None
+    
+            return torch.rand(
+                n_pad,
+                generator=gen,
+                device=device,
+            ) * max_age
+    
+        else:
+            raise NotImplementedError(f"Unknown padding mode: {padding}")
+    
+
+    def insert_no_event_tokens(
+        self,
+        tokens,
+        ages,
+        subject_ids,
+        max_ages,
+        no_event_token_rate=5,
+        padding="regular",
+        gen=None,
+    ):
+    
+        NO_EVENT_TOKEN = self.transformer.embed['padding'].NO_EVENT_TOKEN
+        device = max_ages.device
+    
+        pad_tokens = []
+        pad_ages = []
+        pad_subjects = []
+    
+        warned = False
+    
+        # sanity
+        # print("max_ages.numel()", max_ages.numel())
+        # print("device", max_ages.device)
+        # print("min/max subj diseases", int(subject_ids["diseases"].min()), int(subject_ids["diseases"].max()))
+        # print("unique diseases", subject_ids["diseases"].unique().numel())
+        
+        # unique_subjects = torch.unique( torch.cat([subject_ids[d] for d in subject_ids if d != "padding"]) )
+
+        batch_subjects = torch.unique(
+            torch.cat([subject_ids[d] for d in subject_ids if d != "padding"]),
+            sorted=True
+        )
+        
+        # mapping: subject_id real → índice batch
+        subject_to_batch = { int(s.item()): i for i, s in enumerate(batch_subjects) }       
+        
+        # print(f"{max_ages=}")
+        print(f"{len(max_ages)=}")
+        print(f"{len(subject_to_batch)=}")
+        print(f"{subject_to_batch=}")
+        print(f"{len(batch_subjects)=}")
+        
+        
+
+        for subj_id in batch_subjects:          
             
-            for subj, max_age in max_ages.items():
-
-                tokens[dname] = tokens[dname].masked_fill(
-                    (subject_ids[dname] == subj) & (ages[dname] > max_ages[subj]),
-                    self.transformer.embed['padding'].PADDING_TOKEN
-                ) 
-
-                ages[dname] = ages[dname].masked_fill(
-                    (subject_ids[dname] == subj) & (ages[dname] > max_ages[subj]),
-                    self.transformer.embed['padding'].PADDING_AGE
-                ) 
+            # for subj in range(max_ages.numel()):    
+            # b = subject_to_batch[subj_id]
+            
+            b = subject_to_batch[subj_id.int().item()]            
+            
+            max_age = float(max_ages[b].item())
+    
+            if not self._subject_allows_no_events(max_age, padding):
+                continue
+    
+            pad = self._generate_no_event_ages(
+                max_age=max_age,
+                padding=padding,
+                no_event_token_rate=no_event_token_rate,
+                device=device,
+                gen=gen,
+            )
+    
+            if pad is None or pad.numel() == 0:
+                if padding == "regular" and not warned:
+                    warnings.warn(
+                        "Some subjects have max_age too small for regular no-event padding. "
+                        "No no-event tokens were inserted for them (expected behavior)."
+                    )
+                    warned = True
+                continue
+    
+            pad_tokens.append(
+                torch.full((pad.numel(),), NO_EVENT_TOKEN, device=device, dtype=torch.long)
+            )
+            pad_ages.append(pad)
+            pad_subjects.append(
+                torch.full((pad.numel(),), subj_id, device=device, dtype=torch.long)
+            )
+    
+        if pad_tokens:
+            tokens["padding"] = torch.cat(pad_tokens)
+            ages["padding"] = torch.cat(pad_ages)
+            subject_ids["padding"] = torch.cat(pad_subjects)
+    
+        if "padding" in subject_ids:
+            pass
+            # print("padding unique min/max", int(subject_ids["padding"].min()), int(subject_ids["padding"].max()))
+            # esto debería caer en el rango de los subject_ids reales,
+            # no en 0..B-1 salvo que hayas remapeado explícitamente.
 
         return tokens, ages, subject_ids
+   
 
-
-    def insert_no_event_tokens(self, tokens, ages, subject_ids, no_event_token_rate=5, padding="regular", gen=None):
+    def insert_no_event_tokens_deprecated(self, tokens, ages, subject_ids, no_event_token_rate=5, padding="regular", gen=None):
 
         """Insert synthetic 'no event' tokens at regular or random intervals."""
 
@@ -1302,7 +1556,7 @@ class Delphi(torch.nn.Module):
             gen = torch.Generator(device='cpu')
             gen.manual_seed(tokens.sum().item())
     
-        unique_subject_ids = torch.from_numpy(np.unique(subject_ids['diseases'].cpu().numpy()))
+        unique_subject_ids = torch.unique(subject_ids['diseases'])
 
         no_event_per_subject = {'tokens': [], 'ages':[], 'subject_ids': []}
         for subj_id in unique_subject_ids:
