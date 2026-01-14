@@ -118,6 +118,7 @@ class TokenDomain:
         self.age_jitter = age_jitter        
         self.at_birth = at_birth
         self.type = type
+        self.name = name
 
         assert type in ["categorical", "continuous"], f"Domain type must be either 'categorical' or 'continuous', got {type}"
        
@@ -199,6 +200,9 @@ class TokenDomain:
         if self.type == "categorical" and "token_id" not in df.columns:
             raise ValueError(f"Invalid tokens file {path}, must contain token_id since type==categorical")
             
+
+        df = df.sort_values("subject_id")
+        
         if self.at_birth:
             if "age" in df.columns:
                 if (df["age"] != 0).any():
@@ -236,7 +240,7 @@ class TokenDomain:
 
     def _repr_html_(self):
         return self.tokens.\
-            assign( **{"age (years)": (self.tokens.age / 363.25).round(2)} ).\
+            assign( **{"age (years)": (self.tokens.age / DAYS_PER_YEAR).round(2)} ).\
             drop("age", axis=1)._repr_html_()
              
     
@@ -644,6 +648,7 @@ def get_domain_id(domain_name):
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
 def collate_fn_domains(batch):
+
     domains = defaultdict(list)
     for item in batch:
         for d, arr in item.items():
@@ -654,6 +659,7 @@ def collate_fn_domains(batch):
 
     if "padding" not in out:
         out["padding"] = torch.empty((0, 3), dtype=torch.long, device=sample_device)
+
     return out
 
 
