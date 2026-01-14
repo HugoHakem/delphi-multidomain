@@ -325,6 +325,9 @@ class Trainer():
 
         self.ce_ema = None
         self.time_ema = None
+        
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.allow_tf32 = True
 
     # ——————————————————————————————————————————————————————————————————————————————
    
@@ -354,7 +357,6 @@ class Trainer():
 
         # self.logger.log_params(self.optimizer.config)
         # self.logger.log_params(self.scheduler.config)
-        # profile_and_print(self.shared_step, self.training_loader, self.optimizer, n_steps=2, top_k=20) 
 
         for epoch in range(self.current_epoch, max_epochs):
             
@@ -376,6 +378,8 @@ class Trainer():
 
             if improved:
 
+                ckpt_filepath = f"best_model__epoch{self.current_epoch}__trainloss_{train_loss['train_total']:.4f}__{timestamp}.pt"
+
                 ckpt_uri = self.logger.save_model(
                     self.model,
                     self.optimizer,
@@ -389,7 +393,7 @@ class Trainer():
                         "attention_scheme": getattr(self.model.config, "attention_scheme", None),
                         "date_cutoff": None,  # placeholder - to be set later when needed
                     } | self.get_subject_ids_per_partition(),
-                    filename=f"best_model_epoch{self.current_epoch}_trainloss_{train_loss['train_total']}_{timestamp}.pt"
+                    filename=ckpt_filepath
                 )
                 print(f"New best model logged at {ckpt_uri}")
  
@@ -403,17 +407,10 @@ class Trainer():
     def prepare_input(self, batch, seqlen=128):
 
         x, ages, subject_ids = self.get_tensors_from_batch(batch)
-                
-        #TODO: check if something breaks when len(unique(subject_ids)) != batch_size (i.e. in the last batch)
         max_ages             = self.model.get_max_ages_per_subject(ages, subject_ids, self.train_loader.batch_size)
-        
-        import ipdb; ipdb.set_trace()
-        
         x, ages, subject_ids = self.model.insert_no_event_tokens(x, ages, subject_ids, max_ages)
-        
-        # x, ages, subject_ids = self.model.mask_tokens_after_age (x, ages, subject_ids, max_ages)
-
         x, ages, subject_ids = self.adjust_to_seqlen(x, ages, subject_ids, seqlen)
+
         return x, ages, subject_ids
 
 
@@ -434,9 +431,7 @@ class Trainer():
 
         model = self.model
 
-        # x, ages, subject_ids = self.prepare_input_simplified()
-        
-        x, ages, subject_ids = self.prepare_input(batch)
+        x, ages, subject_ids = self.prepare_input(batch, seqlen=48)
 
         logits, att = model(x, ages, subject_ids)
 
@@ -542,32 +537,7 @@ class Trainer():
     def train_epoch(self, n_batches=None, eval_every=None):
 
         self.val_step = 0
-        ce_ema, time_ema = None, None
-
-        def _assert_no_grad_tensors(tag, obj, max_print=20):
-            import torch
-            found = []
-            if isinstance(obj, dict):
-                items = obj.items()
-            elif isinstance(obj, (list, tuple)):
-                items = enumerate(obj)
-            else:
-                return
-        
-            for k, v in items:
-                if torch.is_tensor(v) and v.grad_fn is not None:
-                    found.append((k, type(v), str(v.grad_fn)))
-                elif isinstance(v, (dict, list, tuple)):
-                    # shallow scan only (evita recursion infinita)
-                    for kk, vv in (v.items() if isinstance(v, dict) else enumerate(v)):
-                        if torch.is_tensor(vv) and vv.grad_fn is not None:
-                            found.append((f"{k}.{kk}", type(vv), str(vv.grad_fn)))
-        
-            if found:
-                print(f"\n[FOUND grad tensors in {tag}]")
-                for row in found[:max_print]:
-                    print("  ", row)
-                raise RuntimeError(f"Grad tensors leaked into {tag}")
+        ce_ema, time_ema = None, None        
 
         pbar = tqdm(
             total=len(self.train_loader) if n_batches == "all" else n_batches, 
@@ -579,12 +549,6 @@ class Trainer():
             self.optimizer.zero_grad()
             loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
                         
-            # justo antes de backward:
-            _assert_no_grad_tensors("self.train_outputs", self.train_outputs)
-            _assert_no_grad_tensors("self.valid_outputs", self.valid_outputs)
-            if hasattr(self.model, "_trace"):
-                _assert_no_grad_tensors("model._trace", self.model._trace)
-
             loss['train_total'].backward()
 
             self.optimizer.step()
@@ -609,9 +573,9 @@ class Trainer():
             })
             
             
-            # if eval_every is not None and (i % eval_every) == 0:
-                # self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=self.n_val_batches)
-                # self.val_step += 1                        
+            if eval_every is not None and (i % eval_every) == 0:
+                self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=self.n_val_batches)
+                self.val_step += 1                        
     
             current_loss = self.train_outputs[-1]
             pbar.set_postfix({
@@ -639,7 +603,7 @@ class Trainer():
             loss_outputs = []
             for i, batch in enumerate(self.valid_loader):
 
-                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_loss_per_disease=False, stage="validation", add_prefix="val")
+                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_loss_per_disease=True, stage="validation", add_prefix="val")
                 loss_outputs.append(loss)
             
                 pbar.set_postfix({
