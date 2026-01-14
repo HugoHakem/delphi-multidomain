@@ -3,6 +3,10 @@ import os, sys
 from pathlib import Path
 import yaml
 
+from dataclasses import dataclass, asdict
+from pprint import pformat    
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -40,9 +44,10 @@ from trainer import (
     clone_run_to_new_experiment,
 )
 
-print(f"{sys.stdout.isatty()=}")
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.allow_tf32 = True
+
 USE_TQDM = sys.stdout.isatty()
-print(f"{USE_TQDM=}")
 
 # ——————————————— CONFIG ———————————————————————————————————————————————————————————————
 
@@ -62,6 +67,7 @@ def get_cli_args():
     parser.add_argument("--run_name",         default=None)
     parser.add_argument("--batch_size",       default=256, type=int)
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
+    parser.add_argument("--no-warnings", "--no_warnings", dest="no_warnings", default=False, action="store_true")
     parser.add_argument("--resume_run_id", type=str, default=None,
                     help="Resume training from the latest checkpoint of this MLflow run")
     parser.add_argument("--dryrun", "--dry-run", "--dry_run", dest="dry_run", action="store_true", default=False)
@@ -96,7 +102,6 @@ def parse_attention_scheme(attention_scheme, as_list=True):
         return [parse_attention_scheme(scheme, as_list=False) for scheme in attention_scheme]
 
 
-from dataclasses import dataclass
 
 @dataclass
 class ProcessedArgs:
@@ -200,16 +205,21 @@ if __name__ == "__main__":
 
     dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[], required_domains=["diseases"])
     
-    train_dataset = DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE)
+    train_dataset = DelphiDataset(subjects=train_ids,   **dataset_config).to(DEVICE)
     valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
-    test_dataset  = DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)    
+    test_dataset  = DelphiDataset(subjects=test_ids,   **dataset_config).to(DEVICE)
+
     dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, args.batch_size, args.batch_size][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
     # —————————————————————————————————————————————————————————————————————————————————————————————————————————
+    
+    config = DelphiConfig( n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head, token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme)
 
-    config = DelphiConfig( n_embd=args.n_embd, n_layer=args.n_layer, token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme)
+    logging.info("Config:\n%s", pformat(asdict(config), sort_dicts=False))
     torch.compile(model := Delphi(config).to(DEVICE))
 
     optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
+    logging.info(f"Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
+    
     optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
     
     assert args.run_name != 'default', f"You are using the 'default' value for run_name."
@@ -235,6 +245,9 @@ if __name__ == "__main__":
     print(f"Resuming from MLflow run {args.resume_run_id} ...")
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+  if args.no_warnings:
+      warnings.filterwarnings("ignore")
 
   trainer = Trainer( model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM ) 
   trainer.train(max_epochs=1000)
