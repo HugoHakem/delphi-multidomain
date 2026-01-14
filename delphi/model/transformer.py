@@ -493,7 +493,6 @@ class DelphiConfig:
     block_size: int = 64
     dropout: float = 0.1
     token_dropout: float = 0.1
-    # mask_ties: bool = False
     # ignore_tokens: list = field(default_factory=lambda: [0])
     domains: dict[str, EmbedConfig] = field(default_factory=dict)
     # modality_emb: bool = False
@@ -542,23 +541,6 @@ def validate_model_config_for_finetuning(
             and finetune_bm.input_size == pretrain_bm.input_size
         ), f"biomarker {biomarker} embed configs must match between finetune and pretrain configs"
 
-
-def parse_token_list(token_list: list[str]) -> list:
-    if not token_list:
-        return []
-
-    parsed = []
-    for token in token_list:
-        if token.endswith(".yaml") or token.endswith(".yml"):
-            with open(token, "r") as f:
-                tokens = yaml.safe_load(f)
-            if not isinstance(tokens, list):
-                raise ValueError(f"Expected a list of tokens in {token}")
-            parsed.extend(tokens)
-        else:
-            parsed.append(token)
-
-    return parsed
 
 # ———————————————————— Embedding layer for a single domain —————————————————————————————————————————————
 
@@ -627,16 +609,13 @@ class DomainEmbedding(nn.Module):
             nn.Linear(d_ext, n_embed, bias=False)
         )
 
-
     @property
     def weight(self):
         return self.projector.weight
 
-
     @property
     def vocab_len(self):
         return self.projector.weight.shape[0]
-
 
     def build_mlp_projector(self, config):
 
@@ -671,21 +650,6 @@ class DomainEmbedding(nn.Module):
         out = self.projector(x)
         return out
 
-# ———————————————————— Final embedding to logits ——————————————————————————————————————————————————
-
-class DomainwiseTiedLinear(nn.Module):
-    
-    def __init__(self, embedding_layer_dict):
-        super().__init__()
-        self.embedding_layer_dict = embedding_layer_dict
-
-
-    def forward(self, x):
-        return {
-          dname: F.linear(x, embedding_layer.weight) 
-          for dname, embedding_layer in self.embedding_layer_dict if dname != "padding"
-        }
-
 # ———————————————————— Embedding layer for all domain ————————————————————————————————————————————————————————————————
 
 class MultiDomainEmbedding(nn.Module):
@@ -704,11 +668,6 @@ class MultiDomainEmbedding(nn.Module):
         else:
             self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=0)
         
-        # Add embedding for padding tokens
-        # self.domain_embed["padding"] = nn.Embedding(2, config.n_embd)
-        # self.PAD_TOKEN_ID = 0
-        # self.NO_EVENT_TOKEN_ID = 1
-                
 
     def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         
@@ -739,6 +698,20 @@ class MultiDomainEmbedding(nn.Module):
     def keys(self):
         return self.domain_embed.keys()
 
+
+# ———————————————————— Final embedding to logits ——————————————————————————————————————————————————
+class DomainwiseTiedLinear(nn.Module):
+    
+    def __init__(self, embedding_layer_dict):
+        super().__init__()
+        self.embedding_layer_dict = embedding_layer_dict
+
+
+    def forward(self, x):
+        return {
+          dname: F.linear(x, embedding_layer.weight) 
+          for dname, embedding_layer in self.embedding_layer_dict if dname != "padding"
+        }
 
 # ———————————————————— HEADS ————————————————————————————————————————————————————————————————
 
@@ -801,42 +774,6 @@ class CompetingExpHead(nn.Module):
             loss_dt = -exp_log_likelihood
 
         return loss_dt
-
-
-# ———————————————————— MASKS ————————————————————————————————————————————————————————————————
-
-# TODO: make sure that this is not needed anymore.
-# def ties_adjusted_delta_t(t0, t1, attn_mask, mask_ties: bool, eps: float = 1.0) -> torch.Tensor:
-# 
-#     delta_t = torch.clamp(t1-t0, min=eps)
-# 
-#     dd = dict(device=t0.device, dtype=torch.float32)
-#     
-#     if mask_ties:
-#         idx = ( attn_mask * torch.arange(0, t0.size(1), **dd).view(1, 1, 1, -1) ).max(-1).indices.squeeze((1, 2))
-#         delta_t = torch.gather(delta_t, -1, idx)
-# 
-#    #  if mask_ties:
-#    #      delta_t = torch.gather(delta_t, -1, (attn_mask * torch.arange(
-#    #                  0, t0.size(1), 
-#    #              ).view(1, 1, 1, -1)
-#    #          )
-#    #          .max(-1)
-#    #          .indices.squeeze((1, 2)),
-#    #      )
-# 
-#     return delta_t
-
-
-class AttentionMaskStack:
-    
-    def __init__(self, attn_mask, n_layer):
-        self.attn_mask = attn_mask
-        self.n_layer   = n_layer
-    
-    def __getitem__(self, i):
-        return self.attn_mask
-
 
 
 class LayerNorm(nn.Module):
@@ -1140,11 +1077,6 @@ class Delphi(torch.nn.Module):
             subjects_flat, return_counts=True
         )
     
-        if not all([x == 128 for x in counts]):
-            print(subjects_flat)
-            print(unique_subjects)
-            print(counts)
-
         # split
         batch_tokens     = torch.split(tokens_flat, counts.tolist())
         batch_ages       = torch.split(ages_flat, counts.tolist())
@@ -1166,7 +1098,8 @@ class Delphi(torch.nn.Module):
         )
 
 
-    def to_tensor_deprecated(self, x, ages, embeddings, subject_ids):
+    # Old and extremely slow on GPU, just kept temporarily for comparison purposes
+    def _to_tensor_(self, x, ages, embeddings, subject_ids):
 
         '''
             input values:
@@ -1260,63 +1193,21 @@ class Delphi(torch.nn.Module):
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
 
         
-        # if not hasattr(self, "_sample_tensors"):
-        #     x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
-        #     self._sample_tensors = x, ages, emb, subject_ids, domains
-        #     
-        #     # TODO: check if this is still necessary
-        #     self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
-        # else:
-        #     x, ages, emb, subject_ids, domains = self._sample_tensors
-            
-        # print(f"{x['padding'].shape=}")
-        # print(f"{ages['padding'].shape=}")
-        # print(f"{subject_ids['padding'].shape=}")
+        x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
 
-        # print(f"{subject_ids['diseases'].shape=}")
-        # print(f"{torch.unique(subject_ids['diseases'])}")
-        
-        xx, _, _, _, _ = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
-        x, ages, emb, subject_ids, domains = self.to_tensor_deprecated(x, ages, emb := self.transformer.embed(x), subject_ids)
-
-        # print(f"{x.shape=}")
-        # print(f"{xx.shape=}")
-        
         self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
                     
         emb += self.transformer.age_embedding(ages)
         
-        # print(f"Allocated memory: {torch.cuda.memory_allocated() / 1e9} GB")
-
-        # single_mask = self.transformer.attn_mask_builder[0][0].build(
-        #     ages, domains, self.domain_to_int
-        # )  # (B, L-1, L-1)
-# 
-        # attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
-        #         expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
-        #             permute(1, 0, 2, 3, 4)        
+        single_mask = self.transformer.attn_mask_builder[0][0].build(ages, domains, self.domain_to_int)  # (B, L-1, L-1)
         
-        # ——— BUILDING ATTENTION MASK —————————————————————————————————————————————————————————————————————————
-        # group = AttentionMaskGroup(self.transformer.attn_mask_builder)
-
-        # TODO: passing domain2id on every call doesn't seem right. Try to pass it in the constructor if possible.
-        # attn_view = group.build(ages, domains, self.domain_to_int)
-
-        # attn_mask = torch.stack([ 
-            # self.transformer.attn_mask_builder[i](ages, domains, domain2id) 
-            # for i, _ in enumerate(self.transformer.h) ]
-        # ) 
-                
-        # attn_mask = attn_view[0].unsqueeze(0).expand(self.config.n_layer, -1, -1, -1)
+        attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
+                expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
+                    permute(1, 0, 2, 3, 4)        
         
-        # (N_LAYERS, BATCH_SIZE, ..., ...) -> (BATCH_SIZE, N_LAYERS, ..., ...)
-        # attn_mask = attn_mask.permute(1, 0, 2, 3)
-        # —————————————————————————————————————————————————————————————————————————————————————————————————————
-
         h, att = emb, []
         for i, transformer_block in enumerate(self.transformer.h):
-            # h, _att = transformer_block(h, attn_mask=attn_mask[i])
-            h, _att = transformer_block(h, None)
+            h, _att = transformer_block(h, attn_mask=attn_mask[i])
             att.append(_att)
         
         h = self.transformer.ln_f(h)        
@@ -1366,7 +1257,6 @@ class Delphi(torch.nn.Module):
             dtype=all_ages.dtype,
         )
     
-        # print(subject_ids_local)
         max_age.scatter_reduce_(
             0,
             subject_ids_local,
@@ -1469,14 +1359,6 @@ class Delphi(torch.nn.Module):
     
         warned = False
     
-        # sanity
-        # print("max_ages.numel()", max_ages.numel())
-        # print("device", max_ages.device)
-        # print("min/max subj diseases", int(subject_ids["diseases"].min()), int(subject_ids["diseases"].max()))
-        # print("unique diseases", subject_ids["diseases"].unique().numel())
-        
-        # unique_subjects = torch.unique( torch.cat([subject_ids[d] for d in subject_ids if d != "padding"]) )
-
         batch_subjects = torch.unique(
             torch.cat([subject_ids[d] for d in subject_ids if d != "padding"]),
             sorted=True
@@ -1485,18 +1367,7 @@ class Delphi(torch.nn.Module):
         # mapping: subject_id real → índice batch
         subject_to_batch = { int(s.item()): i for i, s in enumerate(batch_subjects) }       
         
-        # print(f"{max_ages=}")
-        print(f"{len(max_ages)=}")
-        print(f"{len(subject_to_batch)=}")
-        print(f"{subject_to_batch=}")
-        print(f"{len(batch_subjects)=}")
-        
-        
-
         for subj_id in batch_subjects:          
-            
-            # for subj in range(max_ages.numel()):    
-            # b = subject_to_batch[subj_id]
             
             b = subject_to_batch[subj_id.int().item()]            
             
@@ -1681,8 +1552,6 @@ class Delphi(torch.nn.Module):
         
     def local_to_global_ids(self, domain_ids, local_ids):
 
-        # local_ids = targets[ torch.isin(domain_ids, self.predicted_domains_as_int) ]
-        # f_domains = domain_ids[mask]
         offsets = self.offsets_per_domain[domain_ids]
         global_ids = offsets + local_ids
         return global_ids
