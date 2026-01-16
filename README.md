@@ -21,6 +21,13 @@ It focuses on:
 - [Querying MLflow runs](#tips-for-querying-mlflow-runs)
 - [Developer notes](#notes-for-developers)
 
+## Software environment
+_To be completed_
+The code has been tested with the following versions:
+- `numpy=1.26.4`
+- `pandas=2.2.3`
+- `mlflow=2.22.0`
+- `torch=2.3.0`
 
 ## Training 
 
@@ -97,7 +104,7 @@ python train.py \
 ### Model tracking with MLflow
 You can specify a custom MLflow location by setting the MLFLOW_URI environment variable, otherwise it's the `mlruns` folder within this repo's root directory.
 The previous command will create an MLflow experiment called `rare_variants`. 
-
+Instructions are provided later on how to query the information logged by MLflow.
 
 ## Evaluation
 A Nextflow pipeline is available to compute AUCs on a Slurm cluster. The objective is to parallelize the logit computation across many CPUs.
@@ -105,20 +112,26 @@ Note that it generates bulky intermediate logit files.
 
 You simply need to generate a file called `runs.csv` with the `runid` header and a set of MLflow run IDs, one per line. Place it in the `auc/scripts` folder and run the following.
 
+I recommend setting the `MLFLOW_TRACKING_URI` environment variable in your `~/.bashrc`
+
 ```
 module load nextflow
 
 cd auc/scripts
-nextflow run auc-calculation.nf
+nextflow run auc-calculation.nf -profile slurm
 ```
 
 This will produce a set of AUC files, split by chunks of diseases.
 
 
 ## Model explainability
+_To be completed_
+
+This section will contain details on how to perform SHAP calculation using Nextflow.
 
 ## Submitting a hyperparameter search as Slurm job array
 _To be completed_
+
 This section will provide tips to explore different combinations of hyperparameters by using Slurm's job array feature.
 It requires generating a tabular file, where columns are command-line arguments of the `train.py` script, and the cells contain their values. Each row is a different run.
 Then a Slurm scripts reads this file line by line, building the command based on the configuration given by the row, and submitting it to a different GPU node.
