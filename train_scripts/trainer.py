@@ -1,7 +1,6 @@
 import pandas as pd
 from typing import List, Dict, Union
 import torch
-import numpy as np
 import mlflow
 from tqdm import tqdm
 import os, sys
@@ -9,16 +8,15 @@ from pathlib import Path
 import tempfile
 import shutil
 from datetime import datetime
+from easydict import EasyDict
+from urllib.parse import urlparse
 
 
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
 from data.event_set import EventSet
-from easydict import EasyDict
-from copy import deepcopy
-from collections import defaultdict
-from urllib.parse import urlparse
+
 
 def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_run_name: str = None) -> str:
 
@@ -253,9 +251,8 @@ class MLFlowLogger:
             metadata: Optional dict with extra info (epoch, val_loss, etc.).
             filename: Optional filename for the checkpoint.
         """
-        from datetime import datetime
-        import torch
-        from pathlib import Path
+
+        import torch        
     
         if metadata is None:
             metadata = {}
@@ -404,17 +401,7 @@ class Trainer():
             self.epoch_end()
             
 
-    def prepare_input(self, batch, seqlen=128):
-
-        x, ages, subject_ids = self.get_tensors_from_batch(batch)
-        max_ages             = self.model.get_max_ages_per_subject(ages, subject_ids, self.train_loader.batch_size)
-        x, ages, subject_ids = self.model.insert_no_event_tokens(x, ages, subject_ids, max_ages)
-        x, ages, subject_ids = self.adjust_to_seqlen(x, ages, subject_ids, seqlen)
-
-        return x, ages, subject_ids
-
-
-    def prepare_input_simplified(self):
+    def _prepare_input_simplified(self):
         
         '''
         Sample only one input tensor from the training loader and reuse it
@@ -423,7 +410,7 @@ class Trainer():
 
         if not hasattr(self, "_sample_input_tensor"):
             sample_batch = next(iter(self.train_loader))
-            self._sample_input_tensor = self.prepare_input(sample_batch) 
+            self._sample_input_tensor = self.model.prepare_input(sample_batch, seqlen=self.seqlen)
         return self._sample_input_tensor
 
     
@@ -431,7 +418,7 @@ class Trainer():
 
         model = self.model
 
-        x, ages, subject_ids = self.prepare_input(batch, seqlen=48)
+        x, ages, subject_ids = self.model.prepare_input(batch)
 
         logits, att = model(x, ages, subject_ids)
 
@@ -492,10 +479,7 @@ class Trainer():
             'train_ce_ema_loss': ce_ema,
             'train_time_ema_loss': time_ema,
             'train_total': ce_val + time_val,
-        })
-
-
-        
+        })        
       
 
     def valid_epoch_end(self, loss_outputs):        
@@ -529,10 +513,7 @@ class Trainer():
                 print(f"[compute_mean] Skipping key '{k}': {e}")
                 out[k] = torch.tensor(float('nan'))
         return out
-        
-
-
-    
+          
 
     def train_epoch(self, n_batches=None, eval_every=None):
 
@@ -639,184 +620,3 @@ class Trainer():
 
         pass
 
-
-    # ——————————————————————————————————————————————————————————————————————————————
-    def get_tensors_from_batch(self, batch):
-        
-        tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
-        
-        for dname in batch:               
-            SUBJECT_ID_COLUMN, AGE_COLUMN, TOKEN_COLUMN = 0, 1, 2
-            domain_data = batch.get(dname, [])  
-            if len(domain_data) == 0:
-                domain_data = domain_data.view(0, 3)
-            if dname == "genetic_pcs":
-                tokens[dname] = domain_data[:, 1:-1].float()
-                ages[dname] = domain_data[:, -1]
-                subject_ids[dname] = domain_data[:, 0]
-            else:    
-                tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
-                ages[dname] = domain_data[:, AGE_COLUMN]
-                subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
-
-        return tokens, ages, subject_ids
-
-
-    def lengths_by_subject(self, subject_ids, ignore=None):
-        out = {}
-        for d, sids in subject_ids.items():
-            if ignore is not None and d in ignore: 
-                continue
-            for sid in torch.unique(sids):
-                out.setdefault(int(sid.item()), 0)
-                out[int(sid.item())] += int((sids == sid).sum().item())
-        return out
-    
-
-    def truncate_subjects_by_age(self,
-        x: dict[str, torch.Tensor],
-        ages: dict[str, torch.Tensor],
-        subject_ids: dict[str, torch.Tensor],
-        total_per_subject: dict[int, int],
-        seqlen: int,
-        trim_domains: set[str],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """
-        Truncate subjects with more than `seqlen` tokens, globally across trim_domains.
-    
-        Drops the most recent (highest age) events until each subject has exactly `seqlen` tokens total.
-        Returns updated dicts with tokens removed.
-        """
-        device = next(iter(subject_ids.values())).device
-    
-        # Accumulate indices to drop per domain
-        to_drop_by_domain: dict[str, list[int]] = defaultdict(list)
-    
-        for subj_id, tot in total_per_subject.items():
-            diff = seqlen - tot
-            if diff >= 0:
-                continue  # nothing to drop
-    
-            R = -diff  # number of tokens to remove
-    
-            # Collect all candidate (age, domain, idx) from trim_domains
-            candidates = []
-            for d in trim_domains:
-                if d not in subject_ids:
-                    continue
-                sids_d, ages_d = subject_ids[d], ages[d]
-                idx = (sids_d == subj_id).nonzero(as_tuple=True)[0]
-                if idx.numel() == 0:
-                    continue
-                for j in idx.tolist():
-                    candidates.append((float(ages_d[j].item()), d, j))
-    
-            if not candidates:
-                # No eligible domains for trimming
-                continue
-    
-            # Sort by age (ascending) and remove the R most recent
-            candidates.sort(key=lambda t: t[0])
-            drop = candidates[-min(R, len(candidates)):]
-            for _, d, j in drop:
-                to_drop_by_domain[d].append(j)
-    
-        # Apply drops per domain
-        for d, drop_list in to_drop_by_domain.items():
-            if not drop_list:
-                continue
-            mask = torch.ones(len(subject_ids[d]), dtype=torch.bool, device=device)
-            mask[torch.tensor(sorted(set(drop_list)), device=device)] = False
-            x[d] = x[d][mask]
-            ages[d] = ages[d][mask]
-            subject_ids[d] = subject_ids[d][mask]
-    
-        return x, ages, subject_ids
-
-
-    def pad_subjects(self,
-        x: dict[str, torch.Tensor],
-        ages: dict[str, torch.Tensor],
-        subject_ids: dict[str, torch.Tensor],
-        total_per_subject: dict[int, int],
-        seqlen: int,
-        pad_domain: str,
-        PADDING_TOKEN: int,
-        PAD_AGE: float,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """
-        Pad subjects with fewer than `seqlen` tokens by appending padding tokens
-        in the specified `pad_domain`.
-        """
-        device = next(iter(subject_ids.values())).device
-        dtype_x = next(iter(x.values())).dtype
-        dtype_age = next(iter(ages.values())).dtype
-        dtype_sid = next(iter(subject_ids.values())).dtype
-    
-        pad_x, pad_a, pad_sid = [], [], []
-    
-        for subj_id, tot in total_per_subject.items():
-            diff = seqlen - tot
-            if diff <= 0:
-                continue
-            pad_x.append(torch.full((diff,), PADDING_TOKEN, device=device, dtype=dtype_x))
-            pad_a.append(torch.full((diff,), PAD_AGE, device=device, dtype=dtype_age))
-            pad_sid.append(torch.full((diff,), subj_id, device=device, dtype=dtype_sid))
-    
-        if pad_x:
-            x[pad_domain] = torch.cat([x[pad_domain], torch.cat(pad_x)])
-            ages[pad_domain] = torch.cat([ages[pad_domain], torch.cat(pad_a)])
-            subject_ids[pad_domain] = torch.cat([subject_ids[pad_domain], torch.cat(pad_sid)])
-    
-        return x, ages, subject_ids
-
-
-    def adjust_to_seqlen(self,
-        x: dict[str, torch.Tensor],
-        ages: dict[str, torch.Tensor],
-        subject_ids: dict[str, torch.Tensor],
-        seqlen: int,
-        *,
-        pad_domain: str = "padding",
-        trim_domains: set[str] = frozenset({"diseases"}),
-        PADDING_TOKEN: int = 0,
-        PAD_AGE: float = -10000.0,
-    ):
-        """
-        Main orchestrator: ensures all subjects have exactly `seqlen` tokens in total,
-        truncating by age when too long, padding otherwise.
-        """
-                
-        x  = deepcopy(x)
-        ages  = deepcopy(ages)
-        subject_ids  = deepcopy(subject_ids)
-
-
-        domains = self.model.domains
-    
-        # Count total tokens per subject (excluding padding)
-        if domains:
-            all_sids = torch.cat([subject_ids[d] for d in domains])
-            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
-            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
-        else:
-            total_per_subject = {}
-    
-        # Step 1: truncate subjects with too many tokens
-        x, ages, subject_ids = self.truncate_subjects_by_age(
-            x, ages, subject_ids, total_per_subject, seqlen, trim_domains
-        )
-    
-        # Step 2: recompute totals (after truncation)
-        if domains:
-            all_sids = torch.cat([subject_ids[d] for d in domains])
-            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
-            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
-    
-        # Step 3: pad subjects that are still short
-        x, ages, subject_ids = self.pad_subjects(
-            x, ages, subject_ids, total_per_subject, seqlen, pad_domain, PADDING_TOKEN, PAD_AGE
-        )
-    
-        return x, ages, subject_ids
-    
