@@ -33,6 +33,14 @@ from collections import defaultdict
 from easydict import EasyDict
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
+# TIPS TO HELP YOUR READING OF THIS FILE:
+# - I make extensive use of separators like these  #————— to visually separate different classes or sections
+# - I use the := operator (walrus) to assign and check values in a single line (e.g. if (x := compute_x()) > 0:).
+#   This was introduced in Python 3.8, so you may want to understand what it does if you're not familiar with it (it's very simple).
+# - 
+
+
+# —————————————————————————————————————————————————————————————————————————————————————————————————————
 
 class AttentionMaskBuilder(nn.Module):
     """
@@ -102,31 +110,6 @@ class AttentionMaskBuilder(nn.Module):
 
         return scheme
 
-    # —-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—
-    def build_slow(self, ages: torch.Tensor, domains: torch.Tensor, domain2id: dict):
-        B, L = ages.shape
-        dd = { "device": ages.device }
-        mask = torch.ones(B, L, L, **dd)
-
-        for dom_names, cfg in self.scheme.items():
-
-            dom_ids = [domain2id[d] for d in dom_names]
-            dom_mask = torch.isin(domains, torch.tensor(dom_ids, **dd))
-
-            for b in range(B):
-                idxs = torch.nonzero(dom_mask[b], as_tuple=True)[0]
-                for i in idxs:
-                    for j in idxs:
-                        if cfg["type"] == "bidirectional":
-                            continue
-                        elif cfg["type"] == "causal":
-                            if ages[b, i] < ages[b, j]:
-                                mask[b, i, j] = 0
-                            elif ages[b, i] == ages[b, j] and cfg["mask_ties"]:
-                                mask[b, i, j] = 0
-
-        return mask
-
 
     def build(self, ages: torch.Tensor, domains: torch.Tensor, domain2id: dict):
         """
@@ -170,10 +153,6 @@ class AttentionMaskBuilder(nn.Module):
                     # allow ties
                     causal = age_row >= age_col
 
-                # causal = age_row >= age_col
-                # if not cfg.get("mask_ties", False):
-                    # causal = age_row > age_col
-
                 # Combine with the domain pair mask
                 final = pair_mask & causal
                 mask[final] = 1
@@ -183,130 +162,8 @@ class AttentionMaskBuilder(nn.Module):
 
         return mask
 
-
-
     def forward(self, ages, domains, domain2id):
         return self.build(ages, domains, domain2id)
-
-
-class AttentionMaskGroup:
-    """
-    Extended: handles per-layer AND per-head builder schemes,
-    avoiding redundant computation.
-
-    builders_layers: list of lists
-        builders_layers[layer][head] -> AttentionMaskBuilder
-    """
-    def __init__(self, builders_layers: list[list[nn.Module]]):
-        self.builders_layers = builders_layers
-        self.n_layers = len(builders_layers)
-        self.n_heads = len(builders_layers[0])
-
-        # Cache: scheme_key -> list of (layer, head)
-        self.scheme_cache = {}
-        for i, layer_builders in enumerate(builders_layers):
-            for j, b in enumerate(layer_builders):
-                key = str(b.scheme)
-                self.scheme_cache.setdefault(key, []).append((i, j))
-
-        self.unique_schemes = list(self.scheme_cache.keys())
-
-    # ------------------------------------------------------------------
-    def build(self, ages, domains, domain2id):
-        """
-        Returns tensor (B, n_layers, n_heads, L, L)
-        """
-        B, L = ages.shape
-        device = ages.device
-
-        # Build base masks for each unique scheme
-        base_masks = {}
-        for key in self.unique_schemes:
-            i0, j0 = self.scheme_cache[key][0]
-            builder0 = self.builders_layers[i0][j0]
-            base_masks[key] = builder0.build(ages, domains, domain2id)
-            # (B, L, L)
-
-        # Assemble full tensor
-        out = torch.zeros(
-            B, self.n_layers, self.n_heads, L - 1, L - 1,  # because builder trimmed
-            device=device
-        )
-
-        for key, positions in self.scheme_cache.items():
-            mask = base_masks[key]  # (B, L-1, L-1)
-            for (i, j) in positions:
-                out[:, i, j] = mask
-
-        return out
-
-    # ------------------------------------------------------------------
-    def __len__(self):
-        return self.n_layers
-
-
-
-class LayerHeadMaskView:
-    """
-    Lazy 2D view over layer×head attention masks.
-    Uses shared base masks so repeated schemes aren't recomputed.
-    """
-
-    def __init__(self, base_masks: dict[str, torch.Tensor],
-                 scheme_cache: dict[str, list[tuple[int, int]]],
-                 n_layers: int, n_heads: int):
-
-        self.base_masks = base_masks
-        self.scheme_cache = scheme_cache
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-
-        # Build mapping: (layer, head) -> key
-        self.lh2key = {}
-        for key, positions in scheme_cache.items():
-            for (layer, head) in positions:
-                self.lh2key[(layer, head)] = key
-
-    # --------------------------------------------------------------
-    def __getitem__(self, idx):
-        """
-        idx can be:
-            - int (layer)       → returns list-of-head-masks
-            - tuple (l, h)      → returns mask for that head
-        """
-        if isinstance(idx, int):
-            # layer index: return list of head masks
-            return [ self.base_masks[self.lh2key[(idx, h)]]
-                     for h in range(self.n_heads) ]
-
-        if isinstance(idx, tuple) and len(idx) == 2:
-            l, h = idx
-            key = self.lh2key[(l, h)]
-            return self.base_masks[key]
-
-        raise TypeError("Index must be int (layer) or (layer, head)")
-
-    # --------------------------------------------------------------
-    def to(self, device):
-        for k, v in self.base_masks.items():
-            self.base_masks[k] = v.to(device)
-        return self
-
-    # --------------------------------------------------------------
-    def as_tensor(self):
-        """
-        Materializes full tensor (B, n_layers, n_heads, L, L).
-        """
-        sample = next(iter(self.base_masks.values()))
-        B, L, _ = sample.shape
-        out = torch.empty(B, self.n_layers, self.n_heads, L, L,
-                          device=sample.device,
-                          dtype=sample.dtype)
-        for l in range(self.n_layers):
-            for h in range(self.n_heads):
-                out[:, l, h] = self[l, h]
-        return out
-
 
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -416,52 +273,6 @@ class AgeEncoding(nn.Module):
 
         return self.linear(y)
 
-
-class Time2Vec(nn.Module):
-
-    def __init__(self, n_embd: int, norm_factor: float = 365.25):
-        super().__init__()
-        self.linear = torch.nn.Linear(1, n_embd, bias=True)
-        self.norm_factor = norm_factor
-
-    def forward(self, x: torch.Tensor):
-        x = self.linear(x / self.norm_factor)
-        return torch.cat([x[..., :1], torch.sin(x[..., 1:])], dim=-1)
-
-
-class PiecewiseAgeEncoding(nn.Module):
-
-    def __init__(
-        self,
-        n_embd: int,
-        norm_factors: list[float] = [365.25, 1.0],
-        max_wavelen: float = 10000.0,
-    ):
-        super().__init__()
-        assert n_embd % len(norm_factors) == 0
-        piece_n_embd = n_embd / len(norm_factors)
-        div_term = torch.exp(
-            torch.arange(0, piece_n_embd, 2) * (-math.log(max_wavelen) / piece_n_embd)
-        )
-        self.register_buffer("div_term", div_term)
-        self.n_embd = n_embd
-        self.linear = torch.nn.Linear(n_embd, n_embd, bias=False)
-
-        self.norm_factors = norm_factors
-
-    def forward(self, x: torch.Tensor):
-        y = torch.zeros(x.shape[0], x.shape[1], self.n_embd, device=x.device)
-        for i, norm_factor in enumerate(self.norm_factors):
-            piece_start = int(i / len(self.norm_factors) * self.n_embd)
-            piece_end = int((i + 1) / len(self.norm_factors) * self.n_embd)
-            y[..., piece_start:piece_end:2] = torch.sin(x / norm_factor * self.div_term)
-            y[..., piece_start + 1 : piece_end : 2] = torch.cos(
-                x / norm_factor * self.div_term
-            )
-            x = torch.remainder(x, norm_factor)
-        y = self.linear(y)
-
-        return y
 
 # ———————————————————— CONFIG ————————————————————————————————————————————————————————————————
 
@@ -653,7 +464,7 @@ class DomainEmbedding(nn.Module):
         out = self.projector(x)
         return out
 
-# ———————————————————— Embedding layer for all domain ————————————————————————————————————————————————————————————————
+# ———————————————————— Embedding layer for all domains ————————————————————————————————————————————————————————————————
 
 class MultiDomainEmbedding(nn.Module):
 
@@ -791,10 +602,6 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-# Rename to CustomSelfAttention or RestrictedSelfAttention
-# there is nothing in this function that makes it "causal", 
-# "causality" eventually comes from the attn_mask computed during forward
-# TODO: Make sure that the above is correct
 class MaskedSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -971,6 +778,10 @@ class Delphi(torch.nn.Module):
     @property
     def domain_to_int(self):
         return { dname: i for i, dname in enumerate(self.transformer.embed.domain_embed.keys()) }
+
+    @property
+    def int_to_domain_name(self):
+        return { v: k for k, v in self.domain_to_int.items() }
 
     @property
     def device(self):
@@ -1469,7 +1280,6 @@ class Delphi(torch.nn.Module):
         from data.event_set import EventSet
 
         dataloader = DelphiDataloader(dataset, batch_size=batch_size, shuffle=False)
-
         
         if block_size is not None:
             old_block_size = self.block_size
