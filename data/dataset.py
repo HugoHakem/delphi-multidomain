@@ -326,11 +326,12 @@ class DelphiDataset:
         logger.info("Included subjects: %d", len(self.included_subjects))
     
         self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
-        logger.info(
-            "Excluding %d subjects using files: %s",
-            len(self.excluded_subjects),
-            exclusions
-        )
+        if exclusions:
+            logger.info(
+                "Excluding %d subjects using files: %s",
+                len(self.excluded_subjects),
+                exclusions
+            )
 
         self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
         self._subjects = self.filter_subj_for_required_domains(self._subjects, required_domains)        
