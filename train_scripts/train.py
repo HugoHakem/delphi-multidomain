@@ -2,36 +2,26 @@
 import os, sys
 from pathlib import Path
 import yaml
-
 from dataclasses import dataclass, asdict
 from pprint import pformat    
 import warnings
-
-import numpy as np
 import pandas as pd
-
 import torch
-
-import shutil
-from urllib.parse import urlparse
-from copy import deepcopy
-
 from easydict import EasyDict
 import mlflow
 
-import logging, time
+import logging
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
-root_path = DELPHI_DIR / "data/transforms"
-ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config/attention_schemes.yaml").read_text() )
-MLFLOW_URI = os.getenv("MLFLOW_URI", DELPHI_DIR / "mlruns")
+
+# MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" )
 
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
-from utils.profiling import profile_and_print
 from utils.utils import load_embed_config
 from delphi.optim import OptimConfig, configure_optimizers
 from delphi.model.transformer import ( 
@@ -43,6 +33,9 @@ from trainer import (
     Trainer,
     clone_run_to_new_experiment,
 )
+
+root_path = DELPHI_DIR / "data" / "transforms"
+ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config" / "attention_schemes.yaml").read_text() )
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
@@ -59,13 +52,14 @@ def get_cli_args():
     parser.add_argument("--n_layer",          default=12,   type=int)
     parser.add_argument("--n_head",           default=10,   type=int)
     parser.add_argument("--n_embd",           default=120,  type=int)
+    parser.add_argument("--block_size",       default=96,   type=int)
     parser.add_argument("--test_fold",        default=1,    type=int)
     parser.add_argument("--subjects",         default=None, type=str)
     parser.add_argument("--domain_config_yaml", default="config/domain_config_default.yaml")
     parser.add_argument("--domains",          default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
     parser.add_argument("--experiment_name",  default="drugs-predicted")
     parser.add_argument("--run_name",         default=None)
-    parser.add_argument("--batch_size",       default=256, type=int)
+    parser.add_argument("--batch_size",       default=32, type=int)
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
     parser.add_argument("--no-warnings", "--no_warnings", dest="no_warnings", default=False, action="store_true")
     parser.add_argument("--resume_run_id", type=str, default=None,
@@ -212,7 +206,10 @@ if __name__ == "__main__":
     dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, args.batch_size, args.batch_size][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
     # —————————————————————————————————————————————————————————————————————————————————————————————————————————
     
-    config = DelphiConfig( n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head, token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme)
+    config = DelphiConfig( 
+        n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head, block_size=args.block_size,
+        token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme
+    )
 
     logging.info("Config:\n%s", pformat(asdict(config), sort_dicts=False))
     torch.compile(model := Delphi(config).to(DEVICE))
@@ -222,8 +219,6 @@ if __name__ == "__main__":
     
     optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
     
-    assert args.run_name != 'default', f"You are using the 'default' value for run_name."
-
     logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
 
     mlflow.log_artifact(domain_config_yaml)
