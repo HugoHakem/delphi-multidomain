@@ -50,7 +50,7 @@ domain_config = {
 ```
 Then you need to create a folder for the domain, e.g. `./data/tokens/rare_variants` with two files, named `tokens.csv` and `tokenizer.yaml`.
 - `tokens.csv` contains `subject_id`, `age` (in days) and `token_id`, one row per token (all subjects together).
-- `tokenizer.yaml` contains each token in order, and from this order the mapping to `token_id` is established.
+- `tokenizer.yaml` contains each token in order, and from this order the mapping to `token_id` is established. Note that the token indexing is zero-based, meaning that the first element of `tokenizer.yaml` gets assigned index `0` in `tokens.csv`.
 
 ### Specifying the attention scheme
 The attention scheme within and across domains is specified via a string command-line argument:
