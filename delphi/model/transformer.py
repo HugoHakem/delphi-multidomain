@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 import yaml
 
-
 import logging
 logger = logging.getLogger(__name__)
 from pathlib import Path
@@ -38,7 +37,6 @@ from easydict import EasyDict
 # - I use the := operator (walrus) to assign and check values in a single line (e.g. if (x := compute_x()) > 0:).
 #   This was introduced in Python 3.8, so you may want to understand what it does if you're not familiar with it (it's very simple).
 # - 
-
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -1087,21 +1085,6 @@ class Delphi(torch.nn.Module):
         return max_age
 
 
-    # def get_max_ages_per_subject_deprecated(self, ages, subject_ids):
-
-    #     max_ages= {}
-    #     for subj in np.unique(subject_ids['diseases'].cpu().numpy()):
-    #         subj = int(subj)
-    #         death_age = ages['death'][subject_ids['death'] == subj]
-    #         if len(death_age):
-    #             max_ages[subj] = death_age.item()
-    #             continue
-    #         max_ages[subj] = ages['diseases'][subject_ids['diseases'] == subj][-1].item()
-
-    #     return max_ages
-
-
-
     def _subject_allows_no_events(self, max_age: float, padding: str) -> bool:
 
         if padding in [None, "none"]:
@@ -1227,49 +1210,11 @@ class Delphi(torch.nn.Module):
     
         if "padding" in subject_ids:
             pass
-            # print("padding unique min/max", int(subject_ids["padding"].min()), int(subject_ids["padding"].max()))
-            # esto debería caer en el rango de los subject_ids reales,
-            # no en 0..B-1 salvo que hayas remapeado explícitamente.
+
 
         return tokens, ages, subject_ids
    
-
-#     def insert_no_event_tokens_deprecated(self, tokens, ages, subject_ids, no_event_token_rate=5, padding="regular", gen=None):
-# 
-#         """Insert synthetic 'no event' tokens at regular or random intervals."""
-# 
-#         NO_EVENT_TOKEN = self.transformer.embed['padding'].NO_EVENT_TOKEN
-# 
-#         device = tokens['diseases'].device
-# 
-#         if padding == "random" and gen is None:
-#             gen = torch.Generator(device='cpu')
-#             gen.manual_seed(tokens.sum().item())
-#     
-#         unique_subject_ids = torch.unique(subject_ids['diseases'])
-# 
-#         no_event_per_subject = {'tokens': [], 'ages':[], 'subject_ids': []}
-#         for subj_id in unique_subject_ids:
-#             if padding in [None, "none"] or no_event_token_rate in [0, None]:
-#                 pad = torch.ones(tokens.shape[0], 0)
-#             elif padding == "regular":
-#                 pad = torch.arange(0, 100 * DAYS_PER_YEAR, DAYS_PER_YEAR * no_event_token_rate) * torch.ones(1) + 1
-#             elif padding == "random":
-#                 pad = torch.randint(1, 100 * DAYS_PER_YEAR, (tokens.shape[0], int(100 / no_event_token_rate)), generator=gen)
-#             else:
-#                 raise NotImplementedError(f"Unknown padding {padding}")
-#     
-#             no_event_per_subject['tokens'].append(NO_EVENT_TOKEN * torch.ones_like(pad, dtype=torch.int))
-#             no_event_per_subject['ages'].append(pad)
-#             no_event_per_subject['subject_ids'].append(torch.tensor([subj_id] * len(pad)))
-#             
-#         tokens['padding']      = torch.stack(no_event_per_subject['tokens']).reshape(-1).to(device)
-#         ages['padding']        = torch.stack(no_event_per_subject['ages']).reshape(-1).to(device)
-#         subject_ids['padding'] = torch.stack(no_event_per_subject['subject_ids']).reshape(-1).to(device)
-#             
-#         return tokens, ages, subject_ids
-    
-    
+     
     def run_inference(self, dataset, batch_size, block_size=None, return_token_df=False):
         
         if return_token_df:
