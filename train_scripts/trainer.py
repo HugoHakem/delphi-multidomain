@@ -474,22 +474,6 @@ class Trainer():
         elif return_logits:              return loss, logits
         elif return_att:                 return loss, att
         else:                            return loss
-
-        with torch.no_grad():
-            ce_val = loss['train_ce_loss'].detach()
-            time_val = loss['train_time_loss'].detach()
-        
-            ce_ema = ce_val if ce_ema is None else (1 - self.ema_alpha) * ce_ema + self.ema_alpha * ce_val
-            time_ema = time_val if time_ema is None else (1 - self.ema_alpha) * time_ema + self.ema_alpha * time_val
-
-
-        self.train_outputs.append({
-            'train_ce_loss': ce_val,
-            'train_time_loss': time_val,
-            'train_ce_ema_loss': ce_ema,
-            'train_time_ema_loss': time_ema,
-            'train_total': ce_val + time_val,
-        })        
       
 
     def valid_epoch_end(self, loss_outputs):        
