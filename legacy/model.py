@@ -228,10 +228,15 @@ class Delphi(nn.Module):
 
         # causal self-attention mask, to ensure that attention is only applied to the left in the input sequence
         device = idx.device
+        B, L = idx.size(0), idx.size(1)
+
+        PADDING_TOKEN = 0
         # Do not attend to padded positions
-        attn_mask = (idx>0).view(idx.size(0), 1, 1, idx.size(1)) * (idx>0).view(idx.size(0),1,idx.size(1),1)  
+        attn_mask = (idx != PADDING_TOKEN).view(B, 1, 1, L) * (idx != PADDING_TOKEN).view(B, 1, L, 1)  
         
-        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0 #self.transformer.h[0].attn.bias[:,:,:idx.size(1),:idx.size(1)] > 0
+        attn_mask *= torch.tril(torch.ones(L, L, device=device))[None, None, :, :] > 0
+        
+        #self.transformer.h[0].attn.bias[:,:,:idx.size(1),:idx.size(1)] > 0
         
         # if targets is not None and self.config.mask_ties:
         if targets is not None and mask_ties:
@@ -240,8 +245,9 @@ class Delphi(nn.Module):
             attn_mask += (attn_mask.sum(-1, keepdim=True)==0) * torch.diag(torch.ones(idx.size(1), device=device)) > 0
         
         # Except for padding
-        attn_mask = attn_mask + (idx==0).view(idx.size(0), 1, 1, idx.size(1)) * torch.diag(torch.ones(idx.size(1), device=device)) > 0 
-        attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0 #self.transformer.h[0].attn.bias[:,:,:idx.size(1),:idx.size(1)] > 0
+        attn_mask = attn_mask + (idx==PADDING_TOKEN).view(B, 1, 1, L) * torch.diag(torch.ones(L, device=device)) > 0 
+
+        attn_mask *= torch.tril(torch.ones(L, L, device=device))[None,None,:,:] > 0 # self.transformer.h[0].attn.bias[:,:,:idx.size(1),:idx.size(1)] > 0
         
         return attn_mask
         
