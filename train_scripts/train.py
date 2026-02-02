@@ -18,6 +18,8 @@ DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
+sys.path.insert(0, (Path(__file__).resolve().parent))
+
 # MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" )
 
 from data.dataset import DelphiDataset, DelphiDataloader
@@ -133,18 +135,21 @@ def get_cli_args():
     import argparse
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--attention_scheme", default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
-    parser.add_argument("--n_layer",          default=12,   type=int)
-    parser.add_argument("--n_head",           default=10,   type=int)
-    parser.add_argument("--n_embd",           default=120,  type=int)
-    parser.add_argument("--block_size",       default=96,   type=int)
+    parser.add_argument("--attention_scheme",   default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
+    parser.add_argument("--n_layer",            default=12,   type=int)
+    parser.add_argument("--n_head",             default=10,   type=int)
+    parser.add_argument("--n_embd",             default=120,  type=int)
+    parser.add_argument("--block_size",         default=96,   type=int)
     parser.add_argument("--domain_config_yaml", default="config/domain_config_default.yaml")
-    parser.add_argument("--domains",          default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
-    parser.add_argument("--batch_size",       default=32, type=int)
-    parser.add_argument("--no-compile",       default=False, action='store_true')
+    parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
+    parser.add_argument("--batch_size",         default=32, type=int)
+    parser.add_argument("--no-compile",         default=False, action='store_true')
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
-    parser.add_argument("--test_fold",        default=1,    type=int)
-    parser.add_argument("--subjects",         default=None, type=str)
+    parser.add_argument("--test_fold",          default=1,    type=int)
+    parser.add_argument("--subjects",           default=None, type=str)
+    
+    parser.add_argument("--no_event_token_rate",           default=5, type=float)
+    parser.add_argument("--no_event_token_insertion_mode", default="random", type=str)
 
     parser.add_argument("--no-warnings", "--no_warnings", dest="no_warnings", default=False, action="store_true")
 
@@ -190,22 +195,30 @@ if __name__ == "__main__":
     
         dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[], required_domains=["diseases"])
         
-        train_dataset = DelphiDataset(subjects=train_ids,   **dataset_config).to(DEVICE)
-        valid_dataset = DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE)
-        test_dataset  = DelphiDataset(subjects=test_ids,   **dataset_config).to(DEVICE)
+        datasets = [
+            train_dataset := DelphiDataset(subjects=train_ids,   **dataset_config).to(DEVICE),
+            valid_dataset := DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE),
+            test_dataset  := DelphiDataset(subjects=test_ids,   **dataset_config).to(DEVICE)
+        ]
     
-        dataloaders = [ DelphiDataloader(d, batch_size=[args.batch_size, args.batch_size, args.batch_size][i]) for i, d in enumerate([train_dataset, valid_dataset, test_dataset]) ]
+        dataloaders = [ 
+            train_dataloader := DelphiDataloader(train_dataset, batch_size=args.batch_size),
+            valid_dataloader := DelphiDataloader(valid_dataset, batch_size=args.batch_size), 
+            test_dataset     := DelphiDataloader(test_dataset,  batch_size=args.batch_size)
+        ]
         # —————————————————————————————————————————————————————————————————————————————————————————————————————————
         
-        config = DelphiConfig( 
-            n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head, block_size=args.block_size,
-            token_dropout=0.1, domains=domain_cfg, attention_scheme=attention_scheme
+        delphi_config = DelphiConfig( 
+            n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head,
+            domains=domain_cfg, attention_scheme=attention_scheme,
+            token_dropout=0.1,
+            block_size=args.block_size, no_event_token_rate=args.no_event_token_rate, no_event_token_insertion_mode=args.no_event_token_insertion_mode
         )
     
-        logging.info("Config:\n%s", pformat(asdict(config), sort_dicts=False))
-        torch.compile(model := Delphi(config).to(DEVICE), disable=args.no_compile)
+        logging.info("Config:\n%s", pformat(asdict(delphi_config), sort_dicts=False))
+        torch.compile(model := Delphi(delphi_config).to(DEVICE), disable=args.no_compile)
     
-        optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr/10)
+        optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr / 10)
         logging.info(f"Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
         
         optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
@@ -236,16 +249,4 @@ if __name__ == "__main__":
         warnings.filterwarnings("ignore")
   
     trainer = Trainer( model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM ) 
-    trainer.train(max_epochs=1000)
-
-# %%
-
-# args = DEFAULT_ARGS = EasyDict({
-#     "attention_scheme": ["[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,hla_alleles]:causal(mask_ties=True)"],
-#     "n_layer": 12,
-#     "test_fold": 3,
-#     "patience": 2,
-#     "batch_size": 4,
-#     "lr": 1e-4,
-#     "run_name": os.getenv("RUN_NAME", "default"),
-# })
+    trainer.train(max_epochs=1000, patience=3)

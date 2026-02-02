@@ -1,12 +1,12 @@
 import math
-
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 from dataclasses import fields, is_dataclass, dataclass, field, asdict
 
-from pathlib import Path
 import sys
 
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent.parent ) not in sys.path:
@@ -15,9 +15,6 @@ if ( DELPHI_DIR := Path(__file__).resolve().parent.parent.parent ) not in sys.pa
 from typing import Optional, List, Tuple, Union
 
 import inspect
-
-import numpy as np
-import pandas as pd
 import yaml
 
 import logging
@@ -29,6 +26,7 @@ DAYS_PER_YEAR = 365.25
 import warnings
 from collections import defaultdict
 
+from tqdm import tqdm
 from easydict import EasyDict
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -342,6 +340,8 @@ class DelphiConfig:
     token_dropout: float = 0.1    
     bias: bool = True
     block_size: int = 64    
+    no_event_token_rate: float = 5
+    no_event_token_insertion_mode: str = "random"
     # modality_emb: bool = False
     zero_inflate: bool = False
     zero_inflate_projector: str = "linear"
@@ -383,43 +383,6 @@ class DelphiConfig:
             del self.domains[domain_name]
         return self
         
-
-# ———————————————————— VALIDATE CONFIGS ——————————————————————————————————————————————————————————
-
-def validate_model_config(config: DelphiConfig):
-    assert config.mask_ties != config.zero_inflate, "mask_ties and zero_inflate cannot be both True or both False"
-
-
-def validate_model_config_for_finetuning(
-    finetune_config: DelphiConfig, pretrain_config: DelphiConfig
-) -> None:
-
-    assert (
-        finetune_config.vocab_size == pretrain_config.vocab_size
-        and finetune_config.n_layer == pretrain_config.n_layer
-        and finetune_config.n_head == pretrain_config.n_head
-        and finetune_config.n_embd == pretrain_config.n_embd
-        and finetune_config.bias == pretrain_config.bias
-    ), "model dimensions must match between finetune and pretrain configs"
-
-    finetune_biomarkers = set(finetune_config.biomarkers.keys())
-    pretrain_biomarkers = set(pretrain_config.biomarkers.keys())
-    assert pretrain_biomarkers.issubset(
-        finetune_biomarkers
-    ), "finetune config must have all biomarkers from pretrain config"
-
-    intersect_biomarkers = finetune_biomarkers.intersection(pretrain_biomarkers)
-    for biomarker in intersect_biomarkers:
-        finetune_bm = finetune_config.biomarkers[biomarker]
-        pretrain_bm = pretrain_config.biomarkers[biomarker]
-
-        assert (
-            finetune_bm.projector == pretrain_bm.projector
-            and finetune_bm.n_layers == pretrain_bm.n_layers
-            and finetune_bm.n_hidden == pretrain_bm.n_hidden
-            and finetune_bm.input_size == pretrain_bm.input_size
-        ), f"biomarker {biomarker} embed configs must match between finetune and pretrain configs"
-
 
 # ———————————————————— Embedding layer for a single domain —————————————————————————————————————————————
 
@@ -774,6 +737,9 @@ class Delphi(torch.nn.Module):
 
         self.build_model(config)     
 
+        self.no_event_token_rate = config.no_event_token_rate
+        self.no_event_token_insertion_mode = config.no_event_token_insertion_mode
+
         initialize_weights(self, config=config)
          
     
@@ -782,7 +748,7 @@ class Delphi(torch.nn.Module):
         Build a stable mapping domain_name -> domain_id.
     
         Invariants:
-        - 'padding' MUST exist and MUST be domain_id == 0
+        - 'padding' must exist and be the last domain
         - Order of the remaining domains is stable and deterministic
         - Mapping is consistent with MultiDomainEmbedding and AttentionMaskBuilder
         """
@@ -794,11 +760,7 @@ class Delphi(torch.nn.Module):
                 "Domain 'padding' must be present in config.domains "
                 "(it is required for masking, padding and no-event tokens)."
             )
-    
-
-        # self.PAD_DOMAIN_ID = 0 
-        self.PAD_TOKEN_ID = 0
-        self.PAD_AGE = -10000
+            
         
         ordered_domains = [d for d in domains if d != "padding"] + ["padding"]
     
@@ -1194,7 +1156,7 @@ class Delphi(torch.nn.Module):
     def _generate_no_event_ages(
         self,
         max_age: float,
-        padding: str,
+        padding_mode: str,
         no_event_token_rate: float,
         device,
         gen=None,
@@ -1203,9 +1165,9 @@ class Delphi(torch.nn.Module):
         Returns a 1D tensor of ages (float, days), or None if no no-events apply.
         """
     
-        if padding == "regular":
+        if padding_mode == "regular":
             start = DAYS_PER_YEAR
-            step = DAYS_PER_YEAR * no_event_token_rate
+            step  = DAYS_PER_YEAR * no_event_token_rate
     
             # empty rank -> no no-events
             if max_age <= start or step <= 0:
@@ -1219,7 +1181,7 @@ class Delphi(torch.nn.Module):
                 dtype=torch.float,
             )
     
-        elif padding == "random":
+        elif padding_mode == "random":
             step = DAYS_PER_YEAR * no_event_token_rate
             if step <= 0:
                 return None
@@ -1235,7 +1197,7 @@ class Delphi(torch.nn.Module):
             ) * max_age
     
         else:
-            raise NotImplementedError(f"Unknown padding mode: {padding}")
+            raise NotImplementedError(f"Unknown padding mode: {padding_mode}")
     
 
     def insert_no_event_tokens(
@@ -1244,8 +1206,8 @@ class Delphi(torch.nn.Module):
         ages,
         subject_ids,
         max_ages,
-        no_event_token_rate=5,
-        padding="regular",
+        # no_event_token_rate=5,
+        # padding="regular",
         gen=None,
     ):
     
@@ -1277,8 +1239,8 @@ class Delphi(torch.nn.Module):
     
             pad = self._generate_no_event_ages(
                 max_age=max_age,
-                padding=padding,
-                no_event_token_rate=no_event_token_rate,
+                padding_mode=padding,
+                no_event_token_rate=self.no_event_token_rate,
                 device=device,
                 gen=gen,
             )
@@ -1316,8 +1278,7 @@ class Delphi(torch.nn.Module):
         
         if return_token_df:
             raise NotImplementedError
-
-        from tqdm import tqdm
+        
         from data.dataset import DelphiDataset, DelphiDataloader
         from data.event_set import EventSet
 
@@ -1437,7 +1398,7 @@ class Delphi(torch.nn.Module):
 
         x, ages, subject_ids = self.get_tensors_from_batch(batch)
         max_ages             = self.get_max_ages_per_subject(ages, subject_ids)
-        x, ages, subject_ids = self.insert_no_event_tokens(x, ages, subject_ids, max_ages)
+        x, ages, subject_ids = self.insert_no_event_tokens(x, ages, subject_ids, max_ages, no_event_token_rate=5, padding="random")
         x, ages, subject_ids = self.adjust_to_seqlen(x, ages, subject_ids, self.block_size)
         return x, ages, subject_ids
     
