@@ -365,7 +365,9 @@ class Trainer():
 
         for epoch in range(self.current_epoch, max_epochs):
             
-            self.current_epoch = epoch            
+            self.current_epoch = epoch
+            self.model.train()
+
             train_loss = self.train_epoch(eval_every=VAL_EVERY_NSAMPLES//self.train_loader.batch_size)
 
             metrics = { "train_loss": train_loss }
@@ -582,6 +584,8 @@ class Trainer():
 
     def valid_epoch(self, n_batches='all'):
         
+        self.model.eval()
+
         pbar = tqdm(
             total=len(self.valid_loader) if n_batches == "all" else n_batches, 
             disable=not self.use_tqdm
@@ -616,6 +620,7 @@ class Trainer():
 
         mean_loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
 
+        self.model.train()
         return loss, mean_loss,
 
     
