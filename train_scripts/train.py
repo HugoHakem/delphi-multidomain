@@ -153,7 +153,7 @@ def get_cli_args():
 
     parser.add_argument("--no-warnings", "--no_warnings", dest="no_warnings", default=False, action="store_true")
 
-    parser.add_argument("--experiment_name", "experiment-name", "--exp_name", "--exp-name", "-x", dest="experiment_name", required=True, default=None)
+    parser.add_argument("--experiment_name", "--experiment-name", "--exp_name", "--exp-name", "-x", dest="experiment_name", required=True, default=None)
     parser.add_argument("--run_name",         default=None)
     parser.add_argument("--resume_run_id", type=str, default=None,
                     help="Resume training from the latest checkpoint of this MLflow run")
