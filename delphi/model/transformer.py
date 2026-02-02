@@ -34,7 +34,7 @@ from easydict import EasyDict
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
 # TIPS TO HELP YOUR READING OF THIS FILE:
 # - I make extensive use of separators like these  #————— to visually separate different classes or sections
-# - I use the := operator (walrus) to assign and check values in a single line (e.g. if (x := compute_x()) > 0:).
+# - I use the := operator (walrus) to assign and check values in a single line (e.g. "if x := compute_x()) > 0:").
 #   This was introduced in Python 3.8, so you may want to understand what it does if you're not familiar with it (it's very simple).
 # - 
 
@@ -48,9 +48,14 @@ class AttentionMaskBuilder(nn.Module):
         
     """
 
-    def __init__(self, scheme_str: str):
+    def __init__(self, scheme_str: str, domain2id: dict):
+        
         super().__init__()
+        
         self.scheme = self._parse_scheme(scheme_str)
+
+        self.domain2id = domain2id
+
 
     # —-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—
     def _split_top_level(self, s: str, sep: str = ","):
@@ -59,22 +64,20 @@ class AttentionMaskBuilder(nn.Module):
         """
         parts, buf, depth_brack, depth_paren = [], "", 0, 0
         for ch in s:
-            if ch == "[":
-                depth_brack += 1
-            elif ch == "]":
-                depth_brack -= 1
-            elif ch == "(":
-                depth_paren += 1
-            elif ch == ")":
-                depth_paren -= 1
+            if ch == "[":   depth_brack += 1
+            elif ch == "]": depth_brack -= 1
+            elif ch == "(": depth_paren += 1
+            elif ch == ")": depth_paren -= 1
 
             if ch == sep and depth_brack == 0 and depth_paren == 0:
                 parts.append(buf.strip())
                 buf = ""
             else:
                 buf += ch
+
         if buf.strip():
             parts.append(buf.strip())
+
         return parts
 
     # —-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—
@@ -109,29 +112,29 @@ class AttentionMaskBuilder(nn.Module):
         return scheme
 
 
-    def build(self, ages: torch.Tensor, domains: torch.Tensor, domain2id: dict):
+    def build(self, domains: torch.Tensor, local_token_ids: torch.Tensor, ages: torch.Tensor):
         """
         Build a [B, L, L] attention mask from a declarative DSL.
         1 = attention allowed
         0 = attention blocked
         """
         B, L = ages.shape
-        device = ages.device
+        dd = { 'device': ages.device }
 
         # Start with everything blocked
-        mask = torch.zeros(B, L, L, device=device)
+        mask = torch.zeros(B, L, L, **dd)
 
         # Always allow self-attention
-        diag = torch.arange(L, device=device)
-        mask[..., diag, diag] = 1
+        # diag = torch.arange(L, **dd)
+        # mask[..., diag, diag] = 1        
 
-        # Precompute expanded views for causal tests
+        # Precompute expanded views for "causal" tests
         age_row  = ages.unsqueeze(2)  # [B, L, 1]
         age_col  = ages.unsqueeze(1)  # [B, 1, L]
 
         for dom_names, cfg in self.scheme.items():
             # Gather domain ids
-            dom_ids = torch.tensor([domain2id[d] for d in dom_names], device=device)
+            dom_ids = torch.tensor([self.domain2id[d] for d in dom_names], **dd)
 
             # Boolean mask for tokens belonging to this rule
             dom_mask = torch.isin(domains, dom_ids)   # [B, L]
@@ -158,10 +161,30 @@ class AttentionMaskBuilder(nn.Module):
             else:
                 raise ValueError(f"Unknown attention type: {cfg['type']}")
 
-        return mask
+        mask = mask.bool()
+        is_padding = (domains == self.domain2id["padding"]) & (local_token_ids == 0)
+        not_padding = ~is_padding            # [B, L]
 
-    def forward(self, ages, domains, domain2id):
-        return self.build(ages, domains, domain2id)
+        mask &= ~ ( 
+            is_padding.unsqueeze(2) |       # query not padding
+            is_padding.unsqueeze(1)         # key   not padding
+        )
+
+        mask = mask.int()
+
+        # --- fallback self-attention to avoid NaNs ---
+        # If a row is entirely zero, allow self-attention
+        row_has_any = mask.any(dim=-1)        # [B, L]
+        needs_fallback = ~row_has_any         # [B, L]
+        
+        b_idx, i_idx = needs_fallback.nonzero(as_tuple=True)
+        mask[b_idx, i_idx, i_idx] = 1
+
+        return mask
+    
+
+    def forward(self, domains, local_token_ids, ages):
+        return self.build(domains, local_token_ids, ages)
 
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -276,7 +299,7 @@ class AgeEncoding(nn.Module):
 
 @dataclass
 class EmbedConfig:
-    projector:  str           = "linear"  # "linear", "mlp", or "embed"
+    projector:  str           = "embed" # "linear", "mlp", or "embed"
     n_layers:   Optional[int] = None
     n_hidden:   Optional[int] = None
     input_size: Optional[int] = None
@@ -289,33 +312,77 @@ class EmbedConfig:
     at_birth: bool = False
 
 
+    def set_freeze(self, freeze: bool):
+        """Set whether to freeze pretrained embeddings."""
+        self.freeze = freeze
+        return self
+
+    def unfreeze(self):
+        self.set_freeze(freeze=False)
+
+    def set_predict(self, predict: bool):
+        """Set whether this domain should be predicted."""
+        self.predict = predict
+        return self
+
+
 @dataclass
-class DelphiConfig:
-    # vocab_size: Optional[int] = None
+class DelphiConfig:    
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 120
-    attention_scheme:Union[str, List] = field(
+    domains: dict[str, EmbedConfig] = field(default_factory=dict)
+    attention_scheme: Union[str, List] = field(
         default_factory=lambda: "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
     )
+    dropout: float = 0.1    
     resid_pdrop: float = 0.1
     embd_pdrop: float = 0.1
     attn_pdrop: float = 0.1
+    token_dropout: float = 0.1    
     bias: bool = True
-    block_size: int = 64
-    dropout: float = 0.1
-    token_dropout: float = 0.1
-    # ignore_tokens: list = field(default_factory=lambda: [0])
-    domains: dict[str, EmbedConfig] = field(default_factory=dict)
+    block_size: int = 64    
     # modality_emb: bool = False
-    # ce_beta: float = 1.0
-    # dt_beta: float = 1.0
     zero_inflate: bool = False
     zero_inflate_projector: str = "linear"
 
     def items(self):        
         return asdict(self).items()
     
+    def set_dropout(self, dropout: float):
+        """Set all dropout rates to the same value."""
+        self.dropout = dropout
+        self.resid_pdrop = dropout
+        self.embd_pdrop = dropout
+        self.attn_pdrop = dropout
+        return self
+    
+    def set_token_dropout(self, token_dropout: float):
+        """Set token dropout rate."""
+        self.token_dropout = token_dropout
+        return self
+    
+    def set_block_size(self, block_size: int):
+        """Set the maximum sequence length."""
+        self.block_size = block_size
+        return self
+    
+    def set_attention_scheme(self, attention_scheme: Union[str, List]):
+        """Set the attention scheme."""
+        self.attention_scheme = attention_scheme
+        return self    
+    
+    def add_domain(self, domain_name: str, embed_config: EmbedConfig):
+        """Add or update a domain configuration."""
+        self.domains[domain_name] = embed_config
+        return self
+    
+    def remove_domain(self, domain_name: str):
+        """Remove a domain configuration."""
+        if domain_name in self.domains:
+            del self.domains[domain_name]
+        return self
+        
 
 # ———————————————————— VALIDATE CONFIGS ——————————————————————————————————————————————————————————
 
@@ -470,30 +537,26 @@ class MultiDomainEmbedding(nn.Module):
         
         super().__init__()
         self.config = config
-        self.token_drop   = nn.Dropout(config.token_dropout)        
-        
+        self.token_drop   = nn.Dropout(config.token_dropout)
+
         self.domain_embed = nn.ModuleDict()
         
-        if len(config.domains) > 0:            
-            for domain_name, domain_cfg in config.domains.items():
-                self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, domain_name=domain_name, n_embed=config.n_embd)
-        else:
-            self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=0)
+        for domain_name, domain_cfg in config.domains.items():
+            self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, domain_name=domain_name, n_embed=config.n_embd)
+
+        # else:
+            # self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=0)
         
 
     def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         
-        if len(self.domain_embed) > 0:
-            emb = {}
-            for domain_name in self.domain_embed:                
-                token_emb = self.domain_embed[domain_name](x[domain_name])
-                emb[domain_name] = token_emb
-        else:
-            token_emb = self.token_embedding(x)
-            token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
-        
+        emb = {}
+        for domain_name in self.domain_embed:                
+            token_emb = self.domain_embed[domain_name](x[domain_name])
+            emb[domain_name] = token_emb
+            # token_emb = self.token_drop(token_emb) * (1 - self.config.token_dropout)
         return emb
-    
+
 
     def __iter__(self):
         """Iterate over (domain_name, embedding_module) pairs."""
@@ -529,9 +592,8 @@ class DomainwiseTiedLinear(nn.Module):
 
 class CrossEntropyHead(nn.Module):
 
-    def __init__(self): #, config):
+    def __init__(self):
         super().__init__()
-        # self.config = config
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
@@ -545,7 +607,7 @@ class CompetingExpHead(nn.Module):
 
     def __init__(self,
         n_input:      Optional[int] = None,
-        zero_inflate: bool = False,
+        zero_inflate: bool          = False,
         pi_head:      Optional[str] = None,
     ):
         super().__init__()
@@ -617,23 +679,24 @@ class MaskedSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.dropout = config.dropout
+        # self.dropout = config.dropout
 
 
     def forward(self, x, attn_mask=None):
 
-        B, T, C = x.size()
         # batch size, sequence length, embedding dimensionality (n_embd)
-
+        B, T, C = x.size()
+        
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # self-attention; self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         # manual implementation of attention
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        hs = k.size(-1)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))
 
         if attn_mask is not None:
             att = att.masked_fill(attn_mask == 0, float("-inf"))
@@ -652,9 +715,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU(approximate="tanh")
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU(approximate="tanh")
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -706,15 +769,42 @@ class Delphi(torch.nn.Module):
         
         self.config = config        
         self.config.attention_scheme = self.adapt_attention_scheme(self.config.attention_scheme)       
-        self.build_model(config)
-        
+        self.domain_to_int = self.build_domain_to_int(config)
         self.block_size = config.block_size
-        
+
+        self.build_model(config)     
+
         initialize_weights(self, config=config)
-        
+         
+    
+    def build_domain_to_int(self, config: DelphiConfig) -> dict[str, int]:
+        """
+        Build a stable mapping domain_name -> domain_id.
+    
+        Invariants:
+        - 'padding' MUST exist and MUST be domain_id == 0
+        - Order of the remaining domains is stable and deterministic
+        - Mapping is consistent with MultiDomainEmbedding and AttentionMaskBuilder
+        """
+    
+        domains = list(config.domains.keys())
+    
+        if "padding" not in domains:
+            raise ValueError(
+                "Domain 'padding' must be present in config.domains "
+                "(it is required for masking, padding and no-event tokens)."
+            )
+    
+
+        # self.PAD_DOMAIN_ID = 0 
         self.PAD_TOKEN_ID = 0
-        self.PAD_DOMAIN_ID = 0 
         self.PAD_AGE = -10000
+        
+        ordered_domains = [d for d in domains if d != "padding"] + ["padding"]
+    
+        domain_to_int = {dname: i for i, dname in enumerate(ordered_domains)}
+    
+        return domain_to_int
 
     
     def adapt_attention_scheme(self, attention_scheme):
@@ -730,17 +820,18 @@ class Delphi(torch.nn.Module):
     def build_model(self, config: DelphiConfig):
 
         self.transformer = nn.ModuleDict(dict(
-            embed=MultiDomainEmbedding(config),
-            age_embedding=AgeEncoding(n_embd=config.n_embd),
-            drop=nn.Dropout(config.dropout),
-            attn_mask_builder=nn.ModuleList([
+            embed             = MultiDomainEmbedding(config),
+            age_embedding     = AgeEncoding(n_embd=config.n_embd),
+            drop              = nn.Dropout(config.dropout),
+            # TODO: I want this to look like:
+            # attn_mask_builder = AttentionMaskBuilder(config.attention_scheme, config.n_layer, config.n_head)
+            attn_mask_builder = nn.ModuleList([
                 nn.ModuleList( [
-                    AttentionMaskBuilder(config.attention_scheme[i]) 
+                    AttentionMaskBuilder(config.attention_scheme[i], self.domain_to_int) 
                     for i in range(config.n_layer)
-                ] ) for j in range(config.n_head) ]
-            ),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f=LayerNorm(config.n_embd, bias=config.bias)
+                ] ) for j in range(config.n_head) ]),
+            h                 = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f              = LayerNorm(config.n_embd, bias=config.bias)
         ))
 
         self.embedding_to_logits = DomainwiseTiedLinear(self.transformer.embed)
@@ -759,11 +850,19 @@ class Delphi(torch.nn.Module):
     def domains(self):
         return list(self.config.domains.keys())
 
+    # @property
+    # def domain_to_int(self):
+        # return { dname: i for i, dname in enumerate(self.transformer.embed.domain_embed.keys()) }
+
+    @property
+    def int_to_domain_name(self):
+        return { v: k for k, v in self.domain_to_int.items() }
+
     @property
     def predicted_domains(self):
         return [ dname for dname, config in self.config.domains.items() if config.predict ]
 
-    #TODO: check this. There's a possible confusion here.
+    #TODO: check this. There's a potential confusion here.
     #Do we want to use the space of all domains or only that of predicted domains to assign integers?
     @property
     def predicted_domains_as_int(self):
@@ -772,14 +871,6 @@ class Delphi(torch.nn.Module):
     @property
     def predicted_domains_to_int(self):
         return { dname: i for i, dname in enumerate(self.predicted_domains) }
-
-    @property
-    def domain_to_int(self):
-        return { dname: i for i, dname in enumerate(self.transformer.embed.domain_embed.keys()) }
-
-    @property
-    def int_to_domain_name(self):
-        return { v: k for k, v in self.domain_to_int.items() }
 
     @property
     def device(self):
@@ -1013,19 +1104,25 @@ class Delphi(torch.nn.Module):
     # ————————— FORWARD ————————————————————————————————————————————————————————————————————————————————————
 
     def forward(self, 
-        x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor, 
-        validation_loss_mode: bool = False, 
+        x: torch.Tensor, ages: torch.Tensor, subject_ids: torch.Tensor,         
         return_attention: bool = False
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
-
         
-        x, ages, emb, subject_ids, domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
+        x, \
+        ages, \
+        emb, \
+        subject_ids, \
+        domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
 
         self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
                     
         emb += self.transformer.age_embedding(ages)
+        emb  = self.transformer.drop(emb)
         
-        single_mask = self.transformer.attn_mask_builder[0][0].build(ages, domains, self.domain_to_int)  # (B, L-1, L-1)
+        # transform this into
+        # attn_mask = self.build_mask(ages, domains) # [B, n_layer, n_head, L, L] <- revise these dimensions.
+
+        single_mask = self.transformer.attn_mask_builder[0][0].build(x, ages, domains)
         
         attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
                 expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
@@ -1227,6 +1324,7 @@ class Delphi(torch.nn.Module):
         dataloader = DelphiDataloader(dataset, batch_size=batch_size, shuffle=False)
         
         if block_size is not None:
+            logger.warning(f"Temporarily changing block_size from {self.block_size} to {block_size}")
             old_block_size = self.block_size
             self.set_block_size(block_size)
 
