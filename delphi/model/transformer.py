@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from pathlib import Path
 
 from dataclasses import fields, is_dataclass, dataclass, field, asdict
 
@@ -19,7 +20,6 @@ import yaml
 
 import logging
 logger = logging.getLogger(__name__)
-from pathlib import Path
 
 DAYS_PER_YEAR = 365.25
 
@@ -1206,8 +1206,6 @@ class Delphi(torch.nn.Module):
         ages,
         subject_ids,
         max_ages,
-        # no_event_token_rate=5,
-        # padding="regular",
         gen=None,
     ):
     
@@ -1234,19 +1232,19 @@ class Delphi(torch.nn.Module):
             
             max_age = float(max_ages[b].item())
     
-            if not self._subject_allows_no_events(max_age, padding):
+            if not self._subject_allows_no_events(max_age, self.no_event_token_insertion_mode):
                 continue
     
             pad = self._generate_no_event_ages(
                 max_age=max_age,
-                padding_mode=padding,
+                padding_mode=self.no_event_token_insertion_mode,
                 no_event_token_rate=self.no_event_token_rate,
                 device=device,
                 gen=gen,
             )
     
             if pad is None or pad.numel() == 0:
-                if padding == "regular" and not warned:
+                if self.no_event_token_insertion_mode == "regular" and not warned:
                     warnings.warn(
                         "Some subjects have max_age too small for regular no-event padding. "
                         "No no-event tokens were inserted for them (expected behavior)."
@@ -1398,7 +1396,7 @@ class Delphi(torch.nn.Module):
 
         x, ages, subject_ids = self.get_tensors_from_batch(batch)
         max_ages             = self.get_max_ages_per_subject(ages, subject_ids)
-        x, ages, subject_ids = self.insert_no_event_tokens(x, ages, subject_ids, max_ages, no_event_token_rate=5, padding="random")
+        x, ages, subject_ids = self.insert_no_event_tokens(x, ages, subject_ids, max_ages)
         x, ages, subject_ids = self.adjust_to_seqlen(x, ages, subject_ids, self.block_size)
         return x, ages, subject_ids
     

@@ -92,6 +92,11 @@ class EarlyStopping:
         self.should_stop = False
         self.is_improvement = False
 
+
+    def set_patience(self, patience):
+        self.patience = patience
+
+
     def step(self, current_score):
         """
         Update the early stopping state given a new validation score.
@@ -347,7 +352,10 @@ class Trainer():
         self.model.transformer.embed.domain_embed[domain_name].weight.shape[0]
 
 
-    def train(self, max_epochs=1000):
+    def train(self, max_epochs=1000, patience=None):
+
+        if patience is not None:
+            self.early_stopper.set_patience(patience)
 
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
@@ -617,6 +625,4 @@ class Trainer():
 
 
     def mlflow_logging(self):
-
         pass
-
