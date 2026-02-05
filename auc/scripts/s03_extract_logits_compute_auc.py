@@ -23,8 +23,6 @@ def load_logits(runid, logits_root, LOGITS_FILE_PATTERN):
     """
     basedir = Path(logits_root)
     out = {}
-    print("LOGITS")
-    print(basedir)
     files = sorted(basedir.glob(LOGITS_FILE_PATTERN))
     print(f"[INFO] Logits found: {len(files)} files")
 
@@ -41,8 +39,6 @@ def load_indices(runid, indices_root, INDICES_FILE_PATTERN):
     """
 
     basedir = Path(indices_root)
-    print("INDICES")
-    print(basedir)
     files = sorted(basedir.glob(INDICES_FILE_PATTERN))
 
     if not files:
