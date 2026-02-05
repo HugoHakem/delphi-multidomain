@@ -132,8 +132,6 @@ if __name__ == "__main__":
 
     for bi, batch in tqdm(enumerate(dataloader)):
     
-        # model.set_block_size(BLOCK_SIZE)
-    
         x, ages, subject_ids = model.prepare_input(batch)    
     
         with torch.no_grad():
@@ -159,7 +157,7 @@ if __name__ == "__main__":
     
     all_tokens_df = pd.concat(all_tokens_df, ignore_index=True)
     all_tokens_df = all_tokens_df.reset_index().rename(columns={"index": "global_idx"})
-    all_tokens_df['subject_idx'] = all_tokens_df.global_idx // BLOCK_SIZE
+    all_tokens_df['subject_idx'] = all_tokens_df.global_idx // model.block_size
     
     # ——————————————————————————————————————————————————————————————————————————————————————————
 
