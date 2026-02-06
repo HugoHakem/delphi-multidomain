@@ -15,22 +15,20 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
+if ( DELPHI_DIR := Path(__file__).resolve().parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
-
-sys.path.insert(0, (Path(__file__).resolve().parent))
-
-# MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" )
 
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
+
 from utils.utils import load_embed_config
+
 from delphi.optim import OptimConfig, configure_optimizers
 from delphi.model.transformer import ( 
     Delphi,
     DelphiConfig,
 )
-from trainer import (    
+from utils.trainer import (    
     MLFlowLogger,
     Trainer,
     clone_run_to_new_experiment,
@@ -43,78 +41,6 @@ torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
 
 USE_TQDM = sys.stdout.isatty()
-
-
-@dataclass
-class ProcessedArgs:
-    domains: list[str]
-    domain_cfg: dict
-    attention_scheme: list[str]
-    train_ids: list[int]
-    val_ids: list[int]
-    test_ids: list[int]
-    dataset_config: dict
-    domain_config_yaml: Path
-
-
-# Still not in use
-def process_args(args, root_path) -> ProcessedArgs:
-
-    # ---- attention scheme ----
-    attention_scheme = parse_attention_scheme(args.attention_scheme)
-    assert len(attention_scheme) in {1, args.n_layer}, (
-        f"--attention_scheme must have length 1 or n_layer={args.n_layer}"
-    )
-
-    if len(attention_scheme) == 1:
-        attention_scheme = attention_scheme * args.n_layer
-
-    # ---- domains ----
-    domains = args.domains.split(",")
-
-    domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
-    default_cfg_per_domain = load_embed_config(
-        domain_config_yaml,
-        root_path / "tokens",
-    )
-
-    assert all(d in default_cfg_per_domain for d in domains), (
-        f"Some domains not found in {domain_config_yaml}"
-    )
-
-    domain_cfg = {d: default_cfg_per_domain[d] for d in domains}
-
-    # ---- subject splits ----
-    train_ids, val_ids, test_ids = get_data_partitions(
-        "../data/transforms/subject_lists",
-        fold=args.test_fold,
-    )
-
-    if args.subjects is not None:
-        subject_ids = set(pd.read_csv(args.subjects, header=None)[0])
-        train_ids = list(set(train_ids) & subject_ids)
-        val_ids   = list(set(val_ids)   & subject_ids)
-        test_ids  = list(set(test_ids)  & subject_ids)
-
-    # ---- dataset config ----
-    dataset_config = dict(
-        root=root_path,
-        domains=domain_cfg,
-        exclusions=[],
-        required_domains=["diseases"],
-    )
-
-    return ProcessedArgs(
-        domains=domains,
-        domain_cfg=domain_cfg,
-        attention_scheme=attention_scheme,
-        train_ids=train_ids,
-        val_ids=val_ids,
-        test_ids=test_ids,
-        dataset_config=dataset_config,
-        domain_config_yaml=domain_config_yaml,
-    )
-
 
 def parse_attention_scheme(attention_scheme, as_list=True):
     
@@ -139,7 +65,7 @@ def get_cli_args():
     parser.add_argument("--n_layer",            default=12,   type=int)
     parser.add_argument("--n_head",             default=10,   type=int)
     parser.add_argument("--n_embd",             default=120,  type=int)
-    parser.add_argument("--block_size",         default=96,   type=int)
+    parser.add_argument("--block_size",         default=96   type=int)
     parser.add_argument("--domain_config_yaml", default="config/domain_config_default.yaml")
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
     parser.add_argument("--batch_size",         default=32, type=int)
@@ -185,7 +111,8 @@ if __name__ == "__main__":
             attention_scheme = args.attention_scheme
         
         # —————————————————————————————————————————————————————————————————————————————————————————————————————————
-        train_ids, val_ids, test_ids = get_data_partitions("../data/transforms/subject_lists", fold=args.test_fold)
+        train_ids, val_ids, test_ids = get_data_partitions("./data/transforms/subject_lists", fold=args.test_fold)
+
         
         if args.subjects is not None:
             subject_ids = pd.read_csv(args.subjects, header=None)[0].tolist()
@@ -212,7 +139,9 @@ if __name__ == "__main__":
             n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head,
             domains=domain_cfg, attention_scheme=attention_scheme,
             token_dropout=0.1,
-            block_size=args.block_size, no_event_token_rate=args.no_event_token_rate, no_event_token_insertion_mode=args.no_event_token_insertion_mode
+            block_size=args.block_size, 
+            no_event_token_rate=args.no_event_token_rate, 
+            no_event_token_insertion_mode=args.no_event_token_insertion_mode
         )
     
         logging.info("Config:\n%s", pformat(asdict(delphi_config), sort_dicts=False))
