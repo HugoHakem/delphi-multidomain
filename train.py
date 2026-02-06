@@ -65,7 +65,7 @@ def get_cli_args():
     parser.add_argument("--n_layer",            default=12,   type=int)
     parser.add_argument("--n_head",             default=10,   type=int)
     parser.add_argument("--n_embd",             default=120,  type=int)
-    parser.add_argument("--block_size",         default=96   type=int)
+    parser.add_argument("--block_size",         default=96,   type=int)
     parser.add_argument("--domain_config_yaml", default="config/domain_config_default.yaml")
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
     parser.add_argument("--batch_size",         default=32, type=int)
