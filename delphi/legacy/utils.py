@@ -39,7 +39,7 @@ def get_batch(ix, data, p2i, select='left', index='patient', padding='regular',
     """
 
     MASKING_TOKEN, MASKING_AGE = -1, -10000
-    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
+    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3, 11
 
     # Define the columns of the data array    
     SUBJECT_ID_COLUMN = 0
@@ -121,24 +121,6 @@ def get_batch(ix, data, p2i, select='left', index='patient', padding='regular',
     s = torch.argsort(ages, 1)
     tokens = torch.gather(tokens, 1, s)
     ages = torch.gather(ages, 1, s)
-
-    # invalid_high = (tokens >= vocab_size)
-    # invalid_low = (tokens < 0)
-    # 
-    # if invalid_high.any():
-    #     idx = torch.nonzero(invalid_high)
-    #     print(f"🛑 Token(s) con índice demasiado alto detectados:")
-    #     for i in idx:
-    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}, vocab_size: {vocab_size}")
-    #     raise ValueError("Se encontraron índices fuera del rango superior del vocabulario.")
-    # 
-    # if invalid_low.any():
-    #     idx = torch.nonzero(invalid_low)
-    #     print(f"🛑 Token(s) con índice negativo detectados:")
-    #     for i in idx:
-    #         print(f" - Posición {tuple(i.tolist())}, valor: {tokens[tuple(i.tolist())].item()}")
-    #     raise ValueError("Se encontraron índices negativos en los tokens.")
-
 
     # a technical detail: the token 0 is reserved for padding, so we shift all tokens by one
     tokens = tokens + 1
