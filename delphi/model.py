@@ -940,7 +940,6 @@ class Delphi(torch.nn.Module):
     
         # sort once by (subject, age)
         order = torch.argsort(ages_flat, stable=True)
-        # 2) primaria: subject (estable, preserva el orden por age dentro de cada subject)
         order = order[torch.argsort(subjects_flat[order], stable=True)]
     
         tokens_flat     = tokens_flat[order]
@@ -973,80 +972,6 @@ class Delphi(torch.nn.Module):
             unique_subjects,
             batch_domains,
         )
-
-
-    # Old and extremely slow on GPU, just kept temporarily for comparison purposes
-    def _to_tensor_deprecated(self, x, ages, embeddings, subject_ids):
-
-        '''
-            input values:
-              - x:          dict[domain, Tensor] where the tensor has data for batch_size subjects
-              - ages:       dict[domain, Tensor]
-              - subject_ids:   dict[domain, Tensor]
-              - embeddings: dict[domain, Tensor]
-
-            return values: batches of 
-              - tokens
-              - ages
-              - embeddings
-              - unique_subjects
-              - domains
-        '''
-
-        all_tokens, all_embeddings, all_ages, all_domains, all_subjects = [], [], [], [], []
-        
-        for domain_idx, dname in enumerate(x.keys()):
-            
-            e = embeddings[dname]
-            t = x[dname]
-            a = ages[dname]
-            s = subject_ids[dname]
-    
-            n = t.shape[0]
-            
-            # domain ids (move it from dict keys to a separate tensor)
-            d = torch.full((n,), domain_idx, dtype=torch.long, device=t.device)
-    
-            all_tokens.append(t)
-            all_ages.append(a)
-            all_embeddings.append(e)
-            all_domains.append(d)
-            all_subjects.append(s)
-        
-        tokens_flat     = torch.cat(all_tokens)
-        ages_flat       = torch.cat(all_ages)
-        embeddings_flat = torch.cat(all_embeddings)
-        domains_flat    = torch.cat(all_domains)
-        subjects_flat   = torch.cat(all_subjects)
-    
-        unique_subjects = subjects_flat.unique(sorted=True)
-        batch_tokens, batch_embeddings, batch_ages, batch_domains = [], [], [], []
-        
-        # 2) Process subject by subject        
-        for subj in unique_subjects:
-            mask = subjects_flat == subj
-            a_subj = ages_flat[mask]
-            a_subj = a_subj[ order:=torch.argsort(a_subj) ]
-            t_subj = tokens_flat[mask][order]
-            e_subj = embeddings_flat[mask][order]
-            d_subj = domains_flat[mask][order]
-            
-            batch_tokens.append(t_subj.unsqueeze(0))
-            batch_ages.append(a_subj.unsqueeze(0))
-            batch_embeddings.append(e_subj.unsqueeze(0))
-            batch_domains.append(d_subj.unsqueeze(0))
-    
-        batch_tokens = torch.stack(batch_tokens)
-        batch_embeddings = torch.stack(batch_embeddings)
-        batch_ages   = torch.stack(batch_ages)
-        batch_domains = torch.stack(batch_domains)
-    
-        return \
-            batch_tokens.int().squeeze(1),\
-            batch_ages.squeeze(1),\
-            batch_embeddings.squeeze(1),\
-            unique_subjects,\
-            batch_domains.squeeze(1)
 
     
     def _build_trace(self, x, ages, emb, subject_ids, domains):
@@ -1096,8 +1021,9 @@ class Delphi(torch.nn.Module):
         
         logits = self.embedding_to_logits(h)
         
-        return logits,\
-                (attention_matrices := torch.stack(att) if return_attention else None)
+        return \
+            logits,\
+            (attention_matrices := torch.stack(att) if return_attention else None)
 
     # —————————— END FORWARD ————————————————————————————————————————————————————————————————————————————————
 
@@ -1274,8 +1200,7 @@ class Delphi(torch.nn.Module):
         if return_token_df:
             raise NotImplementedError
         
-        from data.dataset import DelphiDataset, DelphiDataloader
-        from data.event_set import EventSet
+        from data.dataset import DelphiDataloader
 
         dataloader = DelphiDataloader(dataset, batch_size=batch_size, shuffle=False)
         

@@ -272,10 +272,13 @@ def config_from_runid(runid):
     if "scheduler_state" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state"])
 
-    train_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['train_ids']).to("cuda")
-    valid_dataset = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['valid_ids']).to("cuda")
-    test_dataset  = DelphiDataset(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['test_ids']).to("cuda")
-    
+    DDS = DelphiDataset
+    datasets = [
+        train_dataset := DDS(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['train_ids']).to("cuda"),
+        valid_dataset := DDS(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['valid_ids']).to("cuda"),
+        test_dataset  := DDS(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['test_ids']).to("cuda")
+    ]
+
     dataloaders = [
         train_loader := DelphiDataloader(train_dataset, batch_size=batch_size),
         valid_loader := DelphiDataloader(valid_dataset, batch_size=VAL_BATCH_SIZE), 
