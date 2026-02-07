@@ -19,12 +19,10 @@ from auc_utils import compute_all_stats
 # This has to match the pattern from auc-calculation.nf
 def load_logits(runid, logits_root, LOGITS_FILE_PATTERN):
     """
-    Carga logits por chunk_index → {chunk_idx: tensor[T, D]}
+    Loads logits for chunk_index → {chunk_idx: tensor[T, D]}
     """
     basedir = Path(logits_root)
     out = {}
-    print("LOGITS")
-    print(basedir)
     files = sorted(basedir.glob(LOGITS_FILE_PATTERN))
     print(f"[INFO] Logits found: {len(files)} files")
 
@@ -37,7 +35,7 @@ def load_logits(runid, logits_root, LOGITS_FILE_PATTERN):
 
 def load_indices(runid, indices_root, INDICES_FILE_PATTERN):
     """
-    Concatena TODOS los parquets de índices del run.
+    Concatenates all parquet files with indices for the run.
     """
 
     basedir = Path(indices_root)
@@ -66,9 +64,9 @@ def get_global_token_id(model, domain, token_id, offset_per_domain):
 def collect_logits_merged(runid, indices_root, logits_root, indices_file_pattern, logits_file_pattern):
     
     """
-    Junta logits por (disease, sex, age_start, age_end).
-    Cada key acumula datos de múltiples chunks.
-    Devuelve un dict con vectores concatenados.
+    Collects logits for [disease, sex, age_start, age_end]
+    Each key gathers data for multiple chunks.
+    Return a dict with the concatenated vectors
     """
 
     indices_root = Path(indices_root)
@@ -105,17 +103,17 @@ def collect_logits_merged(runid, indices_root, logits_root, indices_file_pattern
             case_idx = np.array(row["case_indices"], dtype=int)
             ctrl_idx = np.array(row["ctrl_indices"], dtype=int)
     
-            # Chequear que el token_id entra en rango
+            # Check that token_id is within the desired
             if token_id >= logits.shape[1]:
                 raise ValueError(
                     f"token_id={token_id} fuera de rango en logits (shape={logits.shape})"
                 )
     
-            # Extraer logits
+            # Extract logits
             case_vals = logits[case_idx, token_id].tolist() if len(case_idx) else []
             ctrl_vals = logits[ctrl_idx, token_id].tolist() if len(ctrl_idx) else []
     
-            # Inicializar el entry si no existe
+            # Initialize entry if it doesn't exist yet
             if key not in merged:
                 merged[key] = { "case": [], "ctrl": [] }
     
