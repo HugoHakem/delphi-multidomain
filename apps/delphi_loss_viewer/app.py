@@ -6,8 +6,13 @@ import ast
 from pathlib import Path
 import seaborn as sns
 import plotly.graph_objs as go
-
+import sys
 import mlflow
+
+DELPHI_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(DELPHI_DIR))
+
+from utils.utils import setup_mlflow
 
 # local modules
 from helpers import load_labels, exponential_moving_average
@@ -15,13 +20,14 @@ from styling import build_map, _normalize_value
 from mlflow_loader import load_runs, filter_runs_with_loss_files, validate_loss_files
 from plot_loss import load_token_loss_for_run, add_run_trace_plotly, add_plotly_legend
 
+setup_mlflow()
+
+print(mlflow.get_tracking_uri())
 # ---------------------------------------------------------
 # STREAMLIT LAYOUT
 # ---------------------------------------------------------
 st.set_page_config(page_title="Delphi Loss Evolution Viewer", layout="wide")
 st.title("Delphi Loss Evolution Viewer")
-
-mlflow.set_tracking_uri("../mlruns")
 
 # ---------------------------------------------------------
 # SIDEBAR — EXPERIMENTS
@@ -98,7 +104,7 @@ labels = load_labels(labels_path)
 labels = labels + ["Death"]
 
 token_display = [
-    f"{i}: {labels[(i+1)%1256]}" if i < len(labels) else str(i)
+    f"{i}: {labels[i]}" if i < len(labels) else str(i)
     for i in range(1257)
 ]
 
