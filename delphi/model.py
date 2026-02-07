@@ -507,9 +507,6 @@ class MultiDomainEmbedding(nn.Module):
         for domain_name, domain_cfg in config.domains.items():
             self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, domain_name=domain_name, n_embed=config.n_embd)
 
-        # else:
-            # self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=0)
-        
 
     def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         
@@ -1084,7 +1081,7 @@ class Delphi(torch.nn.Module):
         # transform this into
         # attn_mask = self.build_mask(ages, domains) # [B, n_layer, n_head, L, L] <- revise these dimensions.
 
-        single_mask = self.transformer.attn_mask_builder[0][0].build(x, ages, domains)
+        single_mask = self.transformer.attn_mask_builder[0][0].build(domains, x, ages)
         
         attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
                 expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
