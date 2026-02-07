@@ -16,7 +16,7 @@ MLFLOW_TRACKING_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlrun
 
 from delphi.model import (
     Delphi,
-    EmbedConfig,
+    DomainConfig,
     DelphiConfig
 )
 
@@ -30,7 +30,7 @@ def load_embed_config(cfg_path, tokens_path):
         p = dict(params)
         if "path" in p:
             p["path"] = tokens_path / p["path"]
-        cfg[domain] = EmbedConfig(**p)
+        cfg[domain] = DomainConfig(**p)
 
     return cfg
 
@@ -238,7 +238,7 @@ def config_from_runid(runid):
     s_clean = re.sub(r"PosixPath\(([^)]+)\)", r"\1", s)
     runinfo.data.params['domains'] = s_clean
     runinfo.data.params['domains'] = ast.literal_eval(runinfo.data.params['domains'])
-    runinfo.data.params['domains'] = { k: EmbedConfig(**v) for k, v in runinfo.data.params['domains'].items() }
+    runinfo.data.params['domains'] = { k: DomainConfig(**v) for k, v in runinfo.data.params['domains'].items() }
     for param, value in runinfo.data.params.items():
         if "drop"in param:
             runinfo.data.params[param] = float(value)

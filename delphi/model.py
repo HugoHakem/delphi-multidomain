@@ -296,7 +296,7 @@ class AgeEncoding(nn.Module):
 # ———————————————————— CONFIG ————————————————————————————————————————————————————————————————
 
 @dataclass
-class EmbedConfig:
+class DomainConfig:
     projector:  str           = "embed" # "linear", "mlp", or "embed"
     n_layers:   Optional[int] = None
     n_hidden:   Optional[int] = None
@@ -329,7 +329,7 @@ class DelphiConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 120
-    domains: dict[str, EmbedConfig] = field(default_factory=dict)
+    domains: dict[str, DomainConfig] = field(default_factory=dict)
     attention_scheme: Union[str, List] = field(
         default_factory=lambda: "[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death]:causal(mask_ties=True)"
     )
@@ -372,7 +372,7 @@ class DelphiConfig:
         self.attention_scheme = attention_scheme
         return self    
     
-    def add_domain(self, domain_name: str, embed_config: EmbedConfig):
+    def add_domain(self, domain_name: str, embed_config: DomainConfig):
         """Add or update a domain configuration."""
         self.domains[domain_name] = embed_config
         return self
@@ -388,7 +388,7 @@ class DelphiConfig:
 
 class DomainEmbedding(nn.Module):
 
-    def __init__(self, config: EmbedConfig, domain_name, n_embed: int) -> None:
+    def __init__(self, config: DomainConfig, domain_name, n_embed: int) -> None:
 
         super().__init__()
         self.config = config

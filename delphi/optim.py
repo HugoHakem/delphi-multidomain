@@ -5,7 +5,7 @@ from functools import partial
 
 import torch
 
-from delphi.model.transformer import LayerNorm
+from delphi.model import LayerNorm
 
 
 @dataclass

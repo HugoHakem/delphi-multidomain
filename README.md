@@ -38,14 +38,14 @@ _To be completed_
 from pathlib import Path
 tokens_path = Path("./data/tokens")
 domain_config = {
-   'diseases':      EmbedConfig(projector="embed", path=tokens_path / 'diseases',       predict=True), # default is predict=False 
-   'death':         EmbedConfig(projector="embed", path=tokens_path / 'death',          predict=True),
-   'drugs':         EmbedConfig(projector="embed", path=tokens_path / 'drugs',          predict=True),
-   'lifestyle':     EmbedConfig(projector="embed", path=tokens_path / 'lifestyle',      age_jitter=True),  
-   "hla_alleles":   EmbedConfig(projector="embed", path=tokens_path / 'hla_alleles',    at_birth=True),
-   "sex":           EmbedConfig(projector="embed", path=tokens_path / 'sex',            at_birth=True),
-   "padding":       EmbedConfig(projector="embed")
-   "rare_variants": EmbedConfig(projector="embed", path=tokens_path / 'rare_variants',  at_birth=True),
+   'diseases':      DomainConfig(projector="embed", path=tokens_path / 'diseases',       predict=True), # default is predict=False 
+   'death':         DomainConfig(projector="embed", path=tokens_path / 'death',          predict=True),
+   'drugs':         DomainConfig(projector="embed", path=tokens_path / 'drugs',          predict=True),
+   'lifestyle':     DomainConfig(projector="embed", path=tokens_path / 'lifestyle',      age_jitter=True),  
+   "hla_alleles":   DomainConfig(projector="embed", path=tokens_path / 'hla_alleles',    at_birth=True),
+   "sex":           DomainConfig(projector="embed", path=tokens_path / 'sex',            at_birth=True),
+   "padding":       DomainConfig(projector="embed")
+   "rare_variants": DomainConfig(projector="embed", path=tokens_path / 'rare_variants',  at_birth=True),
 }
 ```
 Then you need to create a folder for the domain, e.g. `./data/tokens/rare_variants` with two files, named `tokens.csv` and `tokenizer.yaml`.
@@ -102,7 +102,7 @@ python train.py \
 ```
 
 ### Model tracking with MLflow
-You can specify a custom MLflow location by setting the MLFLOW_URI environment variable, otherwise it's the `mlruns` folder within this repo's root directory.
+You can specify a custom MLflow location by setting the `MLFLOW_TRACKING_URI` environment variable, otherwise it's the `mlruns` folder within this repo's root directory.
 The previous command will create an MLflow experiment called `rare_variants`. 
 Instructions are provided later on how to query the information logged by MLflow.
 

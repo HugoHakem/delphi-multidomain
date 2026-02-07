@@ -24,7 +24,7 @@ from utils.cv_utils import get_data_partitions
 from utils.utils import load_embed_config
 
 from delphi.optim import OptimConfig, configure_optimizers
-from delphi.model.transformer import ( 
+from delphi.model import ( 
     Delphi,
     DelphiConfig,
 )
@@ -177,5 +177,10 @@ if __name__ == "__main__":
     if args.no_warnings:
         warnings.filterwarnings("ignore")
   
-    trainer = Trainer( model, dataloaders, optimizer, scheduler, logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM ) 
+    trainer = Trainer( 
+        model, dataloaders, 
+        optimizer, scheduler, 
+        logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM 
+    ) 
+
     trainer.train(max_epochs=1000, patience=3)

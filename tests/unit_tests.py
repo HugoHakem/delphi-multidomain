@@ -16,7 +16,7 @@ import logging
 logging.basicConfig(level=logging.DEBUG, format="%(levelname)s:%(name)s:%(message)s")
 
 from delphi.model.components import (
-    EmbedConfig,
+    DomainConfig,
     DelphiConfig,
     DomainEmbedding,
     DelphiEmbedding,
@@ -29,7 +29,7 @@ from delphi.model.components import (
 
 
 def test_domain_embedding_linear():
-    cfg = EmbedConfig(projector="linear", input_size=10)
+    cfg = DomainConfig(projector="linear", input_size=10)
     emb = DomainEmbedding(cfg, n_embed=16)
     x = torch.randn(2, 5, 10)              # (B, T, input_size)
     y = emb(x)
@@ -37,7 +37,7 @@ def test_domain_embedding_linear():
 
 
 def test_domain_embedding_mlp():
-    cfg = EmbedConfig(projector="mlp", input_size=8, n_layers=2, n_hidden=12)
+    cfg = DomainConfig(projector="mlp", input_size=8, n_layers=2, n_hidden=12)
     emb = DomainEmbedding(cfg, n_embed=20)
     x = torch.randn(4, 3, 8)
     y = emb(x)
@@ -45,7 +45,7 @@ def test_domain_embedding_mlp():
 
 
 def test_domain_embedding_embed():
-    cfg = EmbedConfig(projector="embed", input_size=50)
+    cfg = DomainConfig(projector="embed", input_size=50)
     emb = DomainEmbedding(cfg, n_embed=32)
     x = torch.randint(0, 50, (2, 7))       # (B, T)
     y = emb(x)
@@ -58,7 +58,7 @@ def test_domain_embedding_pretrained(tmp_path):
     path = tmp_path / "weights.pt"
     torch.save(weights, path)
 
-    cfg = EmbedConfig(projector="pretrained", input_size=100, pretrained_path=str(path), freeze=True)
+    cfg = DomainConfig(projector="pretrained", input_size=100, pretrained_path=str(path), freeze=True)
     emb = DomainEmbedding(cfg, n_embed=32)
     x = torch.randint(0, 100, (3, 4))
     y = emb(x)
