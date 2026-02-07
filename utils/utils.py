@@ -12,9 +12,9 @@ import yaml
 DELPHI_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, DELPHI_DIR)
 
-MLFLOW_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" ) )
+MLFLOW_TRACKING_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" ) )
 
-from delphi.model.transformer import (
+from delphi.model import (
     Delphi,
     EmbedConfig,
     DelphiConfig
@@ -22,8 +22,6 @@ from delphi.model.transformer import (
 
 
 def load_embed_config(cfg_path, tokens_path):
-
-    from delphi.model.transformer import EmbedConfig
 
     raw = yaml.safe_load(Path(cfg_path).read_text())
 
@@ -146,10 +144,10 @@ def infer_delphi_config_from_state_dict(sd):
 
 def setup_mlflow():
     
-    global MLFLOW_URI
+    global MLFLOW_TRACKING_URI
     
-    mlflow.set_tracking_uri(MLFLOW_URI)
-    return MLFLOW_URI
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    return MLFLOW_TRACKING_URI
 
 
 def load_run_params(run_id):
