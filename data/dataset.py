@@ -93,9 +93,9 @@ class TokenDomain:
         "tokenizer": "tokenizer.yaml",
     }
 
-    BASE_COLUMNS = {"subject_id"}
-    CATEGORICAL_COLUMNS = {"token_id"}
-    CONTINUOUS_COLUMNS = {"values"}
+    BASE_COLUMNS = ["subject_id"]
+    CATEGORICAL_COLUMNS = ["token_id"]
+    CONTINUOUS_COLUMNS = ["value"]
     AGE_COLUMN = "age"
 
     def __init__(self,
@@ -113,17 +113,20 @@ class TokenDomain:
         Load a single domain: tokenizer.yaml + tokens.csv
         """
 
+        self.name = name
         self.path = path
         self.predict = predict
         self.age_jitter = age_jitter        
         self.at_birth = at_birth
-        self.type = type
-        self.name = name
+        self.type = type        
 
         assert type in ["categorical", "continuous"], f"Domain type must be either 'categorical' or 'continuous', got {type}"
        
         self.tokens    = self._load_tokens(os.path.join(path, "tokens.csv"), subjects=subjects)
+        
+        # an int -> token name dict
         self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))        
+        
         self.aggregation_strategy = aggregation_strategy
 
         if aggregation_strategy is not None:
@@ -138,6 +141,12 @@ class TokenDomain:
         return self.path / self.REQUIRED_FILES["tokenizer"]
 
     @property
+    def vocab_len(self) -> int:
+        if not hasattr(self, "_vocab_len"):
+            self._vocab_len = len(self.tokenizer)
+        return self._vocab_len
+
+    @property
     def subject_ids(self):
         return self.tokens[:, 0].cpu().numpy()
 
@@ -150,7 +159,7 @@ class TokenDomain:
 
         if missing:
             raise FileNotFoundError(
-                f"Missing required files in domain '{self.path}': {missing}"
+                f"Missing required files in domain '{self.name}': {missing}"
             )
 
 
@@ -188,9 +197,9 @@ class TokenDomain:
         if not os.path.exists(path):
             assert False, f"Tokens file {path} does not exist"
             if self.type == "categorical":
-                return pd.DataFrame(columns=["subject_id", "token_id", "age"])
+                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [CATEGORICAL_COLUMNS])
             elif self.type == "continuous":
-                return pd.DataFrame(columns=["subject_id", "values", "age"])
+                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [CONTINUOUS_COLUMNS])
         
         df = pd.read_csv(path)
 
@@ -198,23 +207,22 @@ class TokenDomain:
         if "subject_id" not in df.columns:
             raise ValueError(f"Invalid tokens file {path}, must contain subject_id")
         if self.type == "categorical" and "token_id" not in df.columns:
-            raise ValueError(f"Invalid tokens file {path}, must contain token_id since type==categorical")
-            
+            raise ValueError(f"Invalid tokens file {path}, must contain \"token_id\" since type==categorical")
+        if self.type == "continuous" and "value" not in df.columns:
+            raise ValueError(f"Invalid tokens file {path}, must contain \"value\" since type==continuous")
 
         df = df.sort_values("subject_id")
         
         if self.at_birth:
-            if "age" in df.columns:
-                if (df["age"] != 0).any():
-                    warnings.warn(
-                        "at_birth=True but non-zero ages found in dataframe. "
-                        "All ages will be overwritten to 0.",
-                        UserWarning
-                    )                    
-                    df["age"] = 0
+            if "age" in df.columns and (df["age"] != 0).any():
+                warnings.warn(
+                    "at_birth=True but non-zero ages found in dataframe. "
+                    "All ages will be overwritten to 0.",
+                    UserWarning
+                )                    
+            df["age"] = 0
 
-        if subjects is not None:
-            df = df.query("subject_id in @subjects")
+        df = df.query("subject_id in @subjects") if subjects is not None else df
 
         self._as_dataframe = df
 
@@ -274,7 +282,7 @@ class DelphiDataset:
 
     def __init__(self, 
         root: str, 
-        domains: dict, 
+        domains_cfg: dict, 
         subjects: Union[str, List[str]] = None, 
         exclusions: List[str] = [], 
         n_samples=None, 
@@ -285,16 +293,16 @@ class DelphiDataset:
         Args:
             root: base data directory
             domains: list of domain names (e.g. ["diagnosis", "lifestyle", "sex", "death"])
-            fold: if specified, restrict subjects to that fold
             exclusions: list of exclusion filenames under exclusion_lists/
         """
 
         self.root = Path(root)
         self._device = device
+        self.domain_configs = domains_cfg
 
         # Load the data        
         self.domains = EasyDict()
-        for dname, dinfo in domains.items():
+        for dname, dinfo in domains_cfg.items():
             
             if dname == "padding":
                 continue
@@ -312,7 +320,7 @@ class DelphiDataset:
         logger.info(
             "Initializing DelphiDataset | root=%s | domains=%s | required_domains=%s",
             str(self.root),
-            list(domains.keys()),
+            list(domains_cfg.keys()),
             required_domains
         )
 
@@ -442,30 +450,9 @@ and
         return self.excluded_subjects
  
 
-    def get_subject_events(self, subject_id: str) -> Dict[str, pd.DataFrame]:
-        
-        """
-        Return all events for a subject, per domain.
-        """        
-        subject_events = {}
-        for dname, domain in self.domains.items():            
-            try:
-                start, count = self._subject_indices[dname][subject_id]
-                tokens_subj  = domain.tokens[start:(start+count)]
-            except KeyError as e:
-                tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
-            subject_events[dname] = tokens_subj         
-
-        return subject_events
-
-
     @staticmethod
     def is_ukb_id(index):
-        return index > 1000000
-
-
-    def __len__(self):
-        return len(self.subjects)        
+        return index > 1000000         
 
 
     def to(self, device):
@@ -498,11 +485,37 @@ and
         self._subject_indices = subject_indices
         return self._subject_indices
 
+    
+    def __len__(self):
+        return len(self.subjects)  
+
+
+    def get_subject_events(self, subject_id: str) -> Dict[str, pd.DataFrame]:
+        
+        """
+        Return all events for a subject, per domain.
+        """        
+        subject_events = {}
+        for dname, domain in self.domains.items():
+            try:
+                start, count = self._subject_indices[dname][subject_id]
+                tokens_subj  = domain.tokens[start:(start+count)]
+                
+                # if self.domain_configs[dname].type == "continuous":
+                    # tokens_subj = tokens_subj[:,2].reshape(1, -1)                
+
+            except KeyError as e:
+                tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
+            subject_events[dname] = tokens_subj         
+        
+        return subject_events
+
 
     def __getitem__(self, index):
 
         if not self.is_ukb_id(index) and isinstance(index, int):
             index = self.subjects[index]
+
         out = self.get_subject_events(index)
         return out    
 
@@ -551,6 +564,5 @@ class DelphiDataloader(FlexibleDataLoader):
 
         self.device = dataset.device if device is None else device
         collate_fn = collate_fn_domains
-        # collate_fn = lambda b: collate_fn(b, block_size=block_size, device=self.device)
         super().__init__(dataset, collate_fn=collate_fn, **kwargs)
         

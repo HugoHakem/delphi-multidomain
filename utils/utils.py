@@ -21,7 +21,7 @@ from delphi.model import (
 )
 
 
-def load_embed_config(cfg_path, tokens_path):
+def load_domain_config(cfg_path, tokens_path):
 
     raw = yaml.safe_load(Path(cfg_path).read_text())
 

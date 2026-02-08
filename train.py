@@ -11,7 +11,6 @@ from easydict import EasyDict
 import mlflow
 
 import logging
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -20,10 +19,13 @@ if ( DELPHI_DIR := Path(__file__).resolve().parent ) not in sys.path:
 
 from data.dataset import DelphiDataset, DelphiDataloader
 from utils.cv_utils import get_data_partitions
+from utils.utils import load_domain_config
 
-from utils.utils import load_embed_config
+from delphi.optim import (
+    OptimConfig, 
+    configure_optimizers
+)
 
-from delphi.optim import OptimConfig, configure_optimizers
 from delphi.model import ( 
     Delphi,
     DelphiConfig,
@@ -99,7 +101,7 @@ if __name__ == "__main__":
         args.attention_scheme = parse_attention_scheme(args.attention_scheme)
         domains = args.domains.split(",")
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
-        default_cfg_per_domain = load_embed_config(domain_config_yaml, root_path / 'tokens')
+        default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / 'tokens')
         domain_cfg = { k: v for k, v in default_cfg_per_domain.items() if k in domains }
         
         assert all([k in default_cfg_per_domain for k in domains])
@@ -120,7 +122,7 @@ if __name__ == "__main__":
             val_ids     = list( set(val_ids)   & set(subject_ids) )
             test_ids    = list( set(test_ids)  & set(subject_ids) )
     
-        dataset_config = dict(root=root_path, domains=domain_cfg, exclusions=[], required_domains=["diseases"])
+        dataset_config = dict(root=root_path, domains_cfg=domain_cfg, exclusions=[], required_domains=["diseases"])
         
         datasets = [
             train_dataset := DelphiDataset(subjects=train_ids,   **dataset_config).to(DEVICE),

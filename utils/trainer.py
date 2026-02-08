@@ -259,8 +259,7 @@ class MLFlowLogger:
 
         import torch        
     
-        if metadata is None:
-            metadata = {}
+        metadata = {} if metadata is None else metadata
     
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = filename or f"best_model_{timestamp}.pt"
@@ -282,7 +281,17 @@ class MLFlowLogger:
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
-class Trainer():
+# Just a base class that shows the expected interface for child classes
+class BaseTrainer():
+
+    def train(self):           pass
+    def shared_step(self):     pass
+    def val_epoch(self):       pass
+    def train_epoch(self):     pass
+    def valid_epoch_end(self): pass
+
+
+class Trainer(BaseTrainer):
 
     LOSSES_PER_EPOCH_FILEPATTERN = "losses_epoch{current_epoch}_{val_step}.csv"
 
@@ -294,7 +303,7 @@ class Trainer():
         ):
 
         '''
-        Trainer class, mimicking PytorchLightning trainer
+        Trainer class, mimicking Pytorch Lightning trainer
         '''
 
         self.model           = model        

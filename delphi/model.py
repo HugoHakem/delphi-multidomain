@@ -384,7 +384,7 @@ class DelphiConfig:
         return self
         
 
-# ———————————————————— Embedding layer for a single domain —————————————————————————————————————————————
+# ———————————————————— Embedding layer for a single domain ———————————————————————————————————
 
 class DomainEmbedding(nn.Module):
 
@@ -414,7 +414,7 @@ class DomainEmbedding(nn.Module):
         # ————————————————————————————————————————————————————————————————————————————————————
 
         if config.projector.lower() == "embed":
-            # logging.info(f"DomainEmbedding for '{domain_name}': Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
+            logging.debug(f"DomainEmbedding for '{domain_name}': Using nn.Embedding with input_size={config.input_size}, n_embed={n_embed}")
             self.projector = nn.Embedding(config.input_size, n_embed)
 
         elif config.projector.lower() == "linear":
@@ -432,8 +432,16 @@ class DomainEmbedding(nn.Module):
         else:
             raise ValueError(f"unknown projector type: {config.projector}")
         
-        # ————————————————————————————————————————————————————————————————————————————————————
+    # ————————————————————————————————————————————————————————————————————————————————————
     
+    @property
+    def weight(self):
+        return self.projector.weight
+
+    @property
+    def vocab_len(self):
+        return self.projector.weight.shape[0]
+
     def get_from_pretrained(self, path, n_embed, freeze):
 
         weights = torch.load(path)
@@ -450,14 +458,6 @@ class DomainEmbedding(nn.Module):
             projector,
             nn.Linear(d_ext, n_embed, bias=False)
         )
-
-    @property
-    def weight(self):
-        return self.projector.weight
-
-    @property
-    def vocab_len(self):
-        return self.projector.weight.shape[0]
 
     def build_mlp_projector(self, config):
 
@@ -505,7 +505,11 @@ class MultiDomainEmbedding(nn.Module):
         self.domain_embed = nn.ModuleDict()
         
         for domain_name, domain_cfg in config.domains.items():
-            self.domain_embed[domain_name] = DomainEmbedding(config=domain_cfg, domain_name=domain_name, n_embed=config.n_embd)
+            self.domain_embed[domain_name] = DomainEmbedding(
+                config=domain_cfg, 
+                domain_name=domain_name, 
+                n_embed=config.n_embd
+            )
 
 
     def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -920,7 +924,7 @@ class Delphi(torch.nn.Module):
         for domain_idx, dname in enumerate(x.keys()):
             t = x[dname]
             a = ages[dname]
-            e = embeddings[dname]
+            e = embeddings[dname ]
             s = subject_ids[dname]
     
             n = t.shape[0]
@@ -985,6 +989,17 @@ class Delphi(torch.nn.Module):
         )
 
 
+    def build_attn_mask(self, domains, x, ages):
+
+        single_mask = self.transformer.attn_mask_builder[0][0].build(domains, x, ages)
+        
+        attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
+                expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
+                    permute(1, 0, 2, 3, 4)  
+
+        return attn_mask
+
+
     # ————————— FORWARD ————————————————————————————————————————————————————————————————————————————————————
 
     def forward(self, 
@@ -992,11 +1007,14 @@ class Delphi(torch.nn.Module):
         return_attention: bool = False
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
         
-        x, \
-        ages, \
+        x, ages, \
         emb, \
         subject_ids, \
-        domains = self.to_tensor(x, ages, emb := self.transformer.embed(x), subject_ids)
+        domains = self.to_tensor(
+            x, ages, \
+            emb := self.transformer.embed(x), \
+            subject_ids
+        )
 
         self._trace = self._build_trace(x, ages, emb, subject_ids, domains)
                     
@@ -1006,11 +1024,7 @@ class Delphi(torch.nn.Module):
         # transform this into
         # attn_mask = self.build_mask(ages, domains) # [B, n_layer, n_head, L, L] <- revise these dimensions.
 
-        single_mask = self.transformer.attn_mask_builder[0][0].build(domains, x, ages)
-        
-        attn_mask = single_mask.unsqueeze(1).unsqueeze(1).\
-                expand(-1, self.config.n_layer, self.config.n_head, -1, -1).\
-                    permute(1, 0, 2, 3, 4)        
+        attn_mask = self.build_attn_mask(domains, x, ages)
         
         h, att = emb, []
         for i, transformer_block in enumerate(self.transformer.h):
@@ -1489,5 +1503,4 @@ class Delphi(torch.nn.Module):
             ages[pad_domain] = torch.cat([ages[pad_domain], torch.cat(pad_a)])
             subject_ids[pad_domain] = torch.cat([subject_ids[pad_domain], torch.cat(pad_sid)])
     
-        return x, ages, subject_ids
-    
+        return x, ages, subject_ids    
