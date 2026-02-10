@@ -2,21 +2,15 @@
 
 import argparse
 from pathlib import Path
-from tqdm import tqdm
-import re
-import ast
-from easydict import EasyDict
+from itertools import product
 import os, sys
 
 import numpy as np
 import pandas as pd
-import torch
-import mlflow
 
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent.parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
     
-from data.event_set import EventSet
 from utils.utils import reconstruct_model
 
 SEX_TOKENS = {"female": 0, "male": 1}
@@ -45,6 +39,7 @@ def get_case_ctrl_prevtoken_indices(df, disease_id, sex_token_id, age_min, age_m
 
     subj2sex = get_subject_sex(df, dom_sex)
     subj_sex_arr = np.array([subj2sex.get(s, -1) for s in subj_arr])
+
 
     # FIND CASE INDICES
     mask_sex = (subj_sex_arr == sex_token_id)
@@ -75,9 +70,21 @@ def get_case_ctrl_prevtoken_indices(df, disease_id, sex_token_id, age_min, age_m
     all_subjects = np.unique(subj_arr)
     subjects_without_dis = np.setdiff1d(all_subjects, subjects_with_dis)
     mask_never_had_disease = np.isin(subj_arr, subjects_without_dis)
-    # ctrl_mask = ( mask_sex & mask_age & mask_dom & mask_never_had_disease )
     ctrl_mask = ( mask_sex & mask_age & mask_never_had_disease )
-    ctrl_global_idx = global_arr[ctrl_mask]
+    
+    # choose only one control token per subject
+    rng = np.random.default_rng(seed=42)
+    ctrl_candidates = np.where(ctrl_mask)[0]
+    ctrl_subjects   = subj_arr[ctrl_candidates]
+    
+    ctrl_global_idx = []
+    
+    for s in np.unique(ctrl_subjects):
+        idx = ctrl_candidates[ctrl_subjects == s]
+        chosen = rng.choice(idx)
+        ctrl_global_idx.append(global_arr[chosen])
+    
+    ctrl_global_idx = np.array(ctrl_global_idx, dtype=int)
 
     return case_prev_global_idx, ctrl_global_idx
 
@@ -86,13 +93,10 @@ def get_predicted_domains(model):
     return [ dom for dom, cfg in model.config.domains.items() if getattr(cfg, "predict", True) ]
 
 
-def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
-
-    df = pd.read_parquet(tokens_file).assign(age=lambda df: df.age_days)
-
-    model, _, _, _ = reconstruct_model(runid)
-    domain_to_id = df[['domain_id', 'domain']].drop_duplicates().set_index("domain").domain_id.to_dict()   
-    print("[INFO] domain_to_id =", domain_to_id)
+def compute_indices(model, tokens_df, chunk_index, disease_chunk, n_disease_chunks):
+        
+    domain_to_id = tokens_df[['domain_id', 'domain']].drop_duplicates().set_index("domain").domain_id.to_dict()   
+    # print("[INFO] domain_to_id =", domain_to_id)
 
     assert "sex" in domain_to_id, "Model does not contain 'sex' domain."
     dom_sex = domain_to_id["sex"]
@@ -102,7 +106,7 @@ def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
     else:
         prediction_domains = args.prediction_domains
         print("[INFO] Using user-specified domains:", prediction_domains)
-
+    
     for d in prediction_domains:
         if d not in domain_to_id:
             raise RuntimeError(f"Domain '{d}' not present in model.")
@@ -111,47 +115,69 @@ def main(runid, ci, dchunk, n_dchunks, tokens_file, output_file):
     
     rows = []
 
-    for dom in prediction_domains:
-        domid = dom_targets[dom]
+    for dom in model.predicted_domains:
     
-        max_token = df.loc[df["domain_id"] == domid, "token_id"].max()
-        if pd.isna(max_token):
-            print(f"[WARN] Domain '{dom}' has no tokens in chunk → skipping")
-            continue
-    
+        # max_token = tokens_df.query("domain == @dom").token_id.max()        
+        max_token = model.vocab_lens[model.domain_to_int[dom]]
         all_tokens = np.arange(max_token + 1)
-        my_tokens = np.array_split(all_tokens, n_dchunks)[dchunk-1]
+        
+        my_tokens  = np.array_split(all_tokens, n_disease_chunks)[disease_chunk-1]
+        print(f"[DEBUG] Domain '{dom}': max_token={max_token}, total_tokens={len(all_tokens)}, assigned_tokens={len(my_tokens)}")
+        
+        # if pd.isna(max_token):
+            # print(f"[WARN] Domain '{dom}' has no tokens in chunk → skipping")
+            # continue
+            
+        print(f"[INFO] chunk={chunk_index}, disease_chunk={disease_chunk}, domain={dom}, tokens={len(my_tokens)}")            
+
+        brackets = product( my_tokens, SEX_TOKENS.items(), AGE_RANGES )     
+
+        for token_id, (sex, sex_token), (a0, a1) in brackets:
+        
+            ci_arr, co_arr = get_case_ctrl_prevtoken_indices(
+                tokens_df,
+                token_id,
+                sex_token,
+                a0,
+                a1,
+                (domid := dom_targets[dom]),
+                dom_sex,
+            )
+        
+            row = [ dom, token_id, sex, a0, a1, ci_arr, co_arr, chunk_index, disease_chunk ]           
+            rows.append(row)
     
-        print(f"[INFO] chunk={ci}, dchunk={dchunk}, domain={dom}, tokens={len(my_tokens)}")
-    
-        for tok in tqdm(my_tokens, desc=f"{dom}-dchunk-{dchunk}"):
-            for sex, sex_token in SEX_TOKENS.items():
-                for (a0, a1) in AGE_RANGES:
-                    ci_arr, co_arr = get_case_ctrl_prevtoken_indices(df, tok, sex_token, a0, a1, domid, dom_sex)    
-                    rows.append({ "domain": dom, "token_id": tok, "sex": sex, "age_start": a0, "age_end": a1, 
-                                 "case_indices": ci_arr, "ctrl_indices": co_arr })
-    
-    df_out = pd.DataFrame(rows)
-    df_out["chunk_index"] = ci
-    df_out["dchunk"] = dchunk
-    if output_file is not None:
-        Path(output_file).parent.mkdir(exist_ok=True, parents=True)
-        df_out.to_parquet(output_file)
-    
-    return df_out
+    columns = [ "domain","token_id","sex","age_start","age_end","case_indices","ctrl_indices","chunk_index","dchunk" ]
+    indices_df = pd.DataFrame(rows, columns=columns)    
+
+    return indices_df
         
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--runid", required=True)
     parser.add_argument("--tokens_file", type=str)
     parser.add_argument("--output_file", type=str)
     parser.add_argument("--chunk_index", type=int, required=True)     # DF/logits shard
     parser.add_argument("--dchunk",      type=int, required=True)     # domain token shard index
     parser.add_argument("--n_dchunks",   type=int, required=True)     # total domain shards
+    parser.add_argument("--subject_ids", type=str, required=False, default=None)    # subset of subjects to compute AUCs for 
     parser.add_argument("--prediction_domains", type=str, default=None, nargs='+')
+    
     args = parser.parse_args()
 
-    main(args.runid, args.chunk_index, args.dchunk, args.n_dchunks, args.tokens_file, args.output_file)
+    Path(args.output_file).parent.mkdir(exist_ok=True, parents=True)
+    
+    model, _, _, _ = reconstruct_model(args.runid)
+    tokens_df = pd.read_parquet(args.tokens_file)
+
+    if args.subject_ids:
+        subject_ids = pd.read_csv(args.subject_ids)
+        tokens_df = tokens_df[ tokens_df["subject_idx"].isin(subject_ids["subject_idx"]) ]
+
+    indices_df = compute_indices(model, tokens_df, args.chunk_index, args.dchunk, args.n_dchunks)        
+    
+    indices_df.to_parquet(args.output_file)
     

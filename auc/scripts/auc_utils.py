@@ -2,57 +2,6 @@ import numpy as np
 from scipy.stats import mannwhitneyu
 import torch
 
-def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1):
-    """
-    Computes bootstrapped AUC estimates using PyTorch on CUDA.
-
-    Parameters:
-        case: 1D tensor of scores for positive cases
-        control: 1D tensor of scores for controls
-        n_bootstrap: Number of bootstrap replicates
-
-    Returns:
-        Tensor of shape (n_bootstrap,) containing AUC for each bootstrap replicate
-    """
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. This function requires a GPU.")
-
-    # Convert inputs to CUDA tensors
-    if not torch.is_tensor(case):
-        case = torch.tensor(case, device="cuda", dtype=torch.float32)
-    else:
-        case = case.to("cuda", dtype=torch.float32)
-
-    if not torch.is_tensor(control):
-        control = torch.tensor(control, device="cuda", dtype=torch.float32)
-    else:
-        control = control.to("cuda", dtype=torch.float32)
-
-    n_case = case.size(0)
-    n_control = control.size(0)
-    total = n_case + n_control
-
-    # Generate bootstrap samples
-    boot_idx_case = torch.randint(0, n_case, (n_bootstrap, n_case), device="cuda")
-    boot_idx_control = torch.randint(0, n_control, (n_bootstrap, n_control), device="cuda")
-
-    boot_case = case[boot_idx_case]
-    boot_control = control[boot_idx_control]
-
-    combined = torch.cat([boot_case, boot_control], dim=1)
-
-    # Mask to identify case entries
-    mask = torch.zeros((n_bootstrap, total), dtype=torch.bool, device="cuda")
-    mask[:, :n_case] = True
-
-    # Compute ranks and AUC
-    ranks = combined.argsort(dim=1).argsort(dim=1)
-    case_ranks_sum = torch.sum(ranks.float() * mask.float(), dim=1)
-    min_case_rank_sum = n_case * (n_case - 1) / 2.0
-    U = case_ranks_sum - min_case_rank_sum
-    aucs = U / (n_case * n_control)
-    return aucs.cpu().tolist()
-
 
 def compute_midrank(x):
     """Computes midranks.
@@ -106,37 +55,10 @@ def fastDeLong(predictions_sorted_transposed, label_1_count):
     v01 = (tz[:, :m] - tx[:, :]) / n
     v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m
 
-    sx = np.cov(v01)
-    sy = np.cov(v10)
+    sx, sy = np.cov(v01), np.cov(v10)
 
     delongcov = sx / m + sy / n
     return aucs, delongcov
-
-
-def compute_ground_truth_statistics(ground_truth):
-    assert np.array_equal(np.unique(ground_truth), [0, 1])
-    order = (-ground_truth).argsort()
-    label_1_count = int(ground_truth.sum())
-    return order, label_1_count
-
-
-def get_auc_delong_var(healthy_scores, diseased_scores):
-    """
-    Computes ROC AUC value and variance using DeLong's method.
-
-    healthy_scores: Values for class 0 (controls)
-    diseased_scores: Values for class 1 (cases)
-    """
-    ground_truth = np.array([1] * len(diseased_scores) + [0] * len(healthy_scores))
-    predictions = np.concatenate([diseased_scores, healthy_scores])
-
-    order, label_1_count = compute_ground_truth_statistics(ground_truth)
-    predictions_sorted_transposed = predictions[np.newaxis, order]
-
-    aucs, delongcov = fastDeLong(predictions_sorted_transposed, label_1_count)
-    assert len(aucs) == 1
-
-    return aucs[0], delongcov
 
 
 def delong_auc(case, ctrl):
@@ -152,8 +74,9 @@ def delong_auc(case, ctrl):
 
     preds_sorted = scores[np.newaxis, order]
     auc, cov = fastDeLong(preds_sorted, m)
+    assert len(auc) == 1
 
-    return auc, cov # [0][0]
+    return auc[0], cov
 
 
 def compute_all_stats(case, ctrl, do_bootstrap=False, n_bootstrap=200):
@@ -169,7 +92,7 @@ def compute_all_stats(case, ctrl, do_bootstrap=False, n_bootstrap=200):
 
     auc_d, auc_var = delong_auc(case, ctrl)
 
-    u, p = mannwhitneyu(case, ctrl, alternative="two-sided")
+    u, p = mannwhitneyu(case, ctrl, alternative="greater")
 
     if do_bootstrap and torch.cuda.is_available():
         boots = optimized_bootstrapped_auc_gpu(case, ctrl, n_bootstrap)
@@ -180,10 +103,57 @@ def compute_all_stats(case, ctrl, do_bootstrap=False, n_bootstrap=200):
         auc_b_std = None
 
     return {
-        "auc_delong": auc_d,
-        "auc_delong_var": auc_var,
-        "mann_u": float(u),
-        "mann_p": float(p),
-        "auc_bootstrap_mean": auc_b_mean,
-        "auc_bootstrap_std": auc_b_std,
+        "auc_delong": auc_d, "auc_delong_var": auc_var,
+        "mann_u": float(u),  "mann_p": float(p),
+        "auc_bootstrap_mean": auc_b_mean, "auc_bootstrap_std": auc_b_std,
     }
+
+
+def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1):
+    """
+    Computes bootstrapped AUC estimates using PyTorch on CUDA.
+
+    Parameters:
+        case: 1D tensor of scores for positive cases
+        control: 1D tensor of scores for controls
+        n_bootstrap: Number of bootstrap replicates
+
+    Returns:
+        Tensor of shape (n_bootstrap,) containing AUC for each bootstrap replicate
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. This function requires a GPU.")
+
+    # Convert inputs to CUDA tensors
+    if not torch.is_tensor(case):
+        case = torch.tensor(case, device="cuda", dtype=torch.float32)
+    else:
+        case = case.to("cuda", dtype=torch.float32)
+
+    if not torch.is_tensor(control):
+        control = torch.tensor(control, device="cuda", dtype=torch.float32)
+    else:
+        control = control.to("cuda", dtype=torch.float32)
+
+    total = ( n_case := case.size(0) ) + ( n_control := control.size(0) )
+
+    # Generate bootstrap samples
+    boot_idx_case = torch.randint(0, n_case, (n_bootstrap, n_case), device="cuda")
+    boot_idx_control = torch.randint(0, n_control, (n_bootstrap, n_control), device="cuda")
+
+    boot_case = case[boot_idx_case]
+    boot_control = control[boot_idx_control]
+
+    combined = torch.cat([boot_case, boot_control], dim=1)
+
+    # Mask to identify case entries
+    mask = torch.zeros((n_bootstrap, total), dtype=torch.bool, device="cuda")
+    mask[:, :n_case] = True
+
+    # Compute ranks and AUC
+    ranks = combined.argsort(dim=1).argsort(dim=1)
+    case_ranks_sum = torch.sum(ranks.float() * mask.float(), dim=1)
+    min_case_rank_sum = n_case * (n_case - 1) / 2.0
+    U = case_ranks_sum - min_case_rank_sum
+    aucs = U / (n_case * n_control)
+    return aucs.cpu().tolist()
