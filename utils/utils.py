@@ -35,6 +35,24 @@ def load_domain_config(cfg_path, tokens_path):
     return cfg
 
 
+def read_ids(path, type=int):
+    """
+    Read UK Biobank IDs as strings.
+
+    - Accepts files with or without header.
+    - Uses first column only.
+    - Strips whitespace and removes Excel '.0' artifacts.
+    """
+    s = pd.read_csv(path, dtype=str, comment="#").iloc[:, 0]
+
+    return set(
+        s.str.strip()
+         .str.replace(r"\.0$", "", regex=True)
+         .dropna()
+         .astype(type)
+         .tolist()
+    )
+
 
 
 def fix_artifact_uri(artifact_uri):
@@ -291,6 +309,34 @@ def config_from_runid(runid):
     return model, dataloaders, optimizer, scheduler, logged_params, previous_run_name
 
 
+def migrate_legacy_state_dict(weights: dict) -> dict:
+    """
+    Normalize embedding-related keys to the current layout.
+
+    - transformer.embed.*      → embed.*
+    - embedding_to_logits.*    → embed.*
+    - removes duplicates (keeps first occurrence)
+    """
+    new_weights = {}
+
+    for k, v in weights.items():
+        new_key = k
+
+        if k.startswith("transformer.embed."):
+            new_key = k.replace("transformer.embed.", "embed.")
+
+        elif k.startswith("embedding_to_logits."):
+            # remove full prefix, keep domain path
+            new_key = k.replace("embedding_to_logits.embedding_layer_dict.", "embed.")
+            new_key = new_key.replace("embedding_to_logits.", "embed.")
+
+        # keep first occurrence if duplicates map to same key
+        if new_key not in new_weights:
+            new_weights[new_key] = v
+
+    return new_weights
+
+
 def reconstruct_model(run_id):
     
     params = load_run_params(run_id)
@@ -300,6 +346,8 @@ def reconstruct_model(run_id):
     ckpt, ckpt_path = load_checkpoint(run_id)
 
     weights = ckpt["state_dict"]
+    weights = migrate_legacy_state_dict(weights)
+
     test_ids = ckpt["metadata"]["test_ids"]
 
     cfg = infer_delphi_config_from_state_dict(weights)
@@ -318,7 +366,7 @@ def reconstruct_model(run_id):
 
     # model
     model = Delphi(delphi_cfg)
-    model.load_state_dict(weights)
+    model.load_state_dict(weights, strict=True)
     model.to("cpu")
     model.eval()
 
