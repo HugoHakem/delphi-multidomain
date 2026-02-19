@@ -63,20 +63,21 @@ def get_cli_args():
     import argparse
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--attention_scheme",   default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
-    parser.add_argument("--n_layer",            default=12,   type=int)
-    parser.add_argument("--n_head",             default=10,   type=int)
-    parser.add_argument("--n_embd",             default=120,  type=int)
-    parser.add_argument("--block_size",         default=96,   type=int)
     parser.add_argument("--domain_config_yaml", default="config/domain_config_default.yaml")
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex,padding")
+    parser.add_argument("--attention_scheme",   default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
+    parser.add_argument("--n_layer",            default=12,   type=int)
+    parser.add_argument("--n_head",             default=6,   type=int)
+    parser.add_argument("--n_embd",             default=120,  type=int)
+    parser.add_argument("--block_size",         default=96,   type=int)
     parser.add_argument("--batch_size",         default=32, type=int)
     parser.add_argument("--no-compile",         default=False, action='store_true')
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
     parser.add_argument("--test_fold",          default=1,    type=int)
     parser.add_argument("--subjects",           default=None, type=str)
+    parser.add_argument("--seed",               default=142, type=int)
     
-    parser.add_argument("--no_event_token_rate",           default=5, type=float)
+    parser.add_argument("--no_event_token_rate",           default=2, type=float)
     parser.add_argument("--no_event_token_insertion_mode", default="random", type=str)
 
     parser.add_argument("--no-warnings", "--no_warnings", dest="no_warnings", default=False, action="store_true")
@@ -114,7 +115,6 @@ if __name__ == "__main__":
         
         # —————————————————————————————————————————————————————————————————————————————————————————————————————————
         train_ids, val_ids, test_ids = get_data_partitions("./data/transforms/subject_lists", fold=args.test_fold)
-
         
         if args.subjects is not None:
             subject_ids = pd.read_csv(args.subjects, header=None)[0].tolist()
@@ -123,27 +123,28 @@ if __name__ == "__main__":
             test_ids    = list( set(test_ids)  & set(subject_ids) )
     
         dataset_config = dict(root=root_path, domains_cfg=domain_cfg, exclusions=[], required_domains=["diseases"])
-        
+
         datasets = [
             train_dataset := DelphiDataset(subjects=train_ids,   **dataset_config).to(DEVICE),
             valid_dataset := DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE),
             test_dataset  := DelphiDataset(subjects=test_ids,   **dataset_config).to(DEVICE)
         ]
-    
+
         dataloaders = [ 
             train_dataloader := DelphiDataloader(train_dataset, batch_size=args.batch_size),
             valid_dataloader := DelphiDataloader(valid_dataset, batch_size=args.batch_size), 
             test_dataset     := DelphiDataloader(test_dataset,  batch_size=args.batch_size)
         ]
         # —————————————————————————————————————————————————————————————————————————————————————————————————————————
-        
+
         delphi_config = DelphiConfig( 
             n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head,
             domains=domain_cfg, attention_scheme=attention_scheme,
             token_dropout=0.1,
             block_size=args.block_size, 
             no_event_token_rate=args.no_event_token_rate, 
-            no_event_token_insertion_mode=args.no_event_token_insertion_mode
+            no_event_token_insertion_mode=args.no_event_token_insertion_mode,
+            seed=args.seed
         )
     
         logging.info("Config:\n%s", pformat(asdict(delphi_config), sort_dicts=False))
@@ -164,7 +165,10 @@ if __name__ == "__main__":
   
         ################################ FROM PREVIOUS RUN ################################
     
-        model, dataloaders, optimizer, scheduler, logged_params, previous_run_name = config_from_runid(args.resume_run_id)
+        model, \
+        dataloaders, \
+        optimizer, scheduler, \
+        logged_params, previous_run_name = config_from_runid(args.resume_run_id)
             
         new_run_id = clone_run_to_new_experiment(args.resume_run_id, args.experiment_name)
         logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=previous_run_name, autostart=False)
@@ -185,4 +189,4 @@ if __name__ == "__main__":
         logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM 
     ) 
 
-    trainer.train(max_epochs=1000, patience=3)
+    trainer.train(max_epochs=1000, patience=7)
