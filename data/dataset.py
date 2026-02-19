@@ -1,6 +1,5 @@
 #%%
 import os, sys
-
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import time
@@ -95,7 +94,7 @@ class TokenDomain:
 
     BASE_COLUMNS = ["subject_id"]
     CATEGORICAL_COLUMNS = ["token_id"]
-    CONTINUOUS_COLUMNS = ["value"]
+    CONTINUOUS_COLUMNS = ["token_id", "value"]
     AGE_COLUMN = "age"
 
     def __init__(self,
@@ -197,19 +196,19 @@ class TokenDomain:
         if not os.path.exists(path):
             assert False, f"Tokens file {path} does not exist"
             if self.type == "categorical":
-                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [CATEGORICAL_COLUMNS])
+                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [self.CATEGORICAL_COLUMNS])
             elif self.type == "continuous":
-                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [CONTINUOUS_COLUMNS])
+                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [self.CONTINUOUS_COLUMNS])
         
         df = pd.read_csv(path)
 
         # enforce schema
         if "subject_id" not in df.columns:
             raise ValueError(f"Invalid tokens file {path}, must contain subject_id")
-        if self.type == "categorical" and "token_id" not in df.columns:
-            raise ValueError(f"Invalid tokens file {path}, must contain \"token_id\" since type==categorical")
-        if self.type == "continuous" and "value" not in df.columns:
-            raise ValueError(f"Invalid tokens file {path}, must contain \"value\" since type==continuous")
+        if self.type == "categorical" and any([col not in df.columns for col in self.CATEGORICAL_COLUMNS]):
+            raise ValueError(f"Invalid tokens file {path}, must contain {self.CATEGORICAL_COLUMNS} since type==categorical")
+        if self.type == "continuous" and any([col not in df.columns for col in self.CONTINUOUS_COLUMNS]):
+            raise ValueError(f"Invalid tokens file {path}, must contain both {self.CONTINUOUS_COLUMNS} since type==continuous")
 
         df = df.sort_values("subject_id")
         
@@ -254,9 +253,10 @@ class TokenDomain:
     
     def __getitem__(self, subject_id):
 
-        return self.tokens.set_index("subject_id").loc[[subject_id]].\
-            assign( **{"age (years)": lambda df: (df.age / DAYS_PER_YEAR).round(2)} ).\
-            drop("age", axis=1)
+        return self.tokens.set_index("subject_id").loc[[subject_id]]
+            # .\
+            # assign( **{"age (years)": lambda df: (df.age / DAYS_PER_YEAR).round(2)} ).\
+            # drop("age", axis=1)
 
     
     def as_dataframe(self):
@@ -276,7 +276,7 @@ class SinglePatientTrajectory:
     metadata: Dict[str, Any]       # arbitrary extra info (sex, cohort, etc.)
     tokenizer: Optional[Any] = None
 
-# —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————    
+# ————————————————————————————————————————————————————————————————————————————————————————— 
 
 class DelphiDataset:
 
@@ -501,8 +501,8 @@ and
                 start, count = self._subject_indices[dname][subject_id]
                 tokens_subj  = domain.tokens[start:(start+count)]
                 
-                # if self.domain_configs[dname].type == "continuous":
-                    # tokens_subj = tokens_subj[:,2].reshape(1, -1)                
+                if self.domain_configs[dname].type == "continuous":
+                    tokens_subj = tokens_subj[:,2].reshape(-1, self.domain_configs[dname].input_size)                
 
             except KeyError as e:
                 tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
@@ -519,7 +519,7 @@ and
         out = self.get_subject_events(index)
         return out    
 
-# —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+# ———————————————————————————————————————————————————————————————————————————————————————————————
 
 def collate_fn_domains(batch):
 
@@ -560,7 +560,7 @@ class FlexibleDataLoader(DataLoader):
 
 class DelphiDataloader(FlexibleDataLoader):
     
-    def __init__(self, dataset, block_size=48, device=None, return_dictionary=True, **kwargs):
+    def __init__(self, dataset, device=None, return_dictionary=True, **kwargs):
 
         self.device = dataset.device if device is None else device
         collate_fn = collate_fn_domains
