@@ -1,3 +1,8 @@
+> ⚠️ Stability notice
+>
+> The codebase is evolving and interfaces are not yet stable. Changes may affect the CLI, model architecture, configuration schema, default parameter values and output formats.
+
+
 # Multi-domain Delphi
 
 This repository extends the **Delphi** core codebase to support **multi-domain longitudinal data**, beyond standard diagnosis codes.
