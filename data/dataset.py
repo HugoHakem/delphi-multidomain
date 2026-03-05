@@ -502,10 +502,18 @@ and
                 tokens_subj  = domain.tokens[start:(start+count)]
                 
                 if self.domain_configs[dname].type == "continuous":
-                    tokens_subj = tokens_subj[:,2].reshape(-1, self.domain_configs[dname].input_size)                
+                    tokens_subj = torch.cat([
+                        torch.tensor([tokens_subj[0][0]], device=self.device).unsqueeze(1),
+                        torch.tensor([tokens_subj[0][3]], device=self.device).unsqueeze(1),
+                        tokens_subj[:,2].reshape(-1, self.domain_configs[dname].input_size)                
+                    ], axis=1)
 
             except KeyError as e:
-                tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
+                if self.domain_configs[dname].type == "continuous":
+                    dim = self.domain_configs[dname].input_size
+                    tokens_subj = torch.empty(0, dim+2, dtype=torch.float32, device=self.device)
+                else:
+                    tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
             subject_events[dname] = tokens_subj         
         
         return subject_events
