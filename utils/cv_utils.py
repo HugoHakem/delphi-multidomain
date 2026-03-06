@@ -23,52 +23,28 @@ def generate_splits(
     n_train_folds: int,
     n_val_folds: int,
     n_test_folds: int,
-    val_as_last: bool = True,
 ) -> List[Dict[str, List[str]]]:
-    """
-    Generate splits (train/valid/test) given predefined folds.
 
-    Parameters
-    ----------
-    folds : list of list
-        List of folds, each containing subject IDs.
-    n_train_folds : int
-        Number of folds to use for training.
-    n_val_folds : int
-        Number of folds to use for validation.
-    n_test_folds : int
-        Number of folds to use for testing.
-    val_as_last : bool
-        If True, take validation folds as the last `n_val_folds` among the remaining.
-        If False, take the first `n_val_folds`.
-
-    Returns
-    -------
-    splits : list of dict
-        Each dict has keys "train", "valid", "test".
-    """
     num_folds = len(folds)
-    window_size = n_train_folds + n_val_folds + n_test_folds
-    if window_size > num_folds:
-        raise ValueError("Not enough folds for requested split sizes.")
 
     splits = []
-    for start in range(0, num_folds, n_test_folds):
-        test_idx = list(range(start, start + n_test_folds))
-        remaining = [i for i in range(num_folds) if i not in test_idx]
 
-        if val_as_last:
-            val_idx = remaining[-n_val_folds:]
-            train_idx = remaining[:-n_val_folds]
-        else:
-            val_idx = remaining[:n_val_folds]
-            train_idx = remaining[n_val_folds:n_val_folds + n_train_folds]
+    for start in range(0, num_folds, n_test_folds):
+
+        test_idx = [(start + i) % num_folds for i in range(n_test_folds)]
+        val_idx = [(start - 1) % num_folds]
+
+        train_idx = [
+            i for i in range(num_folds)
+            if i not in test_idx and i not in val_idx
+        ]
 
         split = {
             "train": sum([folds[i] for i in train_idx], []),
             "valid": sum([folds[i] for i in val_idx], []),
             "test": sum([folds[i] for i in test_idx], []),
         }
+
         splits.append(split)
 
     return splits
@@ -82,7 +58,7 @@ def get_data_partitions(folder, fold):
 
     fold_ids = load_fold_ids(folder, num_folds=10)
 
-    splits = generate_splits(fold_ids, n_train_folds=7, n_val_folds=1, n_test_folds=2, val_as_last=True)  
+    splits = generate_splits(fold_ids, n_train_folds=7, n_val_folds=1, n_test_folds=2)  
     split_idx = fold - 1
     
     train_ids = [ int(x) for x in splits[split_idx]["train"]]
