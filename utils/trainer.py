@@ -11,11 +11,36 @@ from datetime import datetime
 from easydict import EasyDict
 from urllib.parse import urlparse
 
-
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
 from data.event_set import EventSet
+
+from dataclasses import asdict
+from pathlib import Path
+import json
+
+
+def lod2dol(lod):
+    """
+    Convert list of dicts -> dict of lists.
+    """
+    from collections import defaultdict
+    dol = defaultdict(list)
+    for d in lod:
+        for k, v in d.items():
+            dol[k].append(v.item())
+    return dict(dol)
+
+
+def make_json_serializable(x):
+    if isinstance(x, Path):
+        return str(x)
+    if isinstance(x, dict):
+        return {k: make_json_serializable(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [make_json_serializable(v) for v in x]
+    return x
 
 
 def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_run_name: str = None) -> str:
@@ -77,6 +102,7 @@ def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_r
 # ————————————————————————————————————————————————————————————————————————————————————————————
 
 VAL_EVERY_NSAMPLES = 100000
+VAL_EVERY_NSAMPLES = 1e18
 
 class EarlyStopping:
     def __init__(self, patience=10, min_delta=0.0, mode='min'):
@@ -284,10 +310,12 @@ class MLFlowLogger:
 # Just a base class that shows the expected interface for child classes
 class BaseTrainer():
 
-    def train(self):           pass
     def shared_step(self):     pass
-    def val_epoch(self):       pass
+    
     def train_epoch(self):     pass
+    def train(self):           pass
+    
+    def val_epoch(self):       pass
     def valid_epoch_end(self): pass
 
 
@@ -297,8 +325,8 @@ class Trainer(BaseTrainer):
 
     def __init__(self, model, dataloaders, 
           optimizer, scheduler, patience=3, 
-          n_train_batches=None, n_val_batches=None, 
-          logger=NullLogger(), mlflow_params=dict(), start_epoch=0,
+          n_train_batches=None, n_val_batches=None, n_validations_per_epoch=1,
+          logger=NullLogger(), mlflow_params=dict(), start_epoch=0, log_loss_per_disease=False,
           use_tqdm=True
         ):
 
@@ -311,7 +339,9 @@ class Trainer(BaseTrainer):
         self.scheduler       = scheduler        
         self.early_stopper   = EarlyStopping(patience=patience, min_delta=0.001, mode='min')                        
 
-        assert isinstance(dataloaders, list), "Argument 'dataloaders' should be a list of either 2 or 3 dataloaders (train/val[/test])"
+        assert isinstance(dataloaders, list), \
+               "Argument 'dataloaders' should be a list of either 2 or 3 dataloaders (train/val[/test])"
+
         if len(dataloaders) == 2:
             self.train_loader, self.valid_loader = dataloaders
         elif len(dataloaders) == 3:
@@ -321,14 +351,17 @@ class Trainer(BaseTrainer):
         
         self.n_train_batches, self.n_val_batches = n_train_batches or 'all', n_val_batches or 'all'
         
-        self.train_outputs,   self.valid_outputs, self.test_outputs = [], [], []            
+        self.train_outputs, \
+        self.valid_outputs, \
+        self.test_outputs = [], [], []            
 
-        self.current_epoch  = start_epoch
+        self.current_epoch = start_epoch
         self._validation_counter = 0
+        self.n_validations_per_epoch = n_validations_per_epoch
         
         self.logger = logger
         self.val_loss = None
-        self.ema_alpha = 0.005
+        self.ema_alpha = 0.02
 
         self.additional_mlflow_params = mlflow_params | { "ema_alpha": self.ema_alpha }
 
@@ -336,6 +369,7 @@ class Trainer(BaseTrainer):
 
         self.ce_ema = None
         self.time_ema = None
+        self.log_loss_per_disease = log_loss_per_disease
         
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.allow_tf32 = True
@@ -365,25 +399,29 @@ class Trainer(BaseTrainer):
 
         if patience is not None:
             self.early_stopper.set_patience(patience)
+        
+        n_batches_epoch = len(self.train_loader)
+        if self.n_validations_per_epoch <= 0:
+            eval_every = None
+        else:
+            eval_every = max(1, n_batches_epoch // self.n_validations_per_epoch)
 
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
-
-        # self.logger.log_params(self.optimizer.config)
-        # self.logger.log_params(self.scheduler.config)
 
         for epoch in range(self.current_epoch, max_epochs):
             
             self.current_epoch = epoch
             self.model.train()
 
-            train_loss = self.train_epoch(eval_every=VAL_EVERY_NSAMPLES//self.train_loader.batch_size)
+            train_loss = self.train_epoch(eval_every=eval_every)
 
             metrics = { "train_loss": train_loss }
              
             if self.val_loss is not None:
                 metrics["val_loss"] = self.val_loss
-                val_loss_per_disease = metrics["val_loss"].pop("val_ce_loss_per_disease")
+                if "val_ce_loss_per_disease" in metrics["val_loss"]:
+                    val_loss_per_disease = metrics["val_loss"].pop("val_ce_loss_per_disease")
 
             self.logger.log_metrics(metrics['val_loss'], step=epoch)            
             self.logger.log_metrics(metrics['train_loss'], step=epoch)            
@@ -433,7 +471,10 @@ class Trainer(BaseTrainer):
         return self._sample_input_tensor
 
     
-    def shared_step(self, batch, batch_idx, epoch, log_loss_per_disease=False, return_logits=False, return_att=False, stage="training", add_prefix=None):
+    def shared_step(self, 
+          batch, batch_idx, epoch,           
+          return_logits=False, return_att=False, stage="training", add_prefix=None
+        ):
 
         model = self.model
 
@@ -472,7 +513,7 @@ class Trainer(BaseTrainer):
             f'{prefix}total': loss_ce + time_loss,
         })
 
-        if log_loss_per_disease:
+        if self.log_loss_per_disease:
             loss_ce_per_disease = model.cross_entropy_loss(
                 f_logits, global_ids, agg="per_disease"
             ).to_frame().assign(batch_idx=batch_idx)
@@ -489,13 +530,16 @@ class Trainer(BaseTrainer):
         
         self._validation_counter += 1        
 
-        return pd.concat([x['val_ce_loss_per_disease'] for x in loss_outputs]).\
-            reset_index().\
-            pivot(index="token_id", columns="batch_idx", values="log_p").\
-            fillna(0).\
-            sum(axis=1).\
-            sort_values().\
-            reset_index()
+        if len(loss_outputs) and 'val_ce_loss_per_disease' in loss_outputs[0]:
+            self._val_ce_loss_per_disease_df = pd.concat([x['val_ce_loss_per_disease'] for x in loss_outputs]).\
+                reset_index().\
+                pivot(index="token_id", columns="batch_idx", values="log_p").\
+                fillna(0).\
+                sum(axis=1).\
+                sort_values().\
+                reset_index()
+
+        return 1
         
 
     def compute_mean(self, outputs: List[Dict]):
@@ -518,13 +562,13 @@ class Trainer(BaseTrainer):
         return out
           
 
-    def train_epoch(self, n_batches=None, eval_every=None):
+    def train_epoch(self, n_batches='all', eval_every=None):
 
         self.val_step = 0
-        ce_ema, time_ema = None, None        
+        ce_ema, time_ema = None, None                
 
         pbar = tqdm(
-            total=len(self.train_loader) if n_batches == "all" else n_batches, 
+            total=len(self.train_loader.dataset) if n_batches == "all" else n_batches, 
             disable=not self.use_tqdm
         )
 
@@ -580,8 +624,9 @@ class Trainer(BaseTrainer):
         self.model.eval()
 
         pbar = tqdm(
-            total=len(self.valid_loader) if n_batches == "all" else n_batches, 
-            disable=not self.use_tqdm
+            total=len(self.valid_loader.dataset) if n_batches == "all" else n_batches, 
+            disable=not self.use_tqdm,
+
         )
 
         with torch.no_grad():
@@ -589,7 +634,7 @@ class Trainer(BaseTrainer):
             loss_outputs = []
             for i, batch in enumerate(self.valid_loader):
 
-                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, log_loss_per_disease=True, stage="validation", add_prefix="val")
+                loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="validation", add_prefix="val")
                 loss_outputs.append(loss)
             
                 pbar.set_postfix({
@@ -604,16 +649,21 @@ class Trainer(BaseTrainer):
         
         pbar.close()
 
-        loss_per_disease_df = self.valid_epoch_end(loss_outputs)
-        
-        losses_per_epoch_file = self.LOSSES_PER_EPOCH_FILEPATTERN.format(current_epoch=self.current_epoch, val_step=self.val_step)
+        self.valid_epoch_end(loss_outputs)
 
-        self.logger.log_df_as_artifact(df=loss_per_disease_df, filename=losses_per_epoch_file, artifact_path="val_loss_per_disease")
-        # loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._validation_counter}.csv", index=False)
-
+        if hasattr(self, "_val_ce_loss_per_disease_df"):            
+            losses_per_epoch_file = self.LOSSES_PER_EPOCH_FILEPATTERN.format(current_epoch=self.current_epoch, val_step=self.val_step)
+            self.logger.log_df_as_artifact(
+                df=loss_per_disease_df, 
+                filename=self._val_ce_loss_per_disease_df, 
+                artifact_path="val_loss_per_disease"
+            )
+            loss_per_disease_df.to_csv(f"{odir}/loss_outputs_{self._validation_counter}.csv", index=False)
+                    
         mean_loss = torch.stack([loss['val_ce_loss'] for loss in loss_outputs]).mean()
 
         self.model.train()
+
         return loss, mean_loss,
 
     

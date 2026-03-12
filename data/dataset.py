@@ -297,7 +297,10 @@ class DelphiDataset:
         """
 
         self.root = Path(root)
-        self._device = device
+
+        if device is not None:
+            self._device = device
+
         self.domain_configs = domains_cfg
 
         # Load the data        
@@ -366,6 +369,7 @@ class DelphiDataset:
             self._subjects = self._subjects.sample(n_samples)
         
         self._subjects = set(self._subjects.subject_id.to_list())
+        
 
         # —————————————————————————————————————————————————————————————————————————————
 
@@ -387,12 +391,19 @@ and
 
         # of internal use, for faster slicing
         self._subject_indices = self._precompute_subject_indices_per_domain()
+
+        self.to(self._device)
+
+        print(f"Final subject count: {len(self._subjects)}")
+        self._cached_data = self.cache_all_data()
+        print(f"Data loading complete. Dataset initialized with {len(self._subjects)} subjects and domains: {list(self.domains.keys())}")
            
 
     @property
     def device(self):
-        device = [ self.domains[dname].tokens.device for dname in self.domains ][0]
-        return device
+        if "_device" not in self.__dict__:
+            self._device = [ self.domains[dname].tokens.device for dname in self.domains ][0]
+        return self._device
 
     @property
     def subjects(self):
@@ -518,14 +529,26 @@ and
         
         return subject_events
 
+    def cache_all_data(self):
+
+        self._cached_data = {}
+        for _, subject_id in enumerate(self.subjects):
+            if subject_id not in self._cached_data:                
+                self._cached_data[subject_id] = self.get_subject_events(subject_id)
+        
+        return self._cached_data
+
 
     def __getitem__(self, index):
 
         if not self.is_ukb_id(index) and isinstance(index, int):
-            index = self.subjects[index]
+            index = self.subjects[index]        
 
-        out = self.get_subject_events(index)
-        return out    
+        if index not in self._cached_data:            
+            self._cached_data[index] = self.get_subject_events(index)
+        
+        out = self._cached_data[index]        
+        return out
 
 # ———————————————————————————————————————————————————————————————————————————————————————————————
 

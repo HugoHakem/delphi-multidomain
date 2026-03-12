@@ -17,9 +17,10 @@ DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 if ( DELPHI_DIR := Path(__file__).resolve().parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
-from data.dataset import DelphiDataset, DelphiDataloader
-from utils.cv_utils import get_data_partitions
-from utils.utils import load_domain_config
+from data.dataset_v2 import (
+    DelphiDataset, 
+    DelphiDataloader
+)
 
 from delphi.optim import (
     OptimConfig, 
@@ -30,11 +31,15 @@ from delphi.model import (
     Delphi,
     DelphiConfig,
 )
+
 from utils.trainer import (    
     MLFlowLogger,
     Trainer,
     clone_run_to_new_experiment,
 )
+
+from utils.cv_utils import get_data_partitions
+from utils.utils import load_domain_config
 
 root_path = DELPHI_DIR / "data" / "transforms"
 ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config" / "attention_schemes.yaml").read_text() )
@@ -71,6 +76,7 @@ def get_cli_args():
     parser.add_argument("--n_embd",             default=120,  type=int)
     parser.add_argument("--block_size",         default=96,   type=int)
     parser.add_argument("--batch_size",         default=32, type=int)
+    parser.add_argument("--token_dropout",      default=0.1, type=float)
     parser.add_argument("--no-compile",         default=False, action='store_true')
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
     parser.add_argument("--test_fold",          default=1,    type=int)
@@ -91,6 +97,41 @@ def get_cli_args():
 
     args = parser.parse_args()
     return args
+
+
+def get_dataloaders(domain_cfg, test_fold, subjects_include_list=None, device='cpu'):
+
+    train_ids, \
+    val_ids, \
+    test_ids = get_data_partitions("./data/transforms/subject_lists", fold=test_fold)
+    
+    if subjects_include_list is not None:
+        subject_ids = pd.read_csv(args.subjects, header=None)[0].tolist()
+        train_ids   = list( set(train_ids) & set(subject_ids) )
+        val_ids     = list( set(val_ids)   & set(subject_ids) )
+        test_ids    = list( set(test_ids)  & set(subject_ids) )
+
+    dataset_config = dict(
+        root=root_path, 
+        domains_cfg=domain_cfg, 
+        exclusions=[], 
+        required_domains=["diseases"]
+    )
+
+    datasets = [
+        train_dataset := DelphiDataset(subjects=train_ids, **dataset_config).to(device),
+        valid_dataset := DelphiDataset(subjects=val_ids,   **dataset_config).to(device),
+        test_dataset  := DelphiDataset(subjects=test_ids,  **dataset_config).to(device)
+    ]
+
+    dataloaders = [ 
+        train_dataloader := DelphiDataloader(train_dataset, batch_size=args.batch_size),
+        valid_dataloader := DelphiDataloader(valid_dataset, batch_size=args.batch_size), 
+        test_dataloader  := DelphiDataloader(test_dataset,  batch_size=args.batch_size)
+    ]
+
+    return dataloaders
+
 
 
 if __name__ == "__main__":    
@@ -114,7 +155,12 @@ if __name__ == "__main__":
             attention_scheme = args.attention_scheme
         
         # —————————————————————————————————————————————————————————————————————————————————————————————————————————
-        train_ids, val_ids, test_ids = get_data_partitions("./data/transforms/subject_lists", fold=args.test_fold)
+        
+        dataloaders = get_dataloaders(domain_cfg, args.test_fold)
+        
+        train_ids, \
+        val_ids, \
+        test_ids = get_data_partitions("./data/transforms/subject_lists", fold=args.test_fold)
         
         if args.subjects is not None:
             subject_ids = pd.read_csv(args.subjects, header=None)[0].tolist()
@@ -125,9 +171,9 @@ if __name__ == "__main__":
         dataset_config = dict(root=root_path, domains_cfg=domain_cfg, exclusions=[], required_domains=["diseases"])
 
         datasets = [
-            train_dataset := DelphiDataset(subjects=train_ids,   **dataset_config).to(DEVICE),
+            train_dataset := DelphiDataset(subjects=train_ids, **dataset_config).to(DEVICE),
             valid_dataset := DelphiDataset(subjects=val_ids,   **dataset_config).to(DEVICE),
-            test_dataset  := DelphiDataset(subjects=test_ids,   **dataset_config).to(DEVICE)
+            test_dataset  := DelphiDataset(subjects=test_ids,  **dataset_config).to(DEVICE)
         ]
 
         dataloaders = [ 
@@ -140,7 +186,7 @@ if __name__ == "__main__":
         delphi_config = DelphiConfig( 
             n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head,
             domains=domain_cfg, attention_scheme=attention_scheme,
-            token_dropout=0.1,
+            token_dropout=args.token_dropout,
             block_size=args.block_size, 
             no_event_token_rate=args.no_event_token_rate, 
             no_event_token_insertion_mode=args.no_event_token_insertion_mode,
@@ -159,7 +205,13 @@ if __name__ == "__main__":
     
         mlflow.log_artifact(domain_config_yaml)
     
-        logged_params = { "test_fold": args.test_fold, "batch_size": args.batch_size, "learning_rate": args.lr }
+        logged_params = { 
+            "test_fold": args.test_fold, 
+            "batch_size": args.batch_size, 
+            "learning_rate": args.lr,
+            "seed": args.seed,
+            "optim_config": optim_config            
+        }
      
     else:
   
@@ -185,8 +237,11 @@ if __name__ == "__main__":
   
     trainer = Trainer( 
         model, dataloaders, 
-        optimizer, scheduler, 
-        logger=logger, mlflow_params=logged_params, use_tqdm=USE_TQDM 
+        optimizer, scheduler,
+        log_loss_per_disease=False, 
+        logger=logger, 
+        mlflow_params=logged_params, 
+        use_tqdm=True#USE_TQDM 
     ) 
 
     trainer.train(max_epochs=1000, patience=7)

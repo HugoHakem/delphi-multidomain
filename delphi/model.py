@@ -22,7 +22,8 @@ import inspect
 import yaml
 from tqdm import tqdm
 from easydict import EasyDict
-from typing import Optional, List, Tuple, Union, Mapping
+
+from typing import Optional, List, Tuple, Dict, Union, Mapping
 from collections import defaultdict
 
 import logging
@@ -53,13 +54,14 @@ class AttentionMaskBuilder(nn.Module):
         
         super().__init__()
         
-        self.scheme = self._parse_scheme(scheme_str)
+        self.scheme = AttentionMaskBuilder._parse_scheme(scheme_str)
 
         self.domain2id = domain2id
 
 
     # —-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—
-    def _split_top_level(self, s: str, sep: str = ","):
+    @staticmethod
+    def _split_top_level(s: str, sep: str = ","):
         """
         Splits a string by sep but ignores separators inside [] or ().
         """
@@ -82,9 +84,10 @@ class AttentionMaskBuilder(nn.Module):
         return parts
 
     # —-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—-—
-    def _parse_scheme(self, scheme_str: str):
+    @staticmethod
+    def _parse_scheme(scheme_str: str) -> Dict[Tuple[str, ...], Dict[str, bool | str]]: 
         scheme = {}
-        parts = self._split_top_level(scheme_str)
+        parts = AttentionMaskBuilder._split_top_level(scheme_str)
 
         for part in parts:
             if ":" not in part:
@@ -311,7 +314,7 @@ class DomainConfig:
     age_jitter: bool = False
     type: str = "categorical"
     at_birth: bool = False
-    n_latent_tokens: int = 1         # how many tokens the input gets mapped to (for continuous domains)
+    n_latent_tokens: int = None         # how many tokens the input gets mapped to (for continuous domains)
 
 
     def set_freeze(self, freeze: bool):
@@ -347,8 +350,8 @@ class DelphiConfig:
     no_event_token_rate: float = 5
     no_event_token_insertion_mode: str = "random"
     # modality_emb: bool = False
-    zero_inflate: bool = False
-    zero_inflate_projector: str = "linear"
+    # zero_inflate: bool = False
+    # zero_inflate_projector: str = "linear"
     seed: int = 42
 
     def items(self):        
@@ -448,7 +451,15 @@ class DomainEmbedding(nn.Module):
 
     @property
     def vocab_len(self):
-        return self.projector.weight.shape[0]
+        if hasattr(self, "_vocab_len"):
+            return self._vocab_len
+        else:
+            if self.config.type == "continuous":
+                return self.config.n_latent_tokens
+            elif self.config.type == "categorical":
+                return self.projector.weight.shape[0]
+            else:
+                raise NotImplementedError
 
     def get_from_pretrained(self, path, n_embed, freeze):
 
@@ -555,7 +566,10 @@ class MultiDomainEmbedding(nn.Module):
 
     @property
     def predicted_domains(self):
-        return [ dname for dname, domain_cfg in self.config.items() if domain_cfg.predict ]
+        if hasattr(self, "_predicted_domains"):
+            return self._predicted_domains
+        self._predicted_domains = [ dname for dname, domain_cfg in self.config.items() if domain_cfg.predict ]
+        return self._predicted_domains
 
 
     def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -573,7 +587,7 @@ class MultiDomainEmbedding(nn.Module):
         logits_dict = {
             dname: F.linear(h, emb.weight)
             for dname, emb in self.domain_embed.items()
-            if dname != "padding"
+            if dname in self.predicted_domains
         }
 
         if not concatenate_domains:
@@ -636,51 +650,51 @@ class CrossEntropyHead(nn.Module):
         return loss_ce
 
 
-class CompetingExpHead(nn.Module):
-
-    def __init__(self,
-        n_input:      Optional[int] = None,
-        zero_inflate: bool          = False,
-        pi_head:      Optional[str] = None,
-    ):
-        super().__init__()
-
-        self.zero_inflate = zero_inflate
-        if zero_inflate:
-            assert n_input is not None
-            assert pi_head is not None
-            if pi_head == "linear":
-                self.pi_head = nn.Linear(n_input, 1, bias=False)
-            elif pi_head == "mlp":
-                self.pi_head = nn.Sequential(
-                    nn.Linear(n_input, 32, bias=False),
-                    nn.ReLU(),
-                    nn.Linear(32, 1, bias=False),
-                )
-            else:
-                raise ValueError(f"Unknown pi_head: {pi_head}")
-
-    def forward(self, logits: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
-
-        lse = torch.logsumexp(logits, -1)
-        lse = -torch.log(torch.exp(-lse) + 1.0)
-        t_min = 0.0 if self.zero_inflate else 1.0
-        delta_t = torch.clamp(delta_t, min=t_min)
-        ldt = -torch.log(delta_t + 1.0)
-        exp_log_likelihood = lse - torch.exp(lse - ldt)
-
-        if self.zero_inflate:
-            pi = self.pi_head(logits).squeeze()
-            zero_case_nll = -(F.softplus(-pi + lse) - F.softplus(-pi))
-            nonzero_case_nll = -(exp_log_likelihood - pi - F.softplus(-pi))
-            loss_dt = (
-                zero_case_nll * (delta_t == 0).float()
-                + nonzero_case_nll * (delta_t > 0).float()
-            )
-        else:
-            loss_dt = -exp_log_likelihood
-
-        return loss_dt
+# class CompetingExpHead(nn.Module):
+# 
+#     def __init__(self,
+#         n_input:      Optional[int] = None,
+#         zero_inflate: bool          = False,
+#         pi_head:      Optional[str] = None,
+#     ):
+#         super().__init__()
+# 
+#         self.zero_inflate = zero_inflate
+#         if zero_inflate:
+#             assert n_input is not None
+#             assert pi_head is not None
+#             if pi_head == "linear":
+#                 self.pi_head = nn.Linear(n_input, 1, bias=False)
+#             elif pi_head == "mlp":
+#                 self.pi_head = nn.Sequential(
+#                     nn.Linear(n_input, 32, bias=False),
+#                     nn.ReLU(),
+#                     nn.Linear(32, 1, bias=False),
+#                 )
+#             else:
+#                 raise ValueError(f"Unknown pi_head: {pi_head}")
+# 
+#     def forward(self, logits: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+# 
+#         lse = torch.logsumexp(logits, -1)
+#         lse = -torch.log(torch.exp(-lse) + 1.0)
+#         t_min = 0.0 if self.zero_inflate else 1.0
+#         delta_t = torch.clamp(delta_t, min=t_min)
+#         ldt = -torch.log(delta_t + 1.0)
+#         exp_log_likelihood = lse - torch.exp(lse - ldt)
+# 
+#         if self.zero_inflate:
+#             pi = self.pi_head(logits).squeeze()
+#             zero_case_nll = -(F.softplus(-pi + lse) - F.softplus(-pi))
+#             nonzero_case_nll = -(exp_log_likelihood - pi - F.softplus(-pi))
+#             loss_dt = (
+#                 zero_case_nll * (delta_t == 0).float()
+#                 + nonzero_case_nll * (delta_t > 0).float()
+#             )
+#         else:
+#             loss_dt = -exp_log_likelihood
+# 
+#         return loss_dt
 
 
 class LayerNorm(nn.Module):
@@ -793,70 +807,155 @@ def initialize_weights(model: torch.nn.Module, config: DelphiConfig):
         if pn.endswith("c_proj.weight"):
             torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
+import torch
 
-class AgeSampler():
+# To generate ages to place no-event tokens at
+class AgeSampler:
+    """
+    Efficient age sampler.
 
-    def __init__(self, 
+    Modes
+    -----
+    - "regular":        deterministic grid: step, 2*step, ...
+    - "random":         n_tokens ~ floor(max_age/step), ages ~ U(0, max_age)
+    - "grid_jitter":    grid + Gaussian jitter (vectorized), then clamped to [0, max_age]
+                        jitter_sigma defaults to step/5
+    """
+
+    def __init__(
+        self,
         insertion_mode: str = "regular",
         token_rate: float = 1.0,
-        seed: int | None = None, device=None):
-
+        seed: int | None = None,
+        device=None,
+        jitter_sigma: float | None = None,  # in same units as ages (days)
+    ):
         self.insertion_mode = insertion_mode
-        self.no_event_token_rate = token_rate
+        self.no_event_token_rate = float(token_rate)
         self.seed = seed
-        self.sampler = self.build_sampler()
         self.device = device
+        self.jitter_sigma = jitter_sigma  # if None, will default to step/5 at runtime
 
+        self._generator = None
+        self.to(device)
 
     def to(self, device):
         self.device = device
-
-        # rebuild RNG on new device if needed
         if self.seed is not None:
             self._generator = torch.Generator(device=device)
             self._generator.manual_seed(self.seed)
         else:
             self._generator = None
+        return self
 
-
-    def build_sampler(self):
-
+    @property
+    def step(self) -> float:
         if self.no_event_token_rate <= 0:
-            def sampler(max_age, device):
-                return None
-            return sampler
-    
-        step = self.no_event_token_rate * DAYS_PER_YEAR
-    
-        if self.insertion_mode == "regular":
-    
-            def sampler(max_age, device):
-                start = step
-                if max_age <= start:
-                    return None
-                return torch.arange(start, max_age, step, device=device, dtype=torch.float)
-    
-        elif self.insertion_mode == "random":
-    
-            def sampler(max_age, device):
-                n_tokens = int(max_age // step)
-                if n_tokens <= 0:
-                    return None
-    
-                return torch.rand(
-                    n_tokens,
-                    generator=self._generator,
-                    device=device,
-                ) * max_age
-        else:
-            raise NotImplementedError
+            return 0.0
+        return self.no_event_token_rate * DAYS_PER_YEAR
 
-        return sampler
+    def _counts(self, max_ages: torch.Tensor) -> torch.Tensor:
+        step = self.step
+        if step <= 0:
+            return torch.zeros_like(max_ages, dtype=torch.long)
+        return torch.floor(max_ages / step).to(torch.long).clamp_min(0)
 
+    def sample(self, max_ages: torch.Tensor):
+        """
+        Vectorized sampler.
+
+        Parameters
+        ----------
+        max_ages : (n_subjects,) float tensor
+
+        Returns
+        -------
+        ages_flat : (total_tokens,) float tensor   or None if total_tokens==0
+        subj_idx  : (total_tokens,) long tensor    indices in [0..n_subjects-1] or None
+        """
+        if max_ages is None or max_ages.numel() == 0:
+            return None, None
+
+        device = max_ages.device
+        step = self.step
+        if step <= 0:
+            return None, None
+
+        counts = self._counts(max_ages)
+        total = int(counts.sum().item())
+        if total == 0:
+            return None, None
+
+        subj_idx = torch.repeat_interleave(torch.arange(max_ages.numel(), device=device), counts)
+        max_rep = torch.repeat_interleave(max_ages, counts)
+
+        mode = self.insertion_mode
+
+        if mode == "random":
+            if self._generator is not None and self._generator.device == device:
+                u = torch.rand(total, device=device, generator=self._generator, dtype=max_ages.dtype)
+            else:
+                u = torch.rand(total, device=device, dtype=max_ages.dtype)
+            ages = u * max_rep
+            return ages, subj_idx
+
+        if mode == "regular":
+            # within-subject index: 1..count
+            offsets = torch.cumsum(
+                torch.cat([torch.zeros(1, device=device, dtype=counts.dtype), counts[:-1]]),
+                dim=0,
+            )
+            within = torch.arange(total, device=device) - torch.repeat_interleave(offsets, counts)
+            k = within + 1  # 1..count
+            ages = k.to(max_ages.dtype) * step
+            # safe clamp (mostly unnecessary for regular, but consistent)
+            ages = torch.minimum(ages, max_rep)
+            return ages, subj_idx
+
+        if mode == "grid_jitter":
+            sigma = self.jitter_sigma
+            if sigma is None:
+                sigma = step / 5.0
+
+            offsets = torch.cumsum(
+                torch.cat([torch.zeros(1, device=device, dtype=counts.dtype), counts[:-1]]),
+                dim=0,
+            )
+            within = torch.arange(total, device=device) - torch.repeat_interleave(offsets, counts)
+            k = within + 1
+            base = k.to(max_ages.dtype) * step
+
+            if self._generator is not None and self._generator.device == device:
+                noise = torch.randn(total, device=device, generator=self._generator, dtype=max_ages.dtype) * float(sigma)
+            else:
+                noise = torch.randn(total, device=device, dtype=max_ages.dtype) * float(sigma)
+            ages = base + noise
+            ages = ages.clamp(min=0.0)
+            ages = torch.minimum(ages, max_rep)
+            return ages, subj_idx
+
+        raise NotImplementedError(f"Unknown insertion_mode: {mode}")
 
     def __call__(self, max_age):
-        return self.sampler(max_age, device=self.device)
+        """
+        Backward compatible scalar API.
+        Returns a 1D tensor of ages (or None), same as before.
+        """
+        if max_age is None:
+            return None
 
+        if not torch.is_tensor(max_age):
+            max_ages = torch.tensor([float(max_age)], device=self.device, dtype=torch.float32)
+        else:
+            max_ages = max_age.reshape(1).to(device=self.device)
+
+        ages, subj_idx = self.sample(max_ages)
+        if ages is None:
+            return None
+        # all ages correspond to the single subject
+        return ages
+
+# —————————————————————————— MAIN DELPHI CLASS ————————————————————————————————————————————————————
 
 class Delphi(torch.nn.Module):
     
@@ -945,6 +1044,14 @@ class Delphi(torch.nn.Module):
         return list(self.config.domains.keys())
 
     @property
+    def categorical_domains(self):
+        return [ k for k in self.config.domains.keys() if self.config.domains[k].type == "categorical" ]
+
+    @property
+    def continuous_domains(self):
+        return [ k for k in self.config.domains.keys() if self.config.domains[k].type == "continuous" ]
+
+    @property
     def domain_to_int(self):
         return self.embed.domain_to_int
         # return { dname: i for i, dname in enumerate(self.embed.domain_embed.keys()) }
@@ -974,6 +1081,27 @@ class Delphi(torch.nn.Module):
             self._vocab_lens = { self.domain_to_int[k]: v.vocab_len for k, v in self.embed.domain_embed.items() }
         return self._vocab_lens
 
+    @property
+    def offsets_per_domain(self):
+        if not hasattr(self, "_offsets_per_domain"):
+            self._offsets_per_domain = self.get_offset_per_domain()
+        return self._offsets_per_domain
+
+
+    def get_offset_per_domain(self):
+        
+        offsets_per_domain = np.array([0] + list(self.vocab_lens.values())).cumsum()[:-1]
+        offsets_per_domain = torch.tensor(offsets_per_domain).to(self.device)
+        return offsets_per_domain
+
+        
+    def local_to_global_ids(self, domain_ids, local_ids):
+
+        offsets = self.offsets_per_domain[domain_ids]
+        global_ids = offsets + local_ids
+        return global_ids
+
+    #
     
     def _build_trace(self, x, ages, emb, subject_ids, domains):
 
@@ -985,7 +1113,7 @@ class Delphi(torch.nn.Module):
             domains=domains.detach()
         )
 
-
+    
     def build_attn_mask(self, domains, x, ages):
 
         single_mask = self.transformer.attn_mask_builder[0][0].build(domains, x, ages)
@@ -1023,9 +1151,6 @@ class Delphi(torch.nn.Module):
         emb += self.transformer.age_embedding(ages)
         emb  = self.transformer.drop(emb)
         
-        # transform this into
-        # attn_mask = self.build_mask(ages, domains) # [B, n_layer, n_head, L, L] <- revise these dimensions.
-
         attn_mask = self.build_attn_mask(domains, x, ages)
         
         h, att = emb, []
@@ -1240,69 +1365,58 @@ class Delphi(torch.nn.Module):
     
         else:
             raise NotImplementedError(f"Unknown padding mode: {padding_mode}")
+        
     
-
     def insert_no_event_tokens(
         self,
         tokens,
         ages,
         subject_ids,
-        max_ages,        
+        max_ages,
     ):
-    
-        NO_EVENT_TOKEN = self.embed['padding'].NO_EVENT_TOKEN
+        NO_EVENT_TOKEN = self.embed["padding"].NO_EVENT_TOKEN
         device = max_ages.device
     
-        pad_tokens = []
-        pad_ages = []
-        pad_subjects = []
-    
-        warned = False
-    
+        # Subjects present in the batch (real subject_ids), sorted for stable alignment
         batch_subjects = torch.unique(
             torch.cat([subject_ids[d] for d in subject_ids if d != "padding"]),
-            sorted=True
+            sorted=True,
         )
-        
-        # mapping: subject_id real -> local batch index
-        subject_to_batch = { int(s.item()): i for i, s in enumerate(batch_subjects) }       
-        
-        for subj_id in batch_subjects:          
-            
-            b = subject_to_batch[subj_id.int().item()]            
-            
-            max_age = float(max_ages[b].item())
     
-            if not self._subject_allows_no_events(max_age, self.age_sampler.insertion_mode):
-                continue
+        # Assumption (same as your old code): max_ages is aligned with batch_subjects order.
+        # If your get_max_ages_per_subject uses a different ordering, fix it there (or reorder here).
     
-            pad = self.age_sampler(max_age)        
+        # --- vectorized "allows no-events" (replaces _subject_allows_no_events) ---
+        step = float(self.age_sampler.step)
+        mode = self.age_sampler.insertion_mode
     
-            if pad is None or pad.numel() == 0:
-                if self.age_sampler.insertion_mode == "regular" and not warned:
-                    warnings.warn(
-                        "Some subjects have max_age too small for regular no-event padding. "
-                        "No no-event tokens were inserted for them (expected behavior)."
-                    )
-                    warned = True
-                continue
+        if step <= 0:
+            return tokens, ages, subject_ids
     
-            pad_tokens.append(
-                torch.full((pad.numel(),), NO_EVENT_TOKEN, device=device, dtype=torch.long)
-            )
-            pad_ages.append(pad)
-            pad_subjects.append(
-                torch.full((pad.numel(),), subj_id, device=device, dtype=torch.long)
+        # In both modes, counts = floor(max_age/step); allow iff counts > 0
+        counts = torch.floor(max_ages / step).to(torch.long)
+        allows = counts > 0
+    
+        # Preserve your warning behavior for "regular"
+        if mode == "regular" and torch.any(~allows):
+            warnings.warn(
+                "Some subjects have max_age too small for regular no-event padding. "
+                "No no-event tokens were inserted for them (expected behavior)."
             )
     
-        if pad_tokens:
-            tokens["padding"] = torch.cat(pad_tokens)
-            ages["padding"] = torch.cat(pad_ages)
-            subject_ids["padding"] = torch.cat(pad_subjects)
+        # Zero-out disallowed subjects so sampler produces 0 tokens for them
+        max_ages_eff = torch.where(allows, max_ages, torch.zeros_like(max_ages))
     
-        if "padding" in subject_ids:
-            pass
-
+        pad_ages, subj_idx = self.age_sampler.sample(max_ages_eff)  # vectorized
+        if pad_ages is None or pad_ages.numel() == 0:
+            return tokens, ages, subject_ids
+    
+        # Build padding tensors in one shot
+        n_pad = pad_ages.numel()
+        tokens["padding"] = torch.full((n_pad,), NO_EVENT_TOKEN, device=device, dtype=torch.long)
+        ages["padding"] = pad_ages
+        subject_ids["padding"] = batch_subjects[subj_idx].to(device=device, dtype=torch.long)
+    
         return tokens, ages, subject_ids
    
      
@@ -1397,34 +1511,12 @@ class Delphi(torch.nn.Module):
     def get_embedding_at_age(self, x, ages, readout_age):
         raise NotImplementedError
 
-
-    def get_offset_per_domain(self):
-        
-        offsets_per_domain = np.array([0] + list(self.vocab_lens.values())).cumsum()[:-1]
-        offsets_per_domain = torch.tensor(offsets_per_domain).to(self.device)
-        return offsets_per_domain
-
-
-    @property
-    def offsets_per_domain(self):
-        if not hasattr(self, "_offsets_per_domain"):
-            self._offsets_per_domain = self.get_offset_per_domain()
-        return self._offsets_per_domain
-
-        
-    def local_to_global_ids(self, domain_ids, local_ids):
-
-        offsets = self.offsets_per_domain[domain_ids]
-        global_ids = offsets + local_ids
-        return global_ids
-
-
     def add_token_domain(self, new_token_domain):
         raise NotImplementedError("add_token_domain method not yet implemented.")
     
 
     # —————————————————————————————————————————————————————————————————————————————————————
-            
+
     def from_dicts_to_tensors(self, x, ages, embeddings, subject_ids):
 
         '''
@@ -1436,10 +1528,15 @@ class Delphi(torch.nn.Module):
         output:
         
         '''
-
-        all_tokens, all_embeddings, all_ages, all_domains, all_subjects = [], [], [], [], []
+        
+        all_tokens, \
+        all_embeddings, \
+        all_ages, \
+        all_domains, \
+        all_subjects = [], [], [], [], []
     
-        for domain_idx, dname in enumerate(x.keys()):
+        # for domain_idx, dname in enumerate(x.keys()):
+        for domain_idx, dname in enumerate(self.categorical_domains):
             t = x[dname]
             a = ages[dname]
             e = embeddings[dname]
@@ -1461,8 +1558,11 @@ class Delphi(torch.nn.Module):
         subjects_flat   = torch.cat(all_subjects)
     
         # sort once by (subject, age)
-        order = torch.argsort(ages_flat, stable=True)
-        order = order[torch.argsort(subjects_flat[order], stable=True)]
+        AGE_SCALE = 365.25 * 100
+        key = subjects_flat * AGE_SCALE + ages_flat
+        order = torch.argsort(key)
+        # order = torch.argsort(ages_flat, stable=True)
+        # order = order[torch.argsort(subjects_flat[order], stable=True)]
     
         tokens_flat     = tokens_flat[order]
         ages_flat       = ages_flat[order]
@@ -1506,23 +1606,33 @@ class Delphi(torch.nn.Module):
 
     def get_tensors_from_batch(self, batch):
         
-        tokens, ages, subject_ids = EasyDict(), EasyDict(), EasyDict()
+        tokens, \
+        ages, \
+        subject_ids = EasyDict(), EasyDict(), EasyDict()
         
         for dname in batch:               
+
             SUBJECT_ID_COLUMN, AGE_COLUMN, TOKEN_COLUMN = 0, 1, 2
             domain_data = batch.get(dname, [])  
             if len(domain_data) == 0:
                 domain_data = domain_data.view(0, 3)
-            if dname == "genetic_pcs":
-                tokens[dname] = domain_data[:, 1:-1].float()
-                ages[dname] = domain_data[:, -1]
-                subject_ids[dname] = domain_data[:, 0]
+            if dname in self.continuous_domains:
+                tokens[dname] = domain_data[:, 2:].float()
             else:    
                 tokens[dname] = domain_data[:, TOKEN_COLUMN].int()
-                ages[dname] = domain_data[:, AGE_COLUMN]
-                subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
 
-        return tokens, ages, subject_ids
+            ages[dname]        = domain_data[:, AGE_COLUMN]
+            subject_ids[dname] = domain_data[:, SUBJECT_ID_COLUMN]
+
+            if dname in self.continuous_domains:
+                dim = self.config.domains['genetic_pcs'].n_latent_tokens
+                ages[dname] = ages[dname][0].repeat(dim)
+                subject_ids[dname] = subject_ids[dname][0].repeat(dim)
+        
+        return \
+            tokens, \
+            ages, \
+            subject_ids
 
 
     def adjust_to_seqlen(self,
@@ -1544,26 +1654,34 @@ class Delphi(torch.nn.Module):
         domains = self.domains
     
         # Count total tokens per subject (excluding padding)
-        if domains:
-            all_sids = torch.cat([subject_ids[d] for d in domains])
-            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
-            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
-        else:
-            total_per_subject = {}
+        # if domains:
+        #    all_sids = torch.cat([subject_ids[d] for d in domains])
+        #    subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
+        #    total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
+        # else:
+        #     total_per_subject = {}
+        
+        all_sids          = torch.cat([subject_ids[d] for d in domains])
+        subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
+        total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
     
         # Step 1: truncate subjects with too many tokens
-        x, ages, subject_ids = self.truncate_subjects_by_age(
+        x, \
+        ages, \
+        subject_ids = self.truncate_subjects_by_age(
             x, ages, subject_ids, total_per_subject, seqlen, trim_domains
         )
     
         # Step 2: recompute totals (after truncation)
-        if domains:
-            all_sids = torch.cat([subject_ids[d] for d in domains])
-            subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
-            total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
+        # if domains:
+        all_sids          = torch.cat([subject_ids[d] for d in domains])
+        subj_uniq, counts = np.unique(all_sids.cpu().int().numpy(), return_counts=True)
+        total_per_subject = {int(k): int(v) for k, v in zip(subj_uniq, counts)}
     
         # Step 3: pad subjects that are still short
-        x, ages, subject_ids = self.pad_subjects(
+        x, \
+        ages, \
+        subject_ids = self.pad_subjects(
             x, ages, subject_ids, total_per_subject, seqlen, pad_domain, PADDING_TOKEN, PAD_AGE
         )
     
