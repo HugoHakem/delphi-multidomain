@@ -14,12 +14,21 @@ sys.path.insert(0, DELPHI_DIR)
 
 MLFLOW_TRACKING_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns" ) )
 
-from delphi.model import (
+from torch.utils.data import DataLoader
+
+from delphi.model_v2 import (
     Delphi,
     DomainConfig,
     DelphiConfig
 )
 
+from delphi.optim import OptimConfig
+
+from data.dataset_v2 import (
+    DelphiDataset,
+    DelphiCollateFn,
+    AgeSampler,
+)
 
 def load_domain_config(cfg_path, tokens_path):
 
@@ -258,14 +267,18 @@ def config_from_runid(runid):
     runinfo.data.params['domains'] = ast.literal_eval(runinfo.data.params['domains'])
     runinfo.data.params['domains'] = { k: DomainConfig(**v) for k, v in runinfo.data.params['domains'].items() }
     for param, value in runinfo.data.params.items():
-        if "drop"in param:
+        if "drop" in param:
             runinfo.data.params[param] = float(value)
-        if param in {"n_embd", "n_head", "n_layer", "block_size", "n_layer"}:
+        if param in {"n_embd", "n_head", "n_layer", "block_size"}:
             runinfo.data.params[param] = int(value)
+        if param in {"seed"}:
+            runinfo.data.params[param] = int(value)
+        if param in {"no_event_token_rate"}:
+            runinfo.data.params[param] = float(value)
         if param in {"zero_inflate", "bias"}:
-            runinfo.data.params[param] = True if runinfo.data.params[param] == "True" else False                    
+            runinfo.data.params[param] = True if runinfo.data.params[param] == "True" else False
     # ------------------------------------------------------------------------------------------------
-    
+
     tracking_uri = Path(os.path.dirname(mlflow.get_tracking_uri()))
 
     ckpt_dir = tracking_uri / (artifact_uri + "/checkpoints")
@@ -274,39 +287,80 @@ def config_from_runid(runid):
         raise FileNotFoundError(f"No checkpoints found for run {runid}")
     latest_ckpt = ckpt_files[-1]
 
-    print(f"Loading latest checkpoint: {latest_ckpt}")
+    print(f"Loading latest checkpoint: {latest_ckpt}")    
+    
+    optim_config_raw = runinfo.data.params.pop("optim_config")
+    if isinstance(optim_config_raw, str):
+        # MLflow stores params as strings; parse "OptimConfig(k=v, ...)" back to a dict
+        m = re.match(r"OptimConfig\((.*)\)$", optim_config_raw, re.DOTALL)
+        if m:
+            optim_kwargs = dict(re.findall(r"(\w+)=([^,)]+)", m.group(1)))
+            optim_kwargs = {k: ast.literal_eval(v) for k, v in optim_kwargs.items()}
+            optim_config = OptimConfig(**optim_kwargs)
+        else:
+            raise ValueError(f"Cannot parse optim_config string: {optim_config_raw!r}")
+    else:
+        optim_config = optim_config_raw
     delphi_cfg = DelphiConfig(**runinfo.data.params)
-    model = Delphi(delphi_cfg).to(DEVICE)
+    model = Delphi(delphi_cfg)
     ckpt = torch.load(latest_ckpt)
 
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
-    weights = ckpt['state_dict']
-    model.load_state_dict(weights, strict=False)
-    torch.compile(model)
-    
-    optimizer, scheduler = configure_optimizers(model=model, cfg=OptimConfig(), device_type=DEVICE)                      
-    if "optimizer_state" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-    if "scheduler_state" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state"])
+    model.load_state_dict(ckpt['state_dict'], strict=False)
 
-    DDS = DelphiDataset
-    datasets = [
-        train_dataset := DDS(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['train_ids']).to("cuda"),
-        valid_dataset := DDS(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['valid_ids']).to("cuda"),
-        test_dataset  := DDS(root="../data/transforms", domains=delphi_cfg.domains, subjects=ckpt['metadata']['test_ids']).to("cuda")
-    ]
+    root_path = DELPHI_DIR / "data" / "transforms"
+    continuous_domains = {
+        dname: cfg.n_latent_tokens or 1
+        for dname, cfg in delphi_cfg.domains.items()
+        if cfg.type == "continuous"
+    }
+
+    dataset_kwargs = dict(
+        root=root_path,
+        domains_cfg=delphi_cfg.domains,
+        domain_to_int=model.domain_to_int,
+        block_size=delphi_cfg.block_size,
+        exclusions=[],
+        required_domains=["diseases"],
+        no_event_token_rate=delphi_cfg.no_event_token_rate,
+        no_event_insertion_mode=delphi_cfg.no_event_token_insertion_mode,
+        continuous_domains=continuous_domains,
+        age_domains=["diseases", "death"],
+    )
+
+    train_dataset = DelphiDataset(subjects=ckpt['metadata']['train_ids'], **dataset_kwargs)
+    valid_dataset = DelphiDataset(subjects=ckpt['metadata']['valid_ids'], **dataset_kwargs)
+    test_dataset  = DelphiDataset(subjects=ckpt['metadata']['test_ids'],  **dataset_kwargs)
+
+    age_sampler = AgeSampler(
+        insertion_mode=delphi_cfg.no_event_token_insertion_mode,
+        token_rate=delphi_cfg.no_event_token_rate,
+        seed=delphi_cfg.seed,
+    )
+
+    collate = DelphiCollateFn(
+        age_sampler=age_sampler,
+        block_size=delphi_cfg.block_size,
+        domain_to_int=model.domain_to_int,
+        domain_offsets=model.domain_offsets,
+        padding_domain_id=model.domain_to_int["padding"],
+        no_event_token_id=1,
+        continuous_domains=continuous_domains,
+    )
 
     dataloaders = [
-        train_loader := DelphiDataloader(train_dataset, batch_size=batch_size),
-        valid_loader := DelphiDataloader(valid_dataset, batch_size=VAL_BATCH_SIZE), 
-        test_loader  := DelphiDataloader(test_dataset,  batch_size=VAL_BATCH_SIZE)
-    ]    
+        DataLoader(train_dataset, batch_size=batch_size,    shuffle=True,  pin_memory=True, collate_fn=collate),
+        DataLoader(valid_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
+        DataLoader(test_dataset,  batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
+    ]
 
     previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
-    logged_params = { "test_fold": test_fold, "batch_size": batch_size }    
+    logged_params = { "test_fold": test_fold, "batch_size": batch_size }
 
-    return model, dataloaders, optimizer, scheduler, logged_params, previous_run_name
+    optimizer_state  = ckpt.get("optimizer_state", None)
+    scheduler_state  = ckpt.get("scheduler_state", None)
+
+    return model, dataloaders, optim_config, optimizer_state, scheduler_state, start_epoch, logged_params, previous_run_name
 
 
 def migrate_legacy_state_dict(weights: dict) -> dict:
