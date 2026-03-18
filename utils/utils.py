@@ -16,7 +16,7 @@ MLFLOW_TRACKING_URI = Path( os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlrun
 
 from torch.utils.data import DataLoader
 
-from delphi.model_v2 import (
+from delphi.model import (
     Delphi,
     DomainConfig,
     DelphiConfig
@@ -24,7 +24,7 @@ from delphi.model_v2 import (
 
 from delphi.optim import OptimConfig
 
-from data.dataset_v2 import (
+from data.dataset import (
     DelphiDataset,
     DelphiCollateFn,
     AgeSampler,
@@ -36,10 +36,14 @@ def load_domain_config(cfg_path, tokens_path):
 
     cfg = {}
     for domain, params in raw.items():
+        if domain == "padding":
+            continue  # always injected automatically below
         p = dict(params)
         if "path" in p:
             p["path"] = tokens_path / p["path"]
         cfg[domain] = DomainConfig(**p)
+
+    cfg["padding"] = DomainConfig(projector="embed")
 
     return cfg
 

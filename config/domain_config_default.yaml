@@ -46,5 +46,3 @@ genetic_pcs:
   input_size: 40
   n_latent_tokens: 5
 
-padding:
-  projector: embed

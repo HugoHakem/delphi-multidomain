@@ -43,16 +43,16 @@ _To be completed_
 from pathlib import Path
 tokens_path = Path("./data/tokens")
 domain_config = {
-   'diseases':      DomainConfig(projector="embed", path=tokens_path / 'diseases',       predict=True), # default is predict=False 
+   'diseases':      DomainConfig(projector="embed", path=tokens_path / 'diseases',       predict=True), # default is predict=False
    'death':         DomainConfig(projector="embed", path=tokens_path / 'death',          predict=True),
-   'drugs':         DomainConfig(projector="embed", path=tokens_path / 'drugs',          predict=True),
-   'lifestyle':     DomainConfig(projector="embed", path=tokens_path / 'lifestyle',      age_jitter=True),  
+   'cv_drugs':      DomainConfig(projector="embed", path=tokens_path / 'cv_drugs',       predict=True),
+   'lifestyle':     DomainConfig(projector="embed", path=tokens_path / 'lifestyle',      age_jitter=True),
    "hla_alleles":   DomainConfig(projector="embed", path=tokens_path / 'hla_alleles',    at_birth=True),
    "sex":           DomainConfig(projector="embed", path=tokens_path / 'sex',            at_birth=True),
-   "padding":       DomainConfig(projector="embed")
    "rare_variants": DomainConfig(projector="embed", path=tokens_path / 'rare_variants',  at_birth=True),
 }
 ```
+The `padding` domain is added automatically — no need to specify it.
 Then you need to create a folder for the domain, e.g. `./data/tokens/rare_variants` with two files, named `tokens.csv` and `tokenizer.yaml`.
 - `tokens.csv` contains `subject_id`, `age` (in days) and `token_id`, one row per token (all subjects together).
 - `tokenizer.yaml` contains each token in order, and from this order the mapping to `token_id` is established. Note that the token indexing is zero-based, meaning that the first element of `tokenizer.yaml` gets assigned index `0` in `tokens.csv`.
@@ -62,49 +62,54 @@ The attention scheme within and across domains is specified via a string command
 
 #### Example 1: Fully causal attention (with tie-masking, i.e. no same-time attention)
 For instance:
-`"[sex,diseases,lifestyle,death,padding,hla_alleles,rare_variants]:causal(mask_ties=True)"`
+`"[sex,diseases,lifestyle,death,hla_alleles,rare_variants]:causal(mask_ties=True)"`
 
-The corresponding 
-| From \ To        | HLA | sex | diseases | lifestyle | death | padding |
-|------------------|-------------|-----|----------|-----------|-------|---------|
-| **HLA**  | · | · | · | · | · | · |
-| **sex**          | ← | · | · | · | · | · |
-| **diseases**     | ← | ← | ← | · | · | · |
-| **lifestyle**    | ← | ← | ← | ← | · | · |
-| **death**        | ← | ← | ← | ← | ← | · |
-| **padding**      | ← | ← | ← | ← | ← | ← |
+The corresponding attention matrix:
+
+| From \ To    | HLA | sex | diseases | lifestyle | death |
+|--------------|-----|-----|----------|-----------|-------|
+| **HLA**      | ·   | ·   | ·        | ·         | ·     |
+| **sex**      | ←   | ·   | ·        | ·         | ·     |
+| **diseases** | ←   | ←   | ←        | ·         | ·     |
+| **lifestyle**| ←   | ←   | ←        | ←         | ·     |
+| **death**    | ←   | ←   | ←        | ←         | ←     |
 
 In this configuration, all domains follow a strictly causal structure.
 Each domain may attend to **past tokens of itself and previous domains**, but never to the future
 nor to same-time tokens (`mask_ties=True`).
 
+You can also use the `all` alias to refer to every domain at once (brackets are optional):
+`"all:causal(mask_ties=True)"`
+
+This is equivalent to listing every domain explicitly and is handy when you don't want to enumerate them.
+
 #### Example 2 — Bidirectional HLA block + causal domains
 On the other hand:
-`"[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,hla_alleles,padding]:causal(mask_ties=True)"`
+`"[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"`
 
-| From \ To        | HLA | sex | diseases | lifestyle | death | padding |
-|------------------|-------------|-----|----------|-----------|-------|---------|
-| **HLA**  | ↔ | ↔ | · | · | · | · |
-| **sex**          | ↔ | ↔ | · | · | · | · |
-| **diseases**     | ← | ← | ← | · | · | · |
-| **lifestyle**    | ← | ← | ← | ← | · | · |
-| **death**        | ← | ← | ← | ← | ← | · |
-| **padding**      | ← | ← | ← | ← | ← | ← |
+| From \ To    | HLA | sex | diseases | lifestyle | death |
+|--------------|-----|-----|----------|-----------|-------|
+| **HLA**      | ↔   | ↔   | ·        | ·         | ·     |
+| **sex**      | ↔   | ↔   | ·        | ·         | ·     |
+| **diseases** | ←   | ←   | ←        | ·         | ·     |
+| **lifestyle**| ←   | ←   | ←        | ←         | ·     |
+| **death**    | ←   | ←   | ←        | ←         | ←     |
 
 Here, the HLA allele and sex domains form a **bidirectional static block**, allowing mutual
 contextualization of at-birth attributes. All downstream domains follow a causal structure,
 ensuring temporal consistency while allowing conditioning on static information.
 
 ### Exemplar command
-This is an exemplar training command, training with the usual domains (`diseases,lifestyle,sex,death,padding`) plus the `rare_variants` domain:
+This is an exemplar training command, training with the usual domains (`diseases,lifestyle,sex,death`) plus the `rare_variants` domain:
 ```
 python train.py \
-  --domains diseases,death,lifestyle,sex,rare_variants,padding \
-  --attention_scheme "[sex,diseases,lifestyle,death,padding,rare_variants]:causal(mask_ties=True)" \
+  --domains diseases,death,lifestyle,sex,rare_variants \
+  --attention_scheme "[sex,diseases,lifestyle,death,rare_variants]:causal(mask_ties=True)" \
   --n_layer 12 \
   --n_embd 240 \
   --experiment_name rare_variants
 ```
+Note: `padding` is added automatically and does not need to be listed in `--domains` or `--attention_scheme`.
 
 ### Model tracking with MLflow
 You can specify a custom MLflow location by setting the `MLFLOW_TRACKING_URI` environment variable, otherwise it's the `mlruns` folder within this repo's root directory.

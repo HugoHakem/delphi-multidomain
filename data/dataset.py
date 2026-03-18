@@ -1,143 +1,179 @@
-#%%
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+"""
+Refactored Delphi dataset & collate.
 
-import time
-from contextlib import nullcontext
-from pathlib import Path
-from ast import literal_eval
-from pprint import pprint
-from collections import defaultdict
-from dataclasses import asdict, dataclass, field
-from typing import Iterator, Optional, List, Dict, Set, Any, Tuple
-from easydict import EasyDict
-import yaml
+Key changes vs. the original dataset.py
+----------------------------------------
+1.  All cached data lives on **CPU**.  The DataLoader with num_workers > 0
+    does the heavy lifting; pin_memory=True handles the transfer.
+2.  The Dataset stores three pre-built tensors of shape
+        [N_subjects, block_size]
+    for domain_ids, local_token_ids and ages, plus metadata vectors
+    real_counts and max_ages (both [N_subjects]).
+3.  __getitem__ returns *copies* of a single subject's row (safe for workers).
+4.  A standalone CollateFn class (no model dependency) performs:
+        collate → insert no-event tokens → sort → compute global IDs
+    and returns tensors ready for the model.
+"""
 
+from __future__ import annotations
+
+import os
 import warnings
 import logging
+from pathlib import Path
+from copy import deepcopy
+from typing import (
+    Any, Callable, Dict, List, Optional, Set, Tuple, Union,
+)
+from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-
-from copy import deepcopy
-
+import yaml
 import torch
 from torch.utils.data import Dataset, DataLoader
-
-from delphi.optim import OptimConfig, configure_optimizers
-from typing import Union, Callable
+from easydict import EasyDict
 
 DAYS_PER_YEAR = 365.25
-DEVICE = os.getenv("DEVICE", 'cuda' if torch.cuda.is_available() else 'cpu')
-
 logger = logging.getLogger(__name__)
 
-# ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DelphiBatch
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DelphiBatch:
+    """
+    Everything the model needs for a single forward pass.
+    Produced by DelphiCollateFn, consumed by Delphi.forward.
+    """
+    global_token_ids: torch.Tensor                    # [B, T]  int
+    domain_ids: torch.Tensor                          # [B, T]  int
+    ages: torch.Tensor                                # [B, T]  float
+    subject_ids: torch.Tensor                         # [B]     int
+    continuous_data: Dict[str, torch.Tensor]           # {name: [B, dim]}
+    continuous_positions: Dict[str, torch.Tensor]      # {name: [B, n_latent]}
+
+    def to(self, device: Union[str, torch.device]) -> "DelphiBatch":
+        """Move all tensors to device."""
+        return DelphiBatch(
+            global_token_ids=self.global_token_ids.to(device),
+            domain_ids=self.domain_ids.to(device),
+            ages=self.ages.to(device),
+            subject_ids=self.subject_ids.to(device),
+            continuous_data={
+                k: v.to(device) for k, v in self.continuous_data.items()
+            },
+            continuous_positions={
+                k: v.to(device) for k, v in self.continuous_positions.items()
+            },
+        )
+
+    @property
+    def batch_size(self) -> int:
+        return self.global_token_ids.shape[0]
+
+    @property
+    def seq_len(self) -> int:
+        return self.global_token_ids.shape[1]
+
+    def __repr__(self) -> str:
+        return (
+            f"DelphiBatch(B={self.batch_size}, T={self.seq_len}, "
+            f"continuous={list(self.continuous_data.keys())})"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TokenDomain  (unchanged from original, kept here for self-containedness)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TokenDomain:
+    """
+    Single token domain: loads tokenizer.yaml + tokens.csv.
     
-    """
-    Representation of a single token domain in the Delphi-style event model.
-
-    A TokenDomain encapsulates all information associated with one domain
-    (e.g. diseases, drugs, labs, demographics), including:
-    - the tokenizer definition (tokenizer.yaml),
-    - the per-subject token occurrences (tokens.csv),
-    - metadata controlling how tokens are interpreted in time and during training.
-
-    The domain can be either categorical (discrete token IDs) or continuous
-    (real-valued observations), and may optionally be restricted to a subset
-    of subjects.
-
-    Parameters
-    ----------
-    path : str
-        Path to the domain directory. Must contain:
-        - tokenizer.yaml : list-like definition of tokens
-        - tokens.csv     : per-subject token occurrences
-    predict : bool
-        Whether this domain is a prediction target.
-    age_jitter : bool
-        Whether age jittering is applied to this domain.
-    type : {"categorical", "continuous"}
-        Domain type. Determines the expected schema of tokens.csv.
-    subjects : set or None, optional
-        Optional subset of subject IDs to keep. If None, all subjects are loaded.
-    at_birth : bool, default False
-        If True, all token ages are forced to zero. A warning is raised if
-        non-zero ages are found.
-    aggregation_strategy : callable or None, optional
-        Placeholder for future aggregation logic. Currently not implemented.
-
-    Notes
-    -----
-    - Internally, tokens are stored both as a pandas DataFrame (for inspection)
-      and as a torch.Tensor (for efficient downstream processing).
-    - The tensor representation follows the column order of tokens.csv.
-    - Subject filtering can be applied at load time or later via `filter_subjects`.
-    - Aggregation strategies are explicitly not implemented yet.
-
-    Raises
-    ------
-    AssertionError
-        If `type` is not one of {"categorical", "continuous"}.
-    ValueError
-        If required columns are missing from tokens.csv.
-    NotImplementedError
-        If `aggregation_strategy` is provided.
+    If `subdomain` is specified, loads token_metadata.csv from the same
+    directory to filter tokens by a metadata column (e.g. locus) and
+    remaps token IDs to a contiguous sub-vocabulary.
     """
 
-    REQUIRED_FILES = {
-        "tokens": "tokens.csv",
-        "tokenizer": "tokenizer.yaml",
-    }
-
-    BASE_COLUMNS = ["subject_id"]
-    CATEGORICAL_COLUMNS = ["token_id"]
-    CONTINUOUS_COLUMNS = ["token_id", "value"]
-    AGE_COLUMN = "age"
-
-    def __init__(self,
-            name: str,
-            path: Union[str, Path],
-            predict: bool, 
-            age_jitter: bool, 
-            type: str, 
-            subjects: Union[None, set]=None, 
-            at_birth=False, 
-            aggregation_strategy: Union[None, Callable]=None
-        ):
-        
-        """
-        Load a single domain: tokenizer.yaml + tokens.csv
-        """
-
+    def __init__(
+        self,
+        name: str,
+        path: Union[str, Path],
+        predict: bool,
+        age_jitter: bool,
+        type: str,
+        subjects: Optional[set] = None,
+        at_birth: bool = False,
+        aggregation_strategy: Optional[Callable] = None,
+        subdomain: Optional[str] = None,
+        subdomain_column: str = "locus",
+        metadata_file: str = "token_metadata.csv",
+    ):
         self.name = name
-        self.path = path
+        self.path = Path(path)
         self.predict = predict
-        self.age_jitter = age_jitter        
+        self.age_jitter = age_jitter
         self.at_birth = at_birth
-        self.type = type        
+        self.type = type
+        self.subdomain = subdomain
 
-        assert type in ["categorical", "continuous"], f"Domain type must be either 'categorical' or 'continuous', got {type}"
-       
-        self.tokens    = self._load_tokens(os.path.join(path, "tokens.csv"), subjects=subjects)
-        
-        # an int -> token name dict
-        self.tokenizer = self._load_tokenizer(os.path.join(path, "tokenizer.yaml"))        
-        
-        self.aggregation_strategy = aggregation_strategy
+        assert type in ("categorical", "continuous"), (
+            f"Domain type must be 'categorical' or 'continuous', got {type}"
+        )
+
+        # Load full tokenizer first
+        full_tokenizer = self._load_tokenizer(self.path / "tokenizer.yaml")
+
+        # If subdomain, filter tokenizer and build remap
+        if subdomain is not None:
+            metadata_path = self.path / metadata_file
+            assert metadata_path.exists(), (
+                f"subdomain='{subdomain}' requires {metadata_path} to exist. "
+                f"Generate it with generate_hla_metadata.py."
+            )
+            meta_df = pd.read_csv(metadata_path)
+            assert subdomain_column in meta_df.columns, (
+                f"Column '{subdomain_column}' not found in {metadata_path}. "
+                f"Available: {meta_df.columns.tolist()}"
+            )
+
+            # Filter metadata to this subdomain
+            sub_meta = meta_df[meta_df[subdomain_column] == subdomain]
+            assert len(sub_meta) > 0, (
+                f"No tokens found for subdomain='{subdomain}' in column '{subdomain_column}'. "
+                f"Available values: {meta_df[subdomain_column].unique().tolist()}"
+            )
+
+            # old_id -> new_id (contiguous from 0)
+            old_ids = sorted(sub_meta["token_id"].tolist())
+            self._old_to_new = {old: new for new, old in enumerate(old_ids)}
+            self._new_to_old = {new: old for old, new in self._old_to_new.items()}
+
+            # Filter tokenizer
+            self.tokenizer = {
+                self._old_to_new[old_id]: full_tokenizer[old_id]
+                for old_id in old_ids
+            }
+
+            logger.info(
+                "TokenDomain '%s': subdomain '%s' → %d/%d tokens",
+                name, subdomain, len(self.tokenizer), len(full_tokenizer),
+            )
+        else:
+            self._old_to_new = None
+            self.tokenizer = full_tokenizer
+
+        # Load tokens (with subdomain filtering and remapping)
+        self.tokens = self._load_tokens(self.path / "tokens.csv", subjects)
 
         if aggregation_strategy is not None:
             raise NotImplementedError
 
-    @property
-    def tokens_path(self) -> Path:
-        return self.path / self.REQUIRED_FILES["tokens"]
-
-    @property
-    def tokenizer_path(self) -> Path:
-        return self.path / self.REQUIRED_FILES["tokenizer"]
+    # ---- properties ----------------------------------------------------------
 
     @property
     def vocab_len(self) -> int:
@@ -147,453 +183,930 @@ class TokenDomain:
 
     @property
     def subject_ids(self):
-        return self.tokens[:, 0].cpu().numpy()
+        return self.tokens[:, 0].numpy()
 
-    def _check_required_files(self) -> None:
-        missing = [
-            fname
-            for fname in self.REQUIRED_FILES.values()
-            if not (self.path / fname).exists()
-        ]
+    # ---- loaders -------------------------------------------------------------
 
-        if missing:
-            raise FileNotFoundError(
-                f"Missing required files in domain '{self.name}': {missing}"
-            )
-
-
-    def _expected_columns(self) -> set:
-        cols = set(self.BASE_COLUMNS)
-
-        if self.type == "categorical":
-            cols |= self.CATEGORICAL_COLUMNS
-        else:
-            cols |= self.CONTINUOUS_COLUMNS
-
-        cols.add(self.AGE_COLUMN)
-        return cols
-
-
-    def _validate_schema(self, df: pd.DataFrame, path: Path) -> None:
-        expected = self._expected_columns()
-        missing = expected - set(df.columns)
-
-        if missing:
-            raise ValueError(
-                f"Invalid tokens file {path}. "
-                f"Missing required columns: {sorted(missing)}"
-            )
-
-
-    def _load_tokenizer(self, path: str) -> Dict:
+    def _load_tokenizer(self, path: Path) -> Dict[int, str]:
         with open(path, "r") as f:
-            tokenizer = yaml.safe_load(f)        
-        return { idx: token for idx, token in enumerate(tokenizer) }  
+            tokenizer = yaml.safe_load(f)
+        return {idx: token for idx, token in enumerate(tokenizer)}
 
+    def _load_tokens(self, path: Path, subjects: Optional[set]) -> torch.Tensor:
+        assert path.exists(), f"Tokens file {path} does not exist"
 
-    def _load_tokens(self, path: str, subjects) -> pd.DataFrame:
-                
-        if not os.path.exists(path):
-            assert False, f"Tokens file {path} does not exist"
-            if self.type == "categorical":
-                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [self.CATEGORICAL_COLUMNS])
-            elif self.type == "continuous":
-                return pd.DataFrame(columns=[BASE_COLUMNS] + [AGE_COLUMN] + [self.CONTINUOUS_COLUMNS])
-        
         df = pd.read_csv(path)
 
-        # enforce schema
         if "subject_id" not in df.columns:
-            raise ValueError(f"Invalid tokens file {path}, must contain subject_id")
-        if self.type == "categorical" and any([col not in df.columns for col in self.CATEGORICAL_COLUMNS]):
-            raise ValueError(f"Invalid tokens file {path}, must contain {self.CATEGORICAL_COLUMNS} since type==categorical")
-        if self.type == "continuous" and any([col not in df.columns for col in self.CONTINUOUS_COLUMNS]):
-            raise ValueError(f"Invalid tokens file {path}, must contain both {self.CONTINUOUS_COLUMNS} since type==continuous")
+            raise ValueError(f"tokens file {path} must contain subject_id")
+        if self.type == "categorical" and "token_id" not in df.columns:
+            raise ValueError(f"tokens file {path} must contain token_id (categorical)")
+        if self.type == "continuous":
+            for col in ("token_id", "value"):
+                if col not in df.columns:
+                    raise ValueError(f"tokens file {path} must contain {col} (continuous)")
+
+        # Filter by subdomain if applicable
+        if self._old_to_new is not None:
+            valid_old_ids = set(self._old_to_new.keys())
+            df = df[df["token_id"].isin(valid_old_ids)].copy()
+            df["token_id"] = df["token_id"].map(self._old_to_new)
 
         df = df.sort_values("subject_id")
-        
+
         if self.at_birth:
             if "age" in df.columns and (df["age"] != 0).any():
                 warnings.warn(
-                    "at_birth=True but non-zero ages found in dataframe. "
-                    "All ages will be overwritten to 0.",
-                    UserWarning
-                )                    
+                    "at_birth=True but non-zero ages found. All ages set to 0.",
+                    UserWarning,
+                )
             df["age"] = 0
 
-        df = df.query("subject_id in @subjects") if subjects is not None else df
+        if subjects is not None:
+            df = df.query("subject_id in @subjects")
 
         self._as_dataframe = df
+        # Always store on CPU
+        return torch.tensor(df.values)
 
-        return torch.tensor(df.values) 
-    
-    
-    def filter_subjects(self, subjects: set):
-        
-        filtered_domain = deepcopy(self._as_dataframe)
-        isin_subset = filtered_domain.subject_id.isin(subjects).values
-        self.tokens = self.tokens[isin_subset]
-        self._as_dataframe = self._as_dataframe[isin_subset]
+    # ---- filtering -----------------------------------------------------------
+
+    def filter_subjects(self, subjects: set) -> "TokenDomain":
+        isin = self._as_dataframe.subject_id.isin(subjects).values
+        self.tokens = self.tokens[isin]
+        self._as_dataframe = self._as_dataframe[isin]
         return self
-
 
     def __len__(self):
         return len(self._as_dataframe)
-
 
     def __repr__(self):
         return str(self._as_dataframe)
 
 
-    def _repr_html_(self):
-        return self.tokens.\
-            assign( **{"age (years)": (self.tokens.age / DAYS_PER_YEAR).round(2)} ).\
-            drop("age", axis=1)._repr_html_()
-             
-    
-    def __getitem__(self, subject_id):
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AgeSampler  (standalone, no model dependency)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        return self.tokens.set_index("subject_id").loc[[subject_id]]
-            # .\
-            # assign( **{"age (years)": lambda df: (df.age / DAYS_PER_YEAR).round(2)} ).\
-            # drop("age", axis=1)
+class AgeSampler:
+    """
+    Vectorized no-event-token age sampler.
+    Modes: "regular", "random", "grid_jitter".
+    Always operates on CPU.
+    """
 
-    
-    def as_dataframe(self):
+    def __init__(
+        self,
+        insertion_mode: str = "regular",
+        token_rate: float = 1.0,
+        seed: Optional[int] = None,
+        jitter_sigma: Optional[float] = None,
+    ):
+        self.insertion_mode = insertion_mode
+        self.no_event_token_rate = float(token_rate)
+        self.seed = seed
+        self.jitter_sigma = jitter_sigma
 
-        return self._as_data_frame.assign(
-            token_id=lambda df: pd.Categorical(df["token_id"].map(self.tokenizer), categories=self.tokenizer.values())
+        self._generator = None
+        if seed is not None:
+            self._generator = torch.Generator(device="cpu")
+            self._generator.manual_seed(seed)
+
+    @property
+    def step(self) -> float:
+        if self.no_event_token_rate <= 0:
+            return 0.0
+        return self.no_event_token_rate * DAYS_PER_YEAR
+
+    def _counts(self, max_ages: torch.Tensor) -> torch.Tensor:
+        step = self.step
+        if step <= 0:
+            return torch.zeros_like(max_ages, dtype=torch.long)
+        return torch.floor(max_ages / step).to(torch.long).clamp_min(0)
+
+    def sample(self, max_ages: torch.Tensor):
+        """
+        Parameters
+        ----------
+        max_ages : (B,) float tensor (CPU)
+
+        Returns
+        -------
+        ages_flat : (total,) float tensor | None
+        subj_idx  : (total,) long tensor  | None   (indices into max_ages)
+        """
+        if max_ages is None or max_ages.numel() == 0:
+            return None, None
+
+        step = self.step
+        if step <= 0:
+            return None, None
+
+        counts = self._counts(max_ages)
+        total = int(counts.sum().item())
+        if total == 0:
+            return None, None
+
+        subj_idx = torch.repeat_interleave(
+            torch.arange(max_ages.numel()), counts
         )
+        max_rep = torch.repeat_interleave(max_ages, counts)
 
-# —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————    
+        mode = self.insertion_mode
 
-@dataclass
-class SinglePatientTrajectory:
-    subject_id: int
-    token_ids: torch.Tensor        # shape: [L] (local token ids)
-    domain_ids: torch.Tensor       # shape: [L] (domain index per token)
-    token_ages: torch.Tensor       # shape: [L] (float ages)
-    metadata: Dict[str, Any]       # arbitrary extra info (sex, cohort, etc.)
-    tokenizer: Optional[Any] = None
+        if mode == "random":
+            u = torch.rand(total, generator=self._generator, dtype=max_ages.dtype)
+            return u * max_rep, subj_idx
 
-# ————————————————————————————————————————————————————————————————————————————————————————— 
+        if mode == "regular":
+            offsets = torch.cumsum(
+                torch.cat([torch.zeros(1, dtype=counts.dtype), counts[:-1]]), dim=0,
+            )
+            within = torch.arange(total) - torch.repeat_interleave(offsets, counts)
+            ages = (within + 1).to(max_ages.dtype) * step
+            ages = torch.minimum(ages, max_rep)
+            return ages, subj_idx
 
-class DelphiDataset:
+        if mode == "grid_jitter":
+            sigma = self.jitter_sigma if self.jitter_sigma is not None else step / 5.0
+            offsets = torch.cumsum(
+                torch.cat([torch.zeros(1, dtype=counts.dtype), counts[:-1]]), dim=0,
+            )
+            within = torch.arange(total) - torch.repeat_interleave(offsets, counts)
+            base = (within + 1).to(max_ages.dtype) * step
+            noise = torch.randn(total, generator=self._generator, dtype=max_ages.dtype) * sigma
+            ages = (base + noise).clamp(min=0.0)
+            ages = torch.minimum(ages, max_rep)
+            return ages, subj_idx
 
-    def __init__(self, 
-        root: str, 
-        domains_cfg: dict, 
-        subjects: Union[str, List[str]] = None, 
-        exclusions: List[str] = [], 
-        n_samples=None, 
-        required_domains=['sex', 'diseases'], 
-        device=DEVICE):
+        raise NotImplementedError(f"Unknown insertion_mode: {mode}")
 
-        """
-        Args:
-            root: base data directory
-            domains: list of domain names (e.g. ["diagnosis", "lifestyle", "sex", "death"])
-            exclusions: list of exclusion filenames under exclusion_lists/
-        """
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DelphiDataset
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DelphiDataset(Dataset):
+    """
+    Caches all data as CPU tensors of shape [N_subjects, block_size].
+
+    Three parallel tensors:
+        domain_ids       [N, block_size]  int
+        local_token_ids  [N, block_size]  int
+        ages             [N, block_size]  float
+
+    Plus metadata:
+        real_counts      [N]              int   (number of real tokens per subject)
+        max_ages         [N]              float (max age per subject, for no-event sampling)
+        subject_ids      [N]              int   (actual subject IDs, for traceability)
+
+    Padding slots are filled with:
+        domain_id  = padding_domain_id
+        token_id   = PADDING_TOKEN (0)
+        age        = PADDING_AGE (-10000)
+    """
+
+    PADDING_TOKEN = 0
+    PADDING_AGE = -10000.0
+
+    def __init__(
+        self,
+        root: str,
+        domains_cfg: dict,
+        domain_to_int: Dict[str, int],
+        block_size: int,
+        subjects: Union[str, List[str]] = None,
+        exclusions: List[str] = [],
+        n_samples: Optional[int] = None,
+        required_domains: List[str] = ["sex", "diseases"],
+        # no-event token config (for validation at setup time)
+        no_event_token_rate: float = 5.0,
+        no_event_insertion_mode: str = "random",
+        # continuous domain metadata
+        continuous_domains: Optional[Dict[str, int]] = None,  # {name: n_latent_tokens}
+        age_domains: Optional[List[str]] = None,  # domains to consider for max_age
+    ):
+        super().__init__()
 
         self.root = Path(root)
-
-        if device is not None:
-            self._device = device
-
+        self.block_size = block_size
         self.domain_configs = domains_cfg
+        self.domain_to_int = domain_to_int
+        self.int_to_domain = {v: k for k, v in domain_to_int.items()}
+        self.padding_domain_id = domain_to_int["padding"]
+        self.continuous_domains = continuous_domains or {}
+        self.age_domains = age_domains or ["diseases", "death"]
 
-        # Load the data        
+        # ── Load raw domains ──────────────────────────────────────────────
         self.domains = EasyDict()
         for dname, dinfo in domains_cfg.items():
-            
             if dname == "padding":
                 continue
-
-            datafile = self.root / "tokens" / dname
+            # Use path from config (allows multiple domains to share the same data dir)
+            datafile = Path(dinfo.path) if Path(dinfo.path).is_absolute() else self.root / "tokens" / dinfo.path
             self.domains[dname] = TokenDomain(
                 dname,
-                datafile, 
-                predict=dinfo.predict, 
-                age_jitter=dinfo.age_jitter, 
-                type=dinfo.type, 
-                at_birth=dinfo.at_birth
+                datafile,
+                predict=dinfo.predict,
+                age_jitter=dinfo.age_jitter,
+                type=dinfo.type,
+                at_birth=dinfo.at_birth,
+                subdomain=getattr(dinfo, "subdomain", None),
             )
 
         logger.info(
-            "Initializing DelphiDataset | root=%s | domains=%s | required_domains=%s",
-            str(self.root),
-            list(domains_cfg.keys()),
-            required_domains
+            "DelphiDataset | root=%s | domains=%s | required=%s",
+            self.root, list(domains_cfg.keys()), required_domains,
         )
 
-        # ——————————————————— DEFINE ALLOWED SUBJECTS —————————————————————————————————
+        # ── Resolve subject set ───────────────────────────────────────────
         if subjects is None:
-            raise ValueError("You must provide either subject IDs or paths to subject lists.")
+            raise ValueError("Must provide subject IDs or paths to subject lists.")
 
-        # detect if subjects are files or IDs
         if isinstance(subjects, (str, Path)):
             subjects = [subjects]
 
         if all(isinstance(s, (str, Path)) and os.path.exists(s) for s in subjects):
-            # subjects are file paths
-            included_subjects = pd.concat([
-                pd.read_csv(self.root / subj_file, names=["subject_id"]) for subj_file in subjects
+            included = pd.concat([
+                pd.read_csv(self.root / f, names=["subject_id"]) for f in subjects
             ])
         else:
-            # assume it's a list/array of IDs
-            included_subjects = pd.DataFrame({"subject_id": subjects})
+            included = pd.DataFrame({"subject_id": subjects})
 
-        self.included_subjects = included_subjects
-        logger.info("Included subjects: %d", len(self.included_subjects))
-    
-        self.excluded_subjects = self.get_excluded_subjects(exclusion_files=exclusions)
+        excluded = self._get_excluded_subjects(exclusions)
         if exclusions:
-            logger.info(
-                "Excluding %d subjects using files: %s",
-                len(self.excluded_subjects),
-                exclusions
-            )
+            logger.info("Excluding %d subjects from %s", len(excluded), exclusions)
 
-        self._subjects = self.included_subjects[~self.included_subjects["subject_id"].astype(str).isin(self.excluded_subjects)]
-        self._subjects = self.filter_subj_for_required_domains(self._subjects, required_domains)        
+        subject_df = included[~included["subject_id"].astype(str).isin(excluded)]
+        subject_df = self._filter_for_required_domains(subject_df, required_domains)
+        logger.info("Subjects after required-domain filter: %d", len(subject_df))
 
-        logger.info(
-            "Subjects after required domain filtering (%s): %d",
-            required_domains,
-            len(self._subjects)
-         )
- 
         if n_samples is not None:
-            logger.info("Subsampling subjects to n_samples=%d", n_samples)
-            self._subjects = self._subjects.sample(n_samples)
-        
-        self._subjects = set(self._subjects.subject_id.to_list())
-        
+            logger.info("Subsampling to n_samples=%d", n_samples)
+            subject_df = subject_df.sample(n_samples)
 
-        # —————————————————————————————————————————————————————————————————————————————
+        subject_set = set(subject_df.subject_id.tolist())
 
-        # Now we filter each domain for the final list of allowed subjects
+        # ── Filter domains ────────────────────────────────────────────────
         for dname in self.domains:
-            filtered_domain = self.domains[dname].filter_subjects(self.subjects)            
-            
-            assert len(filtered_domain) != 0, f"""\n{'—'*80}
-Error: Domain '{dname}' has no tokens. 
-Here are a few original subjects and a few allowed subjects to help you troubleshoot:
-{self.subjects[:10]}
-and
-{self.domains[dname]}
-{'—'*80}
-"""
-            self.domains[dname] = filtered_domain
+            self.domains[dname].filter_subjects(subject_set)
+            assert len(self.domains[dname]) > 0, f"Domain '{dname}' has no tokens after filtering."
 
-        # —————————————————————————————————————————————————————————————————————————————
+        # ── Build subject index ───────────────────────────────────────────
+        self._subject_indices = self._precompute_subject_indices()
 
-        # of internal use, for faster slicing
-        self._subject_indices = self._precompute_subject_indices_per_domain()
+        # ── Collect tokenizers for friendly view ──────────────────────────
+        self.tokenizers = {
+            dname: dom.tokenizer for dname, dom in self.domains.items()
+        }
 
-        self.to(self._device)
+        # ── Build cache ───────────────────────────────────────────────────
+        self._build_cache(subject_set, block_size, no_event_token_rate)
 
-        print(f"Final subject count: {len(self._subjects)}")
-        self._cached_data = self.cache_all_data()
-        print(f"Data loading complete. Dataset initialized with {len(self._subjects)} subjects and domains: {list(self.domains.keys())}")
-           
+        print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, "
+              f"domains={list(self.domains.keys())}")
 
-    @property
-    def device(self):
-        if "_device" not in self.__dict__:
-            self._device = [ self.domains[dname].tokens.device for dname in self.domains ][0]
-        return self._device
+    # ── Private helpers ───────────────────────────────────────────────────
 
-    @property
-    def subjects(self):
-        if not hasattr(self, "_subjects_as_list"):
-            self._subjects_as_list = list(self._subjects)
-        return self._subjects_as_list
+    def _get_excluded_subjects(self, exclusion_files: List[str]) -> set:
+        excluded = set()
+        for excl in exclusion_files:
+            excl_path = self.root / excl
+            if excl_path.exists():
+                ids = excl_path.read_text().strip().splitlines()
+                excluded |= set(map(str, ids))
+        return excluded
 
-
-    # This returns all data (all subjects and domains) merged into a single dataframe
-    def merge_data(self):
-        return pd.concat([ self.domains[dname].tokens for dname in self.domains ]).\
-            sort_index().\
-            sort_values(['age'])
-
-
-    def list_domains(self):
-        return list(self.domains.keys())
-
-
-    def filter_subj_for_required_domains(self, subjects: pd.DataFrame, required_domains: List[str]) -> pd.DataFrame:
-        
-        """
-        Keep only subjects that have at least one token in all required domains.
-        """
-        
-        for dname in required_domains:
+    def _filter_for_required_domains(
+        self, subjects: pd.DataFrame, required: List[str]
+    ) -> pd.DataFrame:
+        for dname in required:
             if dname not in self.domains:
-                logging.debug(f"Required domain '{dname}' not found in self.domains. Returning empty DataFrame.")
+                logger.debug("Required domain '%s' not in self.domains", dname)
                 return subjects.iloc[0:0]
-
-            # Get set of subjects present in this domain
-            # domain_subjects = self.domains[dname].tokens["subject_id"].astype(str).unique()
-            domain_subjects = self.domains[dname]._as_dataframe["subject_id"].astype(str).unique()
-            logging.debug(f"Domain '{dname}': {len(domain_subjects)} unique subjects.")
-
-            # Intersect with current subject list
-            before_count = len(subjects)
-            subjects = subjects[subjects["subject_id"].astype(str).isin(domain_subjects)]
-            after_count = len(subjects)
-            logging.debug(
-                f"Filtered by domain '{dname}': {before_count} → {after_count} subjects remaining."
-            )
-
+            domain_sids = self.domains[dname]._as_dataframe["subject_id"].astype(str).unique()
+            subjects = subjects[subjects["subject_id"].astype(str).isin(domain_sids)]
         return subjects
 
-
-    def get_excluded_subjects(self, exclusion_files):
-        
-        self.excluded_subjects = set()
-        for excl in exclusion_files:
-            excl_path = os.path.join(root, excl)
-            if os.path.exists(excl_path):
-                ids = open(excl_path).read().strip().splitlines()
-                self.excluded_subjects |= set(map(str, ids))        
-        return self.excluded_subjects
- 
-
-    @staticmethod
-    def is_ukb_id(index):
-        return index > 1000000         
-
-
-    def to(self, device):
-        for dname in self.domains:
-            self.domains[dname].tokens = self.domains[dname].tokens.to(device)
-        return self
-
-
-    def _precompute_subject_indices_per_domain(self):
-
-        '''
-        pre-computes indices for each subject in each domain for fast slicing
-        returns something like:
-          { 'domain_1' : {
-                id_1: (0, 18), <- (start_index, token_count)
-                id_2: (18, 17), ... }
-            'domain_2' : {
-                id_1: (0, 4),
-                id_2: (4, 6), ... }
-            }
-        '''
-
-        subject_indices = {}
-        for domain in self.list_domains():
-            ids, counts = np.unique(self.domains[domain].subject_ids, return_counts=True)
-            counts = np.array([0] + counts.tolist())
-            pp = [ (int(x), int(y)) for x, y in zip(np.cumsum(counts)[:-1], counts[1:])]
-            subject_indices[domain] = { int(id): pp[i] for i, id in enumerate(ids) }
-        
-        self._subject_indices = subject_indices
-        return self._subject_indices
-
-    
-    def __len__(self):
-        return len(self.subjects)  
-
-
-    def get_subject_events(self, subject_id: str) -> Dict[str, pd.DataFrame]:
-        
+    def _precompute_subject_indices(self) -> Dict[str, Dict[int, Tuple[int, int]]]:
         """
-        Return all events for a subject, per domain.
-        """        
-        subject_events = {}
-        for dname, domain in self.domains.items():
+        {domain: {subject_id: (start_idx, count)}}
+        """
+        indices = {}
+        for dname, dom in self.domains.items():
+            ids, counts = np.unique(dom.subject_ids, return_counts=True)
+            cumcounts = np.concatenate([[0], np.cumsum(counts)])
+            indices[dname] = {
+                int(sid): (int(cumcounts[i]), int(counts[i]))
+                for i, sid in enumerate(ids)
+            }
+        return indices
+
+    def _get_subject_events(self, subject_id: int) -> Dict[str, torch.Tensor]:
+        """
+        Return per-domain tensors for one subject.
+        Each tensor has columns matching the raw tokens.csv layout.
+        """
+        events = {}
+        for dname, dom in self.domains.items():
             try:
                 start, count = self._subject_indices[dname][subject_id]
-                tokens_subj  = domain.tokens[start:(start+count)]
-                
-                if self.domain_configs[dname].type == "continuous":
-                    tokens_subj = torch.cat([
-                        torch.tensor([tokens_subj[0][0]], device=self.device).unsqueeze(1),
-                        torch.tensor([tokens_subj[0][3]], device=self.device).unsqueeze(1),
-                        tokens_subj[:,2].reshape(-1, self.domain_configs[dname].input_size)                
-                    ], axis=1)
-
-            except KeyError as e:
+                events[dname] = dom.tokens[start : start + count]
+            except KeyError:
                 if self.domain_configs[dname].type == "continuous":
                     dim = self.domain_configs[dname].input_size
-                    tokens_subj = torch.empty(0, dim+2, dtype=torch.float32, device=self.device)
+                    events[dname] = torch.empty(0, dim + 2, dtype=torch.float32)
                 else:
-                    tokens_subj = torch.empty(0, 3, dtype=torch.float32, device=self.device)
-            subject_events[dname] = tokens_subj         
-        
-        return subject_events
+                    events[dname] = torch.empty(0, 3, dtype=torch.float32)
+        return events
 
-    def cache_all_data(self):
+    def _build_cache_slow(self, subject_set: set, block_size: int, no_event_token_rate: float):
+        """
+        Original Python-loop implementation of _build_cache (kept for reference/benchmarking).
+        """
+        sorted_subjects = sorted(subject_set)
+        N = len(sorted_subjects)
 
-        self._cached_data = {}
-        for _, subject_id in enumerate(self.subjects):
-            if subject_id not in self._cached_data:                
-                self._cached_data[subject_id] = self.get_subject_events(subject_id)
-        
-        return self._cached_data
+        domain_ids = torch.full((N, block_size), self.padding_domain_id, dtype=torch.long)
+        local_token_ids = torch.full((N, block_size), self.PADDING_TOKEN, dtype=torch.long)
+        ages = torch.full((N, block_size), self.PADDING_AGE, dtype=torch.float32)
+        real_counts = torch.zeros(N, dtype=torch.long)
+        max_ages_vec = torch.zeros(N, dtype=torch.float32)
+        subject_id_vec = torch.tensor(sorted_subjects, dtype=torch.long)
+
+        # For continuous domains: store raw values separately
+        continuous_cache = {}
+        for cd_name, n_latent in self.continuous_domains.items():
+            continuous_cache[cd_name] = torch.zeros(N, self.domain_configs[cd_name].input_size, dtype=torch.float32)
+
+        step = no_event_token_rate * DAYS_PER_YEAR
+
+        # Pre-compute column indices per domain (avoid repeated lookups)
+        domain_col_indices = {}
+        for dname, dom in self.domains.items():
+            cols = dom._as_dataframe.columns.tolist()
+            domain_col_indices[dname] = {
+                "age": cols.index("age"),
+                "token_id": cols.index("token_id") if "token_id" in cols else None,
+                "value": cols.index("value") if "value" in cols else None,
+            }
+
+        truncation_count = 0
+        min_real_tokens = float("inf")
+        max_real_tokens = 0
+
+        for i, sid in enumerate(sorted_subjects):
+            events = self._get_subject_events(sid)
+
+            # Collect all tokens for this subject into a flat list
+            tokens_list = []  # list of (domain_id, local_token_id, age)
+
+            for dname, ev in events.items():
+                if ev.numel() == 0:
+                    continue
+                d_id = self.domain_to_int[dname]
+                dcfg = self.domain_configs[dname]
+                cidx = domain_col_indices[dname]
+
+                if dcfg.type == "continuous":
+                    # ev has shape [input_size, n_cols] where each row is
+                    # one component: (subject_id, token_id, value, age)
+                    if ev.shape[0] > 0:
+                        continuous_cache[dname][i] = ev[:, cidx["value"]]
+                        age_val = float(ev[0, cidx["age"]])
+                        n_latent = self.continuous_domains.get(dname, 1)
+                        for lt in range(n_latent):
+                            tokens_list.append((d_id, 0, age_val))
+                else:
+                    for row_idx in range(ev.shape[0]):
+                        age_val = float(ev[row_idx, cidx["age"]])
+                        if age_val < 0:
+                            continue  # skip tokens with negative ages
+                        tok_val = int(ev[row_idx, cidx["token_id"]])
+                        tokens_list.append((d_id, tok_val, age_val))
+
+            n_real = len(tokens_list)
+
+            # Compute max age from age_domains
+            max_age = -float("inf")
+            for ad in self.age_domains:
+                if ad in events and events[ad].numel() > 0:
+                    age_col = domain_col_indices[ad]["age"]
+                    max_age = max(max_age, float(events[ad][:, age_col].max()))
+            if max_age == -float("inf"):
+                max_age = 0.0
+
+            # Track truncation stats
+            if step > 0:
+                max_noevents = int(max_age // step)
+                total_needed = n_real + max_noevents
+                if total_needed > block_size:
+                    truncation_count += 1
+                    min_real_tokens = min(min_real_tokens, n_real)
+                    max_real_tokens = max(max_real_tokens, n_real)
+
+            # Sort by (age, domain_id)
+            tokens_list.sort(key=lambda t: (t[2], t[0]))
+
+            # Fill cache (truncate to block_size if necessary)
+            n_fill = min(n_real, block_size)
+            for j in range(n_fill):
+                domain_ids[i, j] = tokens_list[j][0]
+                local_token_ids[i, j] = tokens_list[j][1]
+                ages[i, j] = tokens_list[j][2]
+
+            real_counts[i] = n_fill
+            max_ages_vec[i] = max_age
+
+        # Summary warning for truncated subjects
+        if truncation_count > 0:
+            warnings.warn(
+                f"{truncation_count}/{N} subjects will have no-event tokens truncated "
+                f"(block_size={block_size}, real tokens range: "
+                f"{min_real_tokens}–{max_real_tokens}).",
+                UserWarning,
+            )
+
+        # Store everything
+        self._domain_ids = domain_ids
+        self._local_token_ids = local_token_ids
+        self._ages = ages
+        self._real_counts = real_counts
+        self._max_ages = max_ages_vec
+        self._subject_ids = subject_id_vec
+        self._continuous_cache = continuous_cache
+
+        # Build subject_id -> index mapping
+        self._sid_to_idx = {int(sid): i for i, sid in enumerate(sorted_subjects)}
+
+    def _build_cache(
+        self,
+        subject_set: set,
+        block_size: int,
+        no_event_token_rate: float,
+    ) -> None:
+        """
+        Vectorised cache build using NumPy/PyTorch ops (replaces the Python loop).
+
+        Strategy
+        --------
+        1. Concatenate every categorical domain's data into one flat table
+           (subject_id, domain_id, token_id, age) — all already in memory as tensors.
+        2. Sort the table globally with np.lexsort (subject_idx, age, domain_id).
+        3. Compute each token's position-within-subject via a single np.searchsorted.
+        4. Scatter into the [N, block_size] result tensors in one assignment.
+        5. Compute per-subject max_age with np.maximum.at (one pass per age-domain).
+
+        Continuous domains are still handled per-subject (same as _build_cache_slow)
+        because they are typically absent or very small.
+        """
+        sorted_subjects    = sorted(subject_set)
+        N                  = len(sorted_subjects)
+        sorted_subjects_np = np.array(sorted_subjects, dtype=np.int64)
+
+        # ── Pre-filled padding tensors ────────────────────────────────────────
+        domain_ids_out      = torch.full((N, block_size), self.padding_domain_id, dtype=torch.long)
+        local_token_ids_out = torch.full((N, block_size), self.PADDING_TOKEN,     dtype=torch.long)
+        ages_out            = torch.full((N, block_size), self.PADDING_AGE,        dtype=torch.float32)
+
+        # Continuous cache (filled per-subject below, same as original)
+        continuous_cache = {
+            cd_name: torch.zeros(N, self.domain_configs[cd_name].input_size, dtype=torch.float32)
+            for cd_name in self.continuous_domains
+        }
+
+        # ── Column-index lookup (avoid repeated .index() calls) ───────────────
+        domain_col_idx: dict = {}
+        for dname, dom in self.domains.items():
+            cols = dom._as_dataframe.columns.tolist()
+            domain_col_idx[dname] = {
+                "age":      cols.index("age"),
+                "token_id": cols.index("token_id") if "token_id" in cols else None,
+                "value":    cols.index("value")    if "value"    in cols else None,
+            }
+
+        # ── Build global token table for categorical domains ──────────────────
+        cat_sids: list = []
+        cat_dids: list = []
+        cat_tids: list = []
+        cat_ages: list = []
+
+        for dname, dom in self.domains.items():
+            if dom.tokens.shape[0] == 0:
+                continue
+            dcfg = self.domain_configs[dname]
+            cidx = domain_col_idx[dname]
+            d_id = self.domain_to_int[dname]
+
+            if dcfg.type == "continuous":
+                continue  # handled separately
+
+            sids_t = dom.tokens[:, 0].long()
+            ages_t = dom.tokens[:, cidx["age"]].float()
+            tids_t = dom.tokens[:, cidx["token_id"]].long()
+
+            valid  = ages_t >= 0
+            if valid.sum() == 0:
+                continue
+
+            cat_sids.append(sids_t[valid].numpy().astype(np.int64))
+            cat_dids.append(np.full(valid.sum().item(), d_id, dtype=np.int64))
+            cat_tids.append(tids_t[valid].numpy().astype(np.int64))
+            cat_ages.append(ages_t[valid].numpy().astype(np.float32))
+
+        # ── Handle continuous domains (short per-subject loop) ────────────────
+        cont_sids: list = []
+        cont_dids: list = []
+        cont_ages: list = []
+
+        for cd_name in self.continuous_domains:
+            if cd_name not in self.domains:
+                continue
+            dom   = self.domains[cd_name]
+            cidx  = domain_col_idx[cd_name]
+            d_id  = self.domain_to_int[cd_name]
+            n_lat = self.continuous_domains[cd_name]
+
+            for sid, (start, count) in self._subject_indices[cd_name].items():
+                if sid not in subject_set:
+                    continue
+                idx = int(np.searchsorted(sorted_subjects_np, np.int64(sid)))
+                ev  = dom.tokens[start : start + count]
+                continuous_cache[cd_name][idx] = ev[:, cidx["value"]]
+                age_val = float(ev[0, cidx["age"]])
+                cont_sids.extend([sid]  * n_lat)
+                cont_dids.extend([d_id] * n_lat)
+                cont_ages.extend([age_val] * n_lat)
+
+        # Merge categorical + continuous placeholder tokens
+        all_sids_parts = cat_sids.copy()
+        all_dids_parts = cat_dids.copy()
+        all_tids_parts = cat_tids.copy()
+        all_ages_parts = cat_ages.copy()
+
+        if cont_sids:
+            all_sids_parts.append(np.array(cont_sids, dtype=np.int64))
+            all_dids_parts.append(np.array(cont_dids, dtype=np.int64))
+            all_tids_parts.append(np.zeros(len(cont_sids), dtype=np.int64))
+            all_ages_parts.append(np.array(cont_ages, dtype=np.float32))
+
+        if not all_sids_parts:
+            # No tokens at all — store empty cache
+            self._domain_ids       = domain_ids_out
+            self._local_token_ids  = local_token_ids_out
+            self._ages             = ages_out
+            self._real_counts      = torch.zeros(N, dtype=torch.long)
+            self._max_ages         = torch.zeros(N, dtype=torch.float32)
+            self._subject_ids      = torch.tensor(sorted_subjects, dtype=torch.long)
+            self._continuous_cache = continuous_cache
+            self._sid_to_idx       = {int(s): i for i, s in enumerate(sorted_subjects)}
+            return
+
+        all_sids = np.concatenate(all_sids_parts)
+        all_dids = np.concatenate(all_dids_parts)
+        all_tids = np.concatenate(all_tids_parts)
+        all_ages = np.concatenate(all_ages_parts)
+
+        # ── Map subject_id → 0-based subject index ────────────────────────────
+        all_sidx = np.searchsorted(sorted_subjects_np, all_sids)
+
+        # ── Sort by (subject_idx, age, domain_id) ─────────────────────────────
+        # np.lexsort: last key = primary sort key
+        order    = np.lexsort((all_dids, all_ages, all_sidx))
+        all_sidx = all_sidx[order]
+        all_dids = all_dids[order]
+        all_tids = all_tids[order]
+        all_ages = all_ages[order]
+
+        # ── Compute position of each token within its subject ─────────────────
+        subject_starts = np.searchsorted(all_sidx, np.arange(N, dtype=np.int64))
+        pos_within     = np.arange(len(all_sidx), dtype=np.int64) - subject_starts[all_sidx]
+
+        # ── Scatter into result tensors ───────────────────────────────────────
+        mask = pos_within < block_size
+        row  = all_sidx[mask]
+        col  = pos_within[mask]
+
+        domain_ids_out[row, col]      = torch.from_numpy(all_dids[mask])
+        local_token_ids_out[row, col] = torch.from_numpy(all_tids[mask])
+        ages_out[row, col]            = torch.from_numpy(all_ages[mask])
+
+        # ── real_counts = min(tokens_per_subject, block_size) ─────────────────
+        tokens_per_subject = np.bincount(all_sidx, minlength=N).astype(np.int64)
+        real_counts        = torch.from_numpy(np.minimum(tokens_per_subject, block_size))
+
+        # ── max_age per subject from age_domains ──────────────────────────────
+        max_ages_np = np.full(N, -np.inf, dtype=np.float32)
+        for ad in self.age_domains:
+            if ad not in self.domains:
+                continue
+            dom = self.domains[ad]
+            if dom.tokens.shape[0] == 0:
+                continue
+            age_col = domain_col_idx[ad]["age"]
+            sids_ad = dom.tokens[:, 0].numpy().astype(np.int64)
+            ages_ad = dom.tokens[:, age_col].numpy().astype(np.float32)
+            sidx_ad = np.searchsorted(sorted_subjects_np, sids_ad)
+            in_range = sidx_ad < N
+            matches  = in_range & (sorted_subjects_np[np.minimum(sidx_ad, N - 1)] == sids_ad)
+            np.maximum.at(max_ages_np, sidx_ad[matches], ages_ad[matches])
+
+        max_ages_np = np.where(np.isneginf(max_ages_np), 0.0, max_ages_np)
+
+        # ── Truncation warning ────────────────────────────────────────────────
+        step = no_event_token_rate * DAYS_PER_YEAR
+        if step > 0:
+            max_noevents     = (max_ages_np // step).astype(np.int64)
+            total_needed     = tokens_per_subject + max_noevents
+            truncation_count = int((total_needed > block_size).sum())
+            if truncation_count > 0:
+                trunc_real = tokens_per_subject[total_needed > block_size]
+                warnings.warn(
+                    f"{truncation_count}/{N} subjects will have no-event tokens truncated "
+                    f"(block_size={block_size}, real tokens range: "
+                    f"{trunc_real.min()}–{trunc_real.max()}).",
+                    UserWarning,
+                )
+
+        # ── Store ─────────────────────────────────────────────────────────────
+        self._domain_ids       = domain_ids_out
+        self._local_token_ids  = local_token_ids_out
+        self._ages             = ages_out
+        self._real_counts      = real_counts
+        self._max_ages         = torch.from_numpy(max_ages_np)
+        self._subject_ids      = torch.tensor(sorted_subjects, dtype=torch.long)
+        self._continuous_cache = continuous_cache
+        self._sid_to_idx       = {int(s): i for i, s in enumerate(sorted_subjects)}
+
+    # ── Public interface ──────────────────────────────────────────────────
+
+    @property
+    def subject_list(self) -> List[int]:
+        return self._subject_ids.tolist()
+
+    def __len__(self):
+        return self._subject_ids.shape[0]
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """
+        Returns copies of the cached tensors for one subject.
+        Safe for multi-worker DataLoader.
+        """
+        return {
+            "domain_ids": self._domain_ids[index].clone(),
+            "local_token_ids": self._local_token_ids[index].clone(),
+            "ages": self._ages[index].clone(),
+            "real_count": self._real_counts[index].clone(),
+            "max_age": self._max_ages[index].clone(),
+            "subject_id": self._subject_ids[index].clone(),
+            # continuous data
+            "continuous": {
+                dname: self._continuous_cache[dname][index].clone()
+                for dname in self._continuous_cache
+            },
+        }
 
 
-    def __getitem__(self, index):
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CollateFn
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        if not self.is_ukb_id(index) and isinstance(index, int):
-            index = self.subjects[index]        
+class DelphiCollateFn:
+    """
+    Standalone collate function (no model dependency).
 
-        if index not in self._cached_data:            
-            self._cached_data[index] = self.get_subject_events(index)
-        
-        out = self._cached_data[index]        
-        return out
+    Performs:
+    1. Stack subjects into [B, block_size] tensors
+    2. Sample & insert no-event tokens (overwriting padding slots)
+    3. Sort by (age, domain_id) per subject
+    4. Compute global token IDs using domain offsets
 
-# ———————————————————————————————————————————————————————————————————————————————————————————————
+    Parameters
+    ----------
+    age_sampler : AgeSampler
+    block_size : int
+    domain_to_int : dict[str, int]
+    domain_offsets : dict[str, int]
+        {domain_name: offset} for computing global IDs.
+        For projected domains, the offset points to placeholder (zero) embeddings.
+    padding_domain_id : int
+    no_event_token_id : int
+        The local token ID for no-event tokens (typically 1).
+    continuous_domains : dict[str, int]
+        {domain_name: n_latent_tokens}
+    """
 
-def collate_fn_domains(batch):
+    PADDING_AGE = -10000.0
+    PADDING_TOKEN = 0
 
-    domains = defaultdict(list)
-    for item in batch:
-        for d, arr in item.items():
-            domains[d].append(arr)
+    def __init__(
+        self,
+        age_sampler: AgeSampler,
+        block_size: int,
+        domain_to_int: Dict[str, int],
+        domain_offsets: Dict[int, int],   # domain_int -> global offset
+        padding_domain_id: int,
+        no_event_token_id: int = 1,
+        continuous_domains: Optional[Dict[str, int]] = None,
+    ):
+        self.age_sampler = age_sampler
+        self.block_size = block_size
+        self.domain_to_int = domain_to_int
+        self.domain_offsets = domain_offsets
+        self.padding_domain_id = padding_domain_id
+        self.no_event_token_id = no_event_token_id
+        self.continuous_domains = continuous_domains or {}
 
-    sample_device = next(iter(batch[0].values())).device
-    out = {d: torch.cat(lst, dim=0) for d, lst in domains.items()}
+    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
-    if "padding" not in out:
-        out["padding"] = torch.empty((0, 3), dtype=torch.long, device=sample_device)
+        B = len(batch)
+        T = self.block_size
 
-    return out
+        # ── 1. Stack ──────────────────────────────────────────────────────
+        domain_ids = torch.stack([item["domain_ids"] for item in batch])        # [B, T]
+        local_token_ids = torch.stack([item["local_token_ids"] for item in batch])  # [B, T]
+        ages = torch.stack([item["ages"] for item in batch])                    # [B, T]
+        real_counts = torch.stack([item["real_count"] for item in batch])       # [B]
+        max_ages = torch.stack([item["max_age"] for item in batch])             # [B]
+        subject_ids = torch.stack([item["subject_id"] for item in batch])       # [B]
 
+        # Stack continuous data
+        continuous_data = {}
+        for dname in self.continuous_domains:
+            continuous_data[dname] = torch.stack([
+                item["continuous"][dname] for item in batch
+            ])  # [B, dim]
 
-class FlexibleDataLoader(DataLoader):
-    
-    def set_batch_size(self, new_batch_size):
-        return self.__class__(
-            dataset=self.dataset,
-            batch_size=new_batch_size,
-            shuffle = isinstance(self.sampler, torch.utils.data.RandomSampler),
-            sampler=self.sampler,
-            batch_sampler=None,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=self.drop_last,
-            timeout=self.timeout,
-            worker_init_fn=self.worker_init_fn,
-            multiprocessing_context=self.multiprocessing_context,
-            generator=self.generator,
-            prefetch_factor=getattr(self, "prefetch_factor", 2),
-            persistent_workers=getattr(self, "persistent_workers", False)
+        # ── 2. Insert no-event tokens ─────────────────────────────────────
+        noev_ages, noev_subj_idx = self.age_sampler.sample(max_ages)
+
+        if noev_ages is not None and noev_ages.numel() > 0:
+            # Count per subject
+            noev_counts = torch.zeros(B, dtype=torch.long)
+            for b_idx in range(B):
+                mask = noev_subj_idx == b_idx
+                count = mask.sum().item()
+                available = T - int(real_counts[b_idx].item())
+
+                if count > available:
+                    # Truncate: keep the ones with lowest ages
+                    subj_ages = noev_ages[mask]
+                    _, keep_idx = subj_ages.topk(available, largest=False)
+                    # Zero out the ones we're dropping
+                    all_indices = mask.nonzero(as_tuple=True)[0]
+                    drop_indices = all_indices[~torch.isin(
+                        torch.arange(all_indices.numel()), keep_idx
+                    )]
+                    noev_ages[drop_indices] = -1  # sentinel, will be skipped
+                    count = available
+
+                noev_counts[b_idx] = count
+
+            # Now write the surviving no-event tokens into padding slots
+            for b_idx in range(B):
+                mask = (noev_subj_idx == b_idx) & (noev_ages >= 0)
+                b_ages = noev_ages[mask]
+                n = b_ages.numel()
+                if n == 0:
+                    continue
+
+                start = int(real_counts[b_idx].item())
+                end = start + n
+                # These slots are currently padding; overwrite them
+                ages[b_idx, start:end] = b_ages
+                local_token_ids[b_idx, start:end] = self.no_event_token_id
+                domain_ids[b_idx, start:end] = self.padding_domain_id
+
+        # ── 3. Sort by (age, domain_id) per subject ──────────────────────
+        DOMAIN_SCALE = 0.001  # small enough to not affect age ordering
+        sort_key = ages + domain_ids.float() * DOMAIN_SCALE
+        _, sort_indices = sort_key.sort(dim=1)
+
+        domain_ids = domain_ids.gather(1, sort_indices)
+        local_token_ids = local_token_ids.gather(1, sort_indices)
+        ages = ages.gather(1, sort_indices)
+
+        # ── 4. Compute global token IDs ───────────────────────────────────
+        global_token_ids = local_token_ids.clone()
+        for d_int, offset in self.domain_offsets.items():
+            mask = domain_ids == d_int
+            global_token_ids[mask] += offset
+
+        # ── 5. Compute continuous positions ───────────────────────────────
+        continuous_positions = {}
+        for cd_name, n_latent in self.continuous_domains.items():
+            cd_int = self.domain_to_int[cd_name]
+            # For each subject, find the positions of this domain's tokens
+            cd_mask = domain_ids == cd_int  # [B, T]
+            # Gather positions per subject
+            positions = torch.zeros(B, n_latent, dtype=torch.long)
+            for b_idx in range(B):
+                pos = cd_mask[b_idx].nonzero(as_tuple=True)[0]
+                n_found = min(pos.numel(), n_latent)
+                positions[b_idx, :n_found] = pos[:n_found]
+            continuous_positions[cd_name] = positions
+
+        return DelphiBatch(
+            global_token_ids=global_token_ids,
+            domain_ids=domain_ids,
+            ages=ages,
+            subject_ids=subject_ids,
+            continuous_data=continuous_data,
+            continuous_positions=continuous_positions,
         )
 
 
-class DelphiDataloader(FlexibleDataLoader):
-    
-    def __init__(self, dataset, device=None, return_dictionary=True, **kwargs):
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Friendly view
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        self.device = dataset.device if device is None else device
-        collate_fn = collate_fn_domains
-        super().__init__(dataset, collate_fn=collate_fn, **kwargs)
-        
+def create_friendly_view(
+    batch: DelphiBatch,
+    *,
+    int_to_domain_name: Dict[int, str],
+    tokenizers: Dict[str, Dict[int, str]],
+    domain_offsets: Dict[int, int],
+):
+    """
+    Human-readable DataFrame for inspecting trajectories.
+    Works with DelphiBatch — no model or dataset dependency.
+    """
+    global_token_ids = batch.global_token_ids
+    ages = batch.ages
+    domain_ids = batch.domain_ids
+    subject_ids = batch.subject_ids
+
+    B, L = global_token_ids.shape
+
+    # Invert offsets: build (domain_int, offset) sorted by offset descending
+    # to recover local IDs from global IDs
+    offset_list = sorted(domain_offsets.items(), key=lambda x: -x[1])
+
+    rows = []
+    for b in range(B):
+        subject_id = int(subject_ids[b])
+        for pos in range(L):
+            g_id = int(global_token_ids[b, pos])
+            age_days = float(ages[b, pos])
+            d_id = int(domain_ids[b, pos])
+            dname = int_to_domain_name.get(d_id, f"unknown_{d_id}")
+
+            # Recover local token ID
+            offset = domain_offsets.get(d_id, 0)
+            local_id = g_id - offset
+
+            tokenizer = tokenizers.get(dname, {})
+            rows.append({
+                "subject_id": subject_id,
+                "age": round(age_days / DAYS_PER_YEAR, 2),
+                "domain_id": d_id,
+                "domain_name": dname,
+                "token_id": local_id,
+                "token_name": tokenizer.get(local_id, f"unknown_{local_id}"),
+            })
+
+    df = (
+        pd.DataFrame(rows)
+        .sort_values(["subject_id", "age", "domain_id", "token_id"])
+        .reset_index(drop=True)
+    )
+    return df
+
+
+def color_by_domain(row):
+    colors = {
+        "hla_alleles": "background-color: #A0E5E5",
+        "sex": "background-color: #E5F5FF",
+        "lifestyle": "background-color: #B0B0E5",
+        "diseases": "background-color: #FFF5E5",
+        "death": "background-color: #F5E5FF",
+        "padding": "background-color: #F0F0F0",
+    }
+    return [colors.get(row["domain_name"], "")] * len(row)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DataLoader convenience
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_dataloader(
+    dataset: DelphiDataset,
+    batch_size: int,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    collate_fn: Optional[DelphiCollateFn] = None,
+    **kwargs,
+) -> DataLoader:
+    """
+    Convenience wrapper that creates a DataLoader with the Delphi collate.
+    """
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+        **kwargs,
+    )
