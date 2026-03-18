@@ -391,12 +391,46 @@ def migrate_legacy_state_dict(weights: dict) -> dict:
     return new_weights
 
 
+def migrate_domain_embed_to_global_embed(weights: dict, model) -> dict:
+    """
+    Migrate old per-domain embedding weights to the unified global_embed table.
+
+    Old architecture: embed.domain_embed.{domain}.projector.weight  (one nn.Embedding per domain)
+    New architecture: embed.global_embed.weight  (single concatenated embedding table)
+
+    Uses model.embed.domain_offsets and model.embed.domain_to_int to place each
+    per-domain weight at its correct offset in the global table.
+    """
+    old_keys = [k for k in weights
+                if k.startswith("embed.domain_embed.") and k.endswith(".projector.weight")]
+    if not old_keys:
+        return weights
+
+    embed = model.embed
+    global_weight = embed.global_embed.weight.data.clone()
+
+    for key in old_keys:
+        domain = key.split(".")[2]
+        if domain not in embed.domain_to_int:
+            continue
+        d_int = embed.domain_to_int[domain]
+        offset = embed.domain_offsets[d_int]
+        domain_weight = weights[key]
+        vocab_size = domain_weight.shape[0]
+        global_weight[offset: offset + vocab_size] = domain_weight
+
+    new_weights = {k: v for k, v in weights.items()
+                   if not k.startswith("embed.domain_embed.")}
+    new_weights["embed.global_embed.weight"] = global_weight
+    return new_weights
+
+
 def reconstruct_model(run_id):
-    
+
     params = load_run_params(run_id)
 
     attn_scheme = params['attention_scheme']
-    
+
     ckpt, ckpt_path = load_checkpoint(run_id)
 
     weights = ckpt["state_dict"]
@@ -410,6 +444,16 @@ def reconstruct_model(run_id):
 
     domain_cfg = get_domain_configs_from_string(params['domains'])
 
+    # Paths stored in MLflow params are absolute from the training environment.
+    # Re-anchor them using the leaf folder name (e.g. "diseases"), which is
+    # stable relative to DELPHI_DIR / "data/transforms/tokens".
+    tokens_dir = DELPHI_DIR / "data" / "transforms" / "tokens"
+    for dname, dcfg in domain_cfg.items():
+        if dname == "padding" or not getattr(dcfg, "path", None):
+            continue
+        leaf = Path(str(dcfg.path)).name
+        dcfg.path = str(tokens_dir / leaf)
+
     delphi_cfg = DelphiConfig(
         n_embd=n_embd,
         n_layer=n_layer,
@@ -420,6 +464,7 @@ def reconstruct_model(run_id):
 
     # model
     model = Delphi(delphi_cfg)
+    weights = migrate_domain_embed_to_global_embed(weights, model)
     model.load_state_dict(weights, strict=True)
     model.to("cpu")
     model.eval()
