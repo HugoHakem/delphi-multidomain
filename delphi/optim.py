@@ -5,7 +5,7 @@ from functools import partial
 
 import torch
 
-from delphi.model.transformer import LayerNorm
+from delphi.model import LayerNorm
 
 
 @dataclass
@@ -47,8 +47,10 @@ def get_constant_lr(it: int, cfg: OptimConfig) -> float:
 
 
 def configure_optimizers(
-    model: torch.nn.Module, cfg: OptimConfig, device_type: str
+    model: torch.nn.Module, cfg: OptimConfig, device_type: str = None
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
+    if device_type is None:
+        device_type = next(model.parameters()).device.type
     """
     This long function is unfortunately doing something very simple and is being very defensive:
     We are separating out all parameters of the model into two buckets: those that will experience
