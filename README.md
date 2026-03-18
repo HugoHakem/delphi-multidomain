@@ -39,21 +39,44 @@ The code has been tested with the following versions:
 _To be completed_
 
 ### Preparing the data for each domain
-```python
-from pathlib import Path
-tokens_path = Path("./data/tokens")
-domain_config = {
-   'diseases':      DomainConfig(projector="embed", path=tokens_path / 'diseases',       predict=True), # default is predict=False
-   'death':         DomainConfig(projector="embed", path=tokens_path / 'death',          predict=True),
-   'cv_drugs':      DomainConfig(projector="embed", path=tokens_path / 'cv_drugs',       predict=True),
-   'lifestyle':     DomainConfig(projector="embed", path=tokens_path / 'lifestyle',      age_jitter=True),
-   "hla_alleles":   DomainConfig(projector="embed", path=tokens_path / 'hla_alleles',    at_birth=True),
-   "sex":           DomainConfig(projector="embed", path=tokens_path / 'sex',            at_birth=True),
-   "rare_variants": DomainConfig(projector="embed", path=tokens_path / 'rare_variants',  at_birth=True),
-}
+Domains are configured via a YAML file (see `config/domain_config_default.yaml` for a reference).
+Each entry defines one domain and its properties:
+
+```yaml
+diseases:
+  projector: embed
+  path: diseases
+  predict: true
+
+lifestyle:
+  projector: embed
+  path: lifestyle
+  age_jitter: true
+
+sex:
+  projector: embed
+  path: sex
+  at_birth: true
+
+genetic_pcs:
+  type: continuous
+  projector: linear
+  path: genetic_pcs
+  at_birth: true
+  input_size: 40
+  n_latent_tokens: 5
 ```
-The `padding` domain is added automatically — no need to specify it.
-Then you need to create a folder for the domain, e.g. `./data/tokens/rare_variants` with two files, named `tokens.csv` and `tokenizer.yaml`.
+
+Pass the config file via `--domain_config_yaml` and select which domains to activate with `--domains`:
+```
+python train.py --domain_config_yaml config/domain_config_default.yaml --domains diseases,lifestyle,sex ...
+```
+
+The `padding` domain is injected automatically — do not add it to the YAML or `--domains`.
+
+For each domain, create a folder under `data/transforms/tokens/<domain_name>/` with two files:
+- `tokens.csv`: columns `subject_id`, `age` (in days), `token_id` — one row per token event.
+- `tokenizer.yaml`: list of token names in order; position determines `token_id` (zero-based).
 - `tokens.csv` contains `subject_id`, `age` (in days) and `token_id`, one row per token (all subjects together).
 - `tokenizer.yaml` contains each token in order, and from this order the mapping to `token_id` is established. Note that the token indexing is zero-based, meaning that the first element of `tokenizer.yaml` gets assigned index `0` in `tokens.csv`.
 
