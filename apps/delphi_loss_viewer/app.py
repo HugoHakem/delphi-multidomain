@@ -111,6 +111,15 @@ token_display = [
 selected_token = st.sidebar.selectbox("Select token:", token_display)
 token_id = int(selected_token.split(":")[0])
 
+loss_metric = st.sidebar.radio(
+    "Loss metric",
+    options=["log_p_total", "log_p_mean"],
+    help=(
+        "log_p_total: sum of per-batch mean log-p (contribution = frequency × difficulty)\n"
+        "log_p_mean:  mean of per-batch mean log-p (difficulty, frequency-independent)"
+    ),
+)
+
 
 # ---------------------------------------------------------
 # STYLING PARAMETERS
@@ -198,6 +207,7 @@ for runid in selected_runs:
             color_map,
             marker_map,
             linestyle_map,
+            loss_col=loss_metric,
         )
 
         
@@ -233,7 +243,7 @@ fig_total.update_layout(
 label_name = labels[token_id + 1] if token_id < len(labels) else f"Token {token_id}"
 
 fig_token.update_layout(
-    title=f"Loss evolution for {label_name}",
+    title=f"Loss evolution for {label_name}  [{loss_metric}]",
     xaxis_title="Epoch",
     yaxis_title="Loss (log scale)",
     yaxis_type="log",

@@ -29,13 +29,15 @@ def load_token_loss_for_run(runinfo, token_id):
         if df.empty:
             continue
 
-        # normalizamos columnas
-        df = df.rename(columns={
-            df.columns[0]: "token_id",
-            df.columns[1]: "loss"
-        })
+        # New format: [token_id, log_p_total, log_p_mean]
+        # Old format: [token_id, <unnamed value column>]  — keep backwards compat
+        df = df.rename(columns={df.columns[0]: "token_id"})
+        if "log_p_total" not in df.columns:
+            df = df.rename(columns={df.columns[1]: "log_p_total"})
+        if "log_p_mean" not in df.columns:
+            df["log_p_mean"] = df["log_p_total"]   # old runs: treat total as mean too
 
-        df["epoch"] = epoch
+        df["epoch"]    = epoch
         df["subepoch"] = fraction
         dfs.append(df)
 
@@ -54,10 +56,11 @@ def load_token_loss_for_run(runinfo, token_id):
 # ==========================================================
 def add_run_trace_plotly(fig, runinfo, df_sel, ema_alpha,
                          attr_color, attr_marker, attr_linestyle,
-                         color_map, marker_map, linestyle_map):
+                         color_map, marker_map, linestyle_map,
+                         loss_col="log_p_total"):
 
     epochs = df_sel["epoch"].values
-    losses = (-df_sel["loss"]).clip(lower=1e-8).values
+    losses = (-df_sel[loss_col]).clip(lower=1e-8).values
     ema = exponential_moving_average(losses, alpha=ema_alpha)
 
     color, mk_mpl, ls_mpl = resolve_visuals(
