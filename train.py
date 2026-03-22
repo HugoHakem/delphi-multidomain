@@ -47,6 +47,7 @@ from utils.utils import load_domain_config
 
 root_path = DELPHI_DIR / "data" / "transforms"
 ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config" / "attention_schemes.yaml").read_text() )
+AUTO_BLOCK_SIZE = 512   # cache upper bound when block_size="auto"
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
@@ -78,16 +79,36 @@ def get_cli_args():
     parser.add_argument("--n_layer",            default=12,   type=int)
     parser.add_argument("--n_head",             default=6,   type=int)
     parser.add_argument("--n_embd",             default=120,  type=int)
-    parser.add_argument("--block_size",         default=96,   type=int)
+    parser.add_argument("--block_size",         default="auto",
+                        type=lambda v: v if v == "auto" else int(v),
+                        help="Max tokens per subject in the cache. 'auto' (default) uses a "
+                             "generous upper bound; the effective per-batch length is always "
+                             "trimmed to the longest sequence in that batch.")
     parser.add_argument("--batch_size",         default=32, type=int)
     parser.add_argument("--num_workers",        default=4, type=int)
     parser.add_argument("--token_dropout",      default=0.1, type=float)
     parser.add_argument("--no-compile",         default=False, action='store_true')
     parser.add_argument("--learning_rate", "--lr", dest="lr", default=1e-4, type=float)
+
+    # ── Optimizer / LR schedule ───────────────────────────────────────────────
+    parser.add_argument("--min_lr",         default=None,  type=float,
+                        help="Minimum LR at end of cosine decay (default: lr/10)")
+    parser.add_argument("--weight_decay",   default=1e-1,  type=float)
+    parser.add_argument("--beta1",          default=0.9,   type=float)
+    parser.add_argument("--beta2",          default=0.95,  type=float)
+    parser.add_argument("--grad_clip",      default=1.0,   type=float,
+                        help="Gradient clipping norm (0 = disabled)")
+    parser.add_argument("--schedule",       default="cosine", choices=["cosine", "constant"])
+    parser.add_argument("--warmup_iters",   default=2000,  type=int)
+    parser.add_argument("--lr_decay_iters", default=10000, type=int)
     parser.add_argument("--test_fold",          default=1,    type=int)
     parser.add_argument("--subjects",           default=None, type=str)
     parser.add_argument("--seed",               default=142, type=int)
-    parser.add_argument("--compute_aucs",       default=False, action="store_true")
+    parser.add_argument("--compute_aucs",           default=False, action="store_true")
+    parser.add_argument("--log_loss_per_disease",   default=False, action="store_true",
+                        help="Log per-disease CE loss breakdown as a CSV artifact each validation epoch")
+    parser.add_argument("--checkpoint_every",       default=None, type=int,
+                        help="Save a periodic checkpoint every N epochs (in addition to best-model checkpoints)")
     
     parser.add_argument("--no_event_token_rate",           default=2, type=float)
     parser.add_argument("--no_event_token_insertion_mode", default="random", type=str)
@@ -102,6 +123,9 @@ def get_cli_args():
                     help="Resume training from the latest checkpoint of this MLflow run")
 
     parser.add_argument("--dryrun", "--dry-run", "--dry_run", dest="dry_run", action="store_true", default=False)
+
+    parser.add_argument("--no_rich", "--no-rich", dest="no_rich", action="store_true", default=False,
+                    help="Disable rich display (use tqdm instead, e.g. for cluster log files)")
 
     args = parser.parse_args()
     return args
@@ -141,12 +165,16 @@ def get_dataloaders(
 
     continuous_domains = get_continuous_domains(domain_cfg)
 
+    # Dataset always needs a fixed integer cache size; collate receives the
+    # original value ("auto" or int) to decide per-batch trimming behaviour.
+    cache_block_size = AUTO_BLOCK_SIZE if block_size == "auto" else block_size
+
     dataset_kwargs = dict(
-        root=root_path, 
+        root=root_path,
         domains_cfg=domain_cfg,
         domain_to_int=model.domain_to_int,
-        block_size=block_size,
-        exclusions=[], 
+        block_size=cache_block_size,
+        exclusions=[],
         required_domains=["diseases"],
         no_event_token_rate=no_event_token_rate,
         no_event_insertion_mode=no_event_insertion_mode,
@@ -167,7 +195,7 @@ def get_dataloaders(
 
     collate = DelphiCollateFn(
         age_sampler=age_sampler,
-        block_size=block_size,
+        block_size=block_size,      # "auto" or int
         domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets,
         padding_domain_id=model.domain_to_int["padding"],
@@ -194,7 +222,12 @@ def get_dataloaders(
 if __name__ == "__main__":    
   
     args = get_cli_args()
-  
+
+    cache_block_size = AUTO_BLOCK_SIZE if args.block_size == "auto" else args.block_size
+    logging.info(
+        "block_size=%s  cache_block_size=%d", args.block_size, cache_block_size
+    )
+
     if (train_from_scratch := not args.resume_run_id):
   
         args.attention_scheme = parse_attention_scheme(args.attention_scheme)
@@ -213,11 +246,11 @@ if __name__ == "__main__":
             attention_scheme = args.attention_scheme
         
         # ── Model ─────────────────────────────────────────────────────────
-        delphi_config = DelphiConfig( 
+        delphi_config = DelphiConfig(
             n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head,
             domains=domain_cfg, attention_scheme=attention_scheme,
             token_dropout=args.token_dropout,
-            block_size=args.block_size, 
+            block_size=cache_block_size,
             no_event_token_rate=args.no_event_token_rate, 
             no_event_token_insertion_mode=args.no_event_token_insertion_mode,
             seed=args.seed
@@ -225,7 +258,9 @@ if __name__ == "__main__":
     
         logging.info("Config:\n%s", pformat(asdict(delphi_config), sort_dicts=False))
         model = Delphi(delphi_config).to(DEVICE)
-        torch.compile(model, disable=args.no_compile)
+        if not args.no_compile:
+            logging.info("Compiling model with torch.compile (first batch will be slower)...")
+        model = torch.compile(model, disable=args.no_compile)
 
         # ── Data ──────────────────────────────────────────────────────────
         dataloaders = get_dataloaders(
@@ -242,7 +277,17 @@ if __name__ == "__main__":
         )
 
         # ── Optimizer ─────────────────────────────────────────────────────
-        optim_config = OptimConfig(learning_rate=args.lr, min_lr=args.lr / 10)
+        optim_config = OptimConfig(
+            learning_rate  = args.lr,
+            min_lr         = args.min_lr if args.min_lr is not None else args.lr / 10,
+            weight_decay   = args.weight_decay,
+            beta1          = args.beta1,
+            beta2          = args.beta2,
+            grad_clip      = args.grad_clip,
+            schedule       = args.schedule,
+            warmup_iters   = args.warmup_iters,
+            lr_decay_iters = args.lr_decay_iters,
+        )
         logging.info(f"Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
         
         optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
@@ -270,7 +315,9 @@ if __name__ == "__main__":
         logged_params, previous_run_name = config_from_runid(args.resume_run_id)
 
         model = model.to(DEVICE)
-        torch.compile(model, disable=args.no_compile)
+        if not args.no_compile:
+            logging.info("Compiling model with torch.compile (first batch will be slower)...")
+        model = torch.compile(model, disable=args.no_compile)
         optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
@@ -285,18 +332,32 @@ if __name__ == "__main__":
 
 # —————————————————————————————————————————————————————————————————————————————————————
 
+    # ── Run metadata ──────────────────────────────────────────────────────────────────
+    logger.log_run_metadata(cwd=DELPHI_DIR)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    logged_params["n_params"] = n_params
+
+    train_loader, val_loader, test_loader = dataloaders
+    logged_params["n_train"] = len(train_loader.dataset)
+    logged_params["n_val"]   = len(val_loader.dataset)
+    logged_params["n_test"]  = len(test_loader.dataset)
+
     if args.no_warnings:
         warnings.filterwarnings("ignore")
   
-    trainer = Trainer( 
-        model, dataloaders, 
+    trainer = Trainer(
+        model, dataloaders,
         optimizer, scheduler,
-        log_loss_per_disease=False, 
-        logger=logger, 
-        mlflow_params=logged_params, 
-        use_tqdm=True,
+        log_loss_per_disease=args.log_loss_per_disease,
+        checkpoint_every=args.checkpoint_every,
+        logger=logger,
+        mlflow_params=logged_params,
+        use_tqdm=args.no_rich,
         use_amp=args.use_amp,
-    ) 
+        use_rich=not args.no_rich,
+        optim_config=optim_config,
+    )
 
     trainer.train(max_epochs=1000, patience=10)
 
@@ -310,7 +371,7 @@ if __name__ == "__main__":
         auc_df = evaluate_aucs(
             model,
             test_loader,
-            block_size=args.block_size,
+            block_size=cache_block_size,
             run_id=logger.active_run.info.run_id,
             n_jobs=8,
             logger=logger,

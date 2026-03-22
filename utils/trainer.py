@@ -115,6 +115,7 @@ class NullLogger:
     def log_metrics(self, metrics, step=None): pass
     def log_artifact(self, path, artifact_path=None): pass
     def log_model(self, model, artifact_path="model"): pass
+    def log_run_metadata(self, cwd=None): pass
 
 
 class MLFlowLogger:
@@ -183,6 +184,26 @@ class MLFlowLogger:
             "metadata": metadata
         }
 
+    def log_run_metadata(self, cwd=None):
+        """Log git commit hash, dirty flag, hostname and SLURM job ID as MLflow tags."""
+        import subprocess, socket
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=cwd
+            ).decode().strip()
+            git_dirty = bool(subprocess.check_output(
+                ["git", "status", "--porcelain"], cwd=cwd
+            ).decode().strip())
+        except Exception:
+            git_commit, git_dirty = "unknown", False
+
+        mlflow.set_tags({
+            "git_commit":   git_commit,
+            "git_dirty":    str(git_dirty),
+            "hostname":     socket.gethostname(),
+            "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
+        })
+
     def save_model(self, model, optimizer, scheduler=None, metadata=None, filename=None, symlink_as=None):
         import torch
         metadata = {} if metadata is None else metadata
@@ -208,7 +229,6 @@ class MLFlowLogger:
         shutil.rmtree(tmp_dir)
 
         uri = mlflow.get_artifact_uri("checkpoints")
-        print(f"Saved checkpoint at {uri}/{filename}")
         return Path(uri) / filename
 
 
@@ -230,7 +250,8 @@ class Trainer(BaseTrainer):
           optimizer, scheduler, patience=3,
           n_train_batches=None, n_val_batches=None, n_validations_per_epoch=1,
           logger=NullLogger(), mlflow_params=dict(), start_epoch=0, log_loss_per_disease=False,
-          use_tqdm=True, use_amp=True,
+          use_tqdm=True, use_amp=True, use_rich=True,
+          checkpoint_every=None, optim_config=None,
         ):
 
         self.model           = model
@@ -264,7 +285,10 @@ class Trainer(BaseTrainer):
 
         self.additional_mlflow_params = mlflow_params | { "ema_alpha": self.ema_alpha }
 
-        self.use_tqdm = use_tqdm
+        self.use_tqdm        = use_tqdm
+        self.use_rich        = use_rich
+        self.checkpoint_every = checkpoint_every   # None = only save on improvement
+        self.optim_config = optim_config
 
         self.ce_ema = None
         self.time_ema = None
@@ -277,8 +301,9 @@ class Trainer(BaseTrainer):
 
         # Mixed precision
         self.use_amp = use_amp and torch.cuda.is_available()
-        self.amp_dtype = torch.float16
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        self.amp_dtype = torch.bfloat16
+        # bfloat16 has the same exponent range as float32, so no gradient scaling needed
+        self.scaler = torch.amp.GradScaler("cuda", enabled=False)
 
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.allow_tf32 = True
@@ -296,71 +321,151 @@ class Trainer(BaseTrainer):
             "test_ids":  sorted(self.test_loader.dataset.subject_list),
         }
 
+    def _setup_display(self, epoch_rows: list):
+        """
+        Returns (progress, live_ctx, refresh_fn).
+        When use_rich=False, everything is a no-op.
+        """
+        from contextlib import nullcontext
+        if not self.use_rich:
+            return None, nullcontext(), lambda: None
+
+        try:
+            from rich.live import Live
+            from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn, TimeElapsedColumn
+            from rich.table import Table
+            from rich.console import Group
+            from rich import box
+        except ImportError:
+            return None, nullcontext(), lambda: None
+
+        def build_table():
+            t = Table(box=box.SIMPLE_HEAD, show_edge=False, header_style="bold")
+            t.add_column("Epoch",     justify="right",  style="cyan", width=6)
+            t.add_column("Train CE",  justify="right",  width=9)
+            t.add_column("Train dt",  justify="right",  width=10)
+            t.add_column("Train tot", justify="right",  width=10)
+            t.add_column("Val CE",    justify="right",  width=9)
+            t.add_column("Val dt",    justify="right",  width=10)
+            t.add_column("Val tot",   justify="right",  width=10)
+            t.add_column("LR",        justify="right",  width=9)
+            t.add_column("Improved?", justify="center", width=10)
+            for row in epoch_rows:
+                t.add_row(*row)
+            return t
+
+        progress = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            transient=True,
+        )
+        live = Live(Group(build_table(), progress), refresh_per_second=4)
+        return progress, live, lambda: live.update(Group(build_table(), progress))
+
     def train(self, max_epochs=1000, patience=None):
 
         if patience is not None:
             self.early_stopper.set_patience(patience)
 
         n_batches_epoch = len(self.train_loader)
-        if self.n_validations_per_epoch <= 0:
-            eval_every = None
-        else:
-            eval_every = max(1, n_batches_epoch // self.n_validations_per_epoch)
+        # n_validations_per_epoch <= 1: end-of-epoch validation is enough, no mid-epoch eval
+        eval_every = None if self.n_validations_per_epoch <= 1 else \
+                     max(1, n_batches_epoch // self.n_validations_per_epoch)
 
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
 
-        for epoch in range(self.current_epoch, max_epochs):
+        epoch_rows = []
+        progress, live_ctx, refresh_display = self._setup_display(epoch_rows)
+        _print = (lambda msg: live_ctx.console.print(msg)) if self.use_rich and progress else print
 
-            self.current_epoch = epoch
-            self.model.train()
+        with live_ctx:
+            for epoch in range(self.current_epoch, max_epochs):
 
-            train_loss = self.train_epoch(eval_every=eval_every)
+                self.current_epoch = epoch
+                self.model.train()
 
-            # Always run validation at end of epoch for checkpointing/early stopping
-            self.val_loss, self.mean_val_loss = self.valid_epoch(n_batches=self.n_val_batches)
+                train_task = progress.add_task(
+                    f"[green]Ep {epoch:>4d}  train", total=len(self.train_loader)
+                ) if progress else None
+                train_loss = self.train_epoch(eval_every=eval_every, _progress=progress, _task_id=train_task)
+                self.on_train_epoch_end(epoch)
+                if progress: progress.remove_task(train_task)
 
-            metrics = { "train_loss": train_loss }
-
-            if self.val_loss is not None:
-                metrics["val_loss"] = self.val_loss
-                if "val_ce_loss_per_disease" in metrics["val_loss"]:
-                    val_loss_per_disease = metrics["val_loss"].pop("val_ce_loss_per_disease")
-
-            self.logger.log_metrics(metrics['val_loss'], step=epoch)
-            self.logger.log_metrics(metrics['train_loss'], step=epoch)
-
-            should_stop, improved = self.early_stopper.step(self.mean_val_loss)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            if improved:
-                val_loss_val = float(self.mean_val_loss.cpu())
-                ckpt_filepath = f"epoch{self.current_epoch}__valloss_{val_loss_val:.4f}__{timestamp}.pt"
-
-                ckpt_uri = self.logger.save_model(
-                    self.model,
-                    self.optimizer,
-                    self.scheduler,
-                    metadata={
-                        "epoch": epoch,
-                        "val_loss": val_loss_val,
-                        "train_loss": float(train_loss["train_total"].cpu()),
-                        "n_params": sum(p.numel() for p in self.model.parameters()),
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "attention_scheme": getattr(self.model.config, "attention_scheme", None),
-                        "date_cutoff": None,
-                    } | self.get_subject_ids_per_partition(),
-                    filename=ckpt_filepath,
-                    symlink_as="best_model.pt",
+                n_val = len(self.valid_loader) if self.n_val_batches == 'all' else self.n_val_batches
+                val_task = progress.add_task(
+                    f"[blue]Ep {epoch:>4d}  val  ", total=n_val
+                ) if progress else None
+                self.val_loss, self.mean_val_loss = self.valid_epoch(
+                    n_batches=self.n_val_batches, _progress=progress, _task_id=val_task
                 )
-                print(f"New best model logged at {ckpt_uri}")
+                if progress: progress.remove_task(val_task)
 
-            if should_stop:
-                print(f"Early stopping triggered at epoch {self.current_epoch}")
-                break
+                metrics = {"train_loss": train_loss}
+                if self.val_loss is not None:
+                    metrics["val_loss"] = self.val_loss
+                    if "val_ce_loss_per_disease" in metrics["val_loss"]:
+                        metrics["val_loss"].pop("val_ce_loss_per_disease")
 
-            self.epoch_end()
+                self.logger.log_metrics(metrics['val_loss'], step=epoch)
+                self.logger.log_metrics(metrics['train_loss'], step=epoch)
+
+                should_stop, improved = self.early_stopper.step(self.mean_val_loss)
+
+                val_loss_val = float(self.mean_val_loss.cpu())
+                ckpt_metadata = {
+                    "epoch": epoch,
+                    "val_loss": val_loss_val,
+                    "train_loss": float(train_loss["train_total"].cpu()),
+                    "n_params": sum(p.numel() for p in self.model.parameters()),
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "attention_scheme": getattr(self.model.config, "attention_scheme", None),
+                    "date_cutoff": None,
+                } | self.get_subject_ids_per_partition()
+
+                if improved:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    ckpt_filepath = f"epoch{epoch}__valloss_{val_loss_val:.4f}__{timestamp}.pt"
+                    ckpt_uri = self.logger.save_model(
+                        self.model, self.optimizer, self.scheduler,
+                        metadata=ckpt_metadata,
+                        filename=ckpt_filepath,
+                        symlink_as="best_model.pt",
+                    )
+                    _print(f"New best model → {ckpt_uri}")
+
+                if self.checkpoint_every and (epoch % self.checkpoint_every == 0):
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    ckpt_filepath = f"epoch{epoch}__periodic__{timestamp}.pt"
+                    ckpt_uri = self.logger.save_model(
+                        self.model, self.optimizer, self.scheduler,
+                        metadata=ckpt_metadata | {"checkpoint_type": "periodic"},
+                        filename=ckpt_filepath,
+                    )
+                    _print(f"Periodic checkpoint → {ckpt_uri}")
+
+                # Add row to epoch table
+                lr = self.optimizer.param_groups[0]['lr']
+                epoch_rows.append((
+                    str(epoch),
+                    f"{train_loss['train_ce_loss'].item():.4f}",
+                    f"{train_loss['train_time_loss'].item():.4f}",
+                    f"{train_loss['train_total'].item():.4f}",
+                    f"{self.val_loss['val_ce_loss'].item():.4f}",
+                    f"{self.val_loss['val_time_loss'].item():.4f}",
+                    f"{self.val_loss['val_total'].item():.4f}",
+                    f"{lr:.2e}",
+                    "[yellow]★[/]" if improved else "",
+                ))
+                refresh_display()
+
+                if should_stop:
+                    _print(f"Early stopping at epoch {epoch}")
+                    break
+
+                self.epoch_end()
 
 
     def shared_step(self,
@@ -418,11 +523,10 @@ class Trainer(BaseTrainer):
             f'{prefix}total':     loss_ce + time_loss,
         })
 
-        if self.log_loss_per_disease:
-            loss_ce_per_disease = model.cross_entropy_loss(
+        if self.log_loss_per_disease and stage == "validation":
+            loss[f'{prefix}ce_loss_per_disease'] = model.cross_entropy_loss(
                 f_logits.float(), f_global_ids, agg="per_disease"
-            ).to_frame().assign(batch_idx=batch_idx)
-            loss[f'{prefix}ce_loss_per_disease'] = loss_ce_per_disease
+            )  # pd.Series indexed by token_id
 
         if return_att and return_logits: return loss, logits_cat, att
         elif return_logits:              return loss, logits_cat
@@ -434,11 +538,20 @@ class Trainer(BaseTrainer):
         self._validation_counter += 1
 
         if len(loss_outputs) and 'val_ce_loss_per_disease' in loss_outputs[0]:
-            self._val_ce_loss_per_disease_df = pd.concat(
-                [x['val_ce_loss_per_disease'] for x in loss_outputs]
-            ).reset_index().pivot(
-                index="token_id", columns="batch_idx", values="log_p"
-            ).fillna(0).sum(axis=1).sort_values().reset_index()
+            # Each item is a pd.Series(mean_log_p, index=token_id).
+            # Concat produces a Series with repeated token_id index entries
+            # (one entry per batch where the token appeared).
+            # groupby then computes, per token:
+            #   log_p_total: sum of per-batch means  (contribution = frequency × difficulty)
+            #   log_p_mean:  mean of per-batch means  (difficulty, independent of frequency)
+            combined = pd.concat([x['val_ce_loss_per_disease'] for x in loss_outputs])
+            self._val_ce_loss_per_disease_df = (
+                combined
+                .groupby(level=0)
+                .agg(log_p_total="sum", log_p_mean="mean")
+                .sort_values("log_p_total")
+                .reset_index()
+            )
 
         return 1
 
@@ -456,20 +569,21 @@ class Trainer(BaseTrainer):
                 ]
                 out[k] = torch.stack(vals).mean()
             except Exception as e:
-                print(f"[compute_mean] Skipping key '{k}': {e}")
+                if not k.endswith("_per_disease"):  # DataFrames are handled separately
+                    print(f"[compute_mean] Skipping key '{k}': {e}")
                 out[k] = torch.tensor(float('nan'))
         return out
 
 
-    def train_epoch(self, n_batches='all', eval_every=None):
+    def train_epoch(self, n_batches='all', eval_every=None, _progress=None, _task_id=None):
 
         self.val_step = 0
-        ce_ema, time_ema = None, None
 
+        use_tqdm = (_progress is None) and self.use_tqdm
         pbar = tqdm(
             total=len(self.train_loader.dataset) if n_batches == "all" else n_batches,
-            disable=not self.use_tqdm
-        )
+            disable=not use_tqdm,
+        ) if use_tqdm else None
 
         for i, batch in enumerate(self.train_loader):
 
@@ -480,6 +594,9 @@ class Trainer(BaseTrainer):
             )
 
             self.scaler.scale(loss['train_total']).backward()
+            if self.optim_config is not None and self.optim_config.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.optim_config.grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
@@ -507,12 +624,19 @@ class Trainer(BaseTrainer):
                 self.val_step += 1
 
             current_loss = self.train_outputs[-1]
-            pbar.set_postfix({
-                "train_cce_loss":  f"{current_loss['train_ce_loss'].item():.3f}   ({current_loss['train_ce_ema_loss'].item():.3f})",
-                "train_time_loss": f"{current_loss['train_time_loss'].item():.3f} ({current_loss['train_time_ema_loss'].item():.3f})"
-            })
+            if pbar:
+                pbar.set_postfix({
+                    "ce":  f"{current_loss['train_ce_loss'].item():.3f} ({current_loss['train_ce_ema_loss'].item():.3f})",
+                    "dt":  f"{current_loss['train_time_loss'].item():.1f} ({current_loss['train_time_ema_loss'].item():.1f})",
+                })
+                pbar.update(self.train_loader.batch_size)
 
-            pbar.update(self.train_loader.batch_size)
+            if _progress is not None and _task_id is not None:
+                _progress.advance(_task_id)
+                _progress.update(_task_id, description=(
+                    f"[green]Ep {self.current_epoch:>4d}  train  "
+                    f"ce={current_loss['train_ce_ema_loss'].item():.3f}"
+                ))
 
             if (n_batches is not None) and (i == n_batches):
                 break
@@ -520,14 +644,15 @@ class Trainer(BaseTrainer):
         return self.compute_mean(self.train_outputs)
 
 
-    def valid_epoch(self, n_batches='all'):
+    def valid_epoch(self, n_batches='all', _progress=None, _task_id=None):
 
         self.model.eval()
 
+        use_tqdm = (_progress is None) and self.use_tqdm
         pbar = tqdm(
             total=len(self.valid_loader.dataset) if n_batches == "all" else n_batches,
-            disable=not self.use_tqdm,
-        )
+            disable=not use_tqdm,
+        ) if use_tqdm else None
 
         with torch.no_grad():
 
@@ -546,17 +671,23 @@ class Trainer(BaseTrainer):
                 time_sum += loss['val_time_loss'].item()
                 n = i + 1
 
-                pbar.set_postfix({
-                    "val_cce":       f"{loss['val_ce_loss'].item():.3f} ({ce_sum/n:.3f})",
-                    "val_time_loss": f"{loss['val_time_loss'].item():.3f} ({time_sum/n:.3f})",
-                })
+                if pbar:
+                    pbar.set_postfix({
+                        "ce":  f"{loss['val_ce_loss'].item():.3f} ({ce_sum/n:.3f})",
+                        "dt":  f"{loss['val_time_loss'].item():.1f} ({time_sum/n:.1f})",
+                    })
+                    pbar.update(self.valid_loader.batch_size)
 
-                pbar.update(self.valid_loader.batch_size)
+                if _progress is not None and _task_id is not None:
+                    _progress.advance(_task_id)
+                    _progress.update(_task_id, description=(
+                        f"[blue]Ep {self.current_epoch:>4d}  val    ce={ce_sum/n:.3f}"
+                    ))
 
                 if n_batches != "all" and i == n_batches:
                     break
 
-        pbar.close()
+        if pbar: pbar.close()
 
         self.valid_epoch_end(loss_outputs)
 
@@ -570,12 +701,16 @@ class Trainer(BaseTrainer):
                 artifact_path="val_loss_per_disease"
             )
 
-        mean_loss = torch.stack([loss['val_total'] for loss in loss_outputs]).mean()
+        mean_val = self.compute_mean(loss_outputs)
 
         self.model.train()
 
-        return loss, mean_loss,
+        return mean_val, mean_val['val_total']
 
+
+    def on_train_epoch_end(self, epoch):
+        """Hook called after each train_epoch(). Override in subclasses."""
+        pass
 
     def epoch_end(self):
         self.train_outputs = []

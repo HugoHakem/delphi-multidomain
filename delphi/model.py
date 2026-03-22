@@ -572,11 +572,34 @@ class Delphi(nn.Module):
     # ── Loss functions ────────────────────────────────────────────────────
 
     def cross_entropy_loss(self, logits, targets, agg=None):
+        import pandas as pd
         n_classes = logits.size(-1)
         if agg == "per_token":
             log_softmax = F.log_softmax(logits.view(-1, n_classes), dim=-1)
             loss_ce_per_token = log_softmax[torch.arange(log_softmax.size(0)), targets.view(-1)]
             return loss_ce_per_token
+        elif agg == "per_disease":
+            # Returns a pd.Series indexed by token_id with mean log-probability per token.
+            # Negative log-prob = CE loss; more negative = harder to predict.
+            # Uses scatter_add on GPU to avoid a pandas groupby round-trip.
+            flat_targets = targets.view(-1)
+            log_softmax = F.log_softmax(logits.view(-1, n_classes), dim=-1)
+            log_p = log_softmax[torch.arange(flat_targets.size(0), device=logits.device), flat_targets]
+
+            unique_ids, inverse, counts = torch.unique(
+                flat_targets, return_inverse=True, return_counts=True
+            )
+            sum_log_p = torch.zeros(unique_ids.size(0), dtype=log_p.dtype, device=logits.device)
+            sum_log_p.scatter_add_(0, inverse, log_p)
+            mean_log_p = sum_log_p / counts.float()
+
+            result = pd.Series(
+                mean_log_p.detach().cpu().numpy(),
+                index=unique_ids.cpu().numpy(),
+                name="log_p",
+            )
+            result.index.name = "token_id"
+            return result
         elif agg is None:
             loss_ce = F.cross_entropy(
                 logits.reshape(-1, n_classes),
@@ -584,7 +607,7 @@ class Delphi(nn.Module):
                 ignore_index=-1,
             )
         else:
-            raise ValueError(f"agg should be in [None, 'per_token']")
+            raise ValueError(f"agg should be in [None, 'per_token', 'per_disease']")
         return loss_ce
 
     def time_to_event_loss(self, logits, time_to_next, t_min, agg=None):
