@@ -902,7 +902,7 @@ class DelphiCollateFn:
     def __init__(
         self,
         age_sampler: AgeSampler,
-        block_size: int,
+        block_size: Union[int, str],
         domain_to_int: Dict[str, int],
         domain_offsets: Dict[int, int],   # domain_int -> global offset
         padding_domain_id: int,
@@ -920,12 +920,12 @@ class DelphiCollateFn:
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
         B = len(batch)
-        T = self.block_size
 
         # ── 1. Stack ──────────────────────────────────────────────────────
-        domain_ids = torch.stack([item["domain_ids"] for item in batch])        # [B, T]
-        local_token_ids = torch.stack([item["local_token_ids"] for item in batch])  # [B, T]
-        ages = torch.stack([item["ages"] for item in batch])                    # [B, T]
+        domain_ids = torch.stack([item["domain_ids"] for item in batch])        # [B, T_cache]
+        local_token_ids = torch.stack([item["local_token_ids"] for item in batch])  # [B, T_cache]
+        ages = torch.stack([item["ages"] for item in batch])                    # [B, T_cache]
+        T = domain_ids.shape[1]
         real_counts = torch.stack([item["real_count"] for item in batch])       # [B]
         max_ages = torch.stack([item["max_age"] for item in batch])             # [B]
         subject_ids = torch.stack([item["subject_id"] for item in batch])       # [B]
@@ -1005,6 +1005,22 @@ class DelphiCollateFn:
                 n_found = min(pos.numel(), n_latent)
                 positions[b_idx, :n_found] = pos[:n_found]
             continuous_positions[cd_name] = positions
+
+        # ── 6. Trim or keep to target length ─────────────────────────────
+        # After sorting, padding (age=PADDING_AGE) collects at the front of every
+        # sequence.
+        #
+        # block_size="auto": trim to the longest real sequence in this batch.
+        # block_size=N (int): keep the full [B, N] — padding stays at the front.
+        if self.block_size == "auto":
+            n_real = (ages > self.PADDING_AGE).sum(dim=1)   # [B]
+            trim_start = int((T - n_real.max()).item())
+            if trim_start > 0:
+                global_token_ids = global_token_ids[:, trim_start:]
+                domain_ids       = domain_ids[:, trim_start:]
+                ages             = ages[:, trim_start:]
+                for k in continuous_positions:
+                    continuous_positions[k] = (continuous_positions[k] - trim_start).clamp(min=0)
 
         return DelphiBatch(
             global_token_ids=global_token_ids,
