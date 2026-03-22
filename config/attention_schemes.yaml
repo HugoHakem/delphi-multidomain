@@ -1,31 +1,69 @@
-hla_bidir:
-  description: HLA bidirectional with sex, rest causal
-  scheme: |
-    [hla_alleles,sex]:bidirectional,
-    [diseases,lifestyle,sex,hla_alleles,death]:causal(mask_ties=true)
+# Attention scheme presets
+#
+# Each entry defines a named configuration with:
+#   description : human-readable summary
+#   domains     : comma-separated list of domains to pass to --domains
+#                 (padding is injected automatically and should not be listed)
+#   scheme      : attention scheme string to pass to --attention_scheme
+#
+# Usage:
+#   python train.py --attention_scheme <name> --domains <domains from entry> ...
+
+
+# ── Clinical only ──────────────────────────────────────────────────────────────
+
+clinical_causal:
+  description: Clinical domains only, fully causal
+  domains: diseases,death,lifestyle,sex
+  scheme: "all:causal(mask_ties=True)"
+
+clinical_causal_with_pcs:
+  description: Clinical domains + genetic PCs; PCs, lifestyle and sex form a bidirectional block
+  domains: diseases,death,lifestyle,genetic_pcs,sex
+  scheme: "[genetic_pcs,lifestyle,sex]:bidirectional,all:causal(mask_ties=True)"
+
+
+# ── HLA ────────────────────────────────────────────────────────────────────────
 
 hla_causal:
-  description: causal, no attention within HLA.
-  scheme: |
-    [diseases,lifestyle,sex,hla_alleles,death]:causal(mask_ties=true)
+  description: HLA + clinical domains, fully causal
+  domains: diseases,death,lifestyle,hla_alleles,sex
+  scheme: "all:causal(mask_ties=True)"
 
-no_hla:
-  description: Clinical domains only, causal attention
-  scheme: |
-    [sex,diseases,death,lifestyle,death]:causal(mask_ties=true)
+hla_bidirectional:
+  description: HLA + sex form a bidirectional block; clinical domains causal
+  domains: diseases,death,lifestyle,hla_alleles,sex
+  scheme: "[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"
 
-ns_drugs:
-  description: Clinical domains and central nervous system drugs, causal attention
-  scheme: |
-    [sex,diseases,ns_drugs,lifestyle,death]:causal(mask_ties=true)
+hla_pcs_causal:
+  description: HLA + genetic PCs + clinical; PCs/lifestyle/sex bidirectional, HLA causal
+  domains: diseases,death,lifestyle,hla_alleles,genetic_pcs,sex
+  scheme: "[genetic_pcs,lifestyle,sex]:bidirectional,all:causal(mask_ties=True)"
 
-cv_drugs:
-  description: Clinical domains and cardiovascular drugs , causal attention
-  scheme: |
-    [sex,diseases,cv_drugs,lifestyle,death]:causal(mask_ties=true)
+hla_pcs_bidirectional:
+  description: HLA + genetic PCs + clinical; HLA/sex/PCs/lifestyle all bidirectional
+  domains: diseases,death,lifestyle,hla_alleles,genetic_pcs,sex
+  scheme: "[hla_alleles,sex,genetic_pcs,lifestyle]:bidirectional,all:causal(mask_ties=True)"
 
-cvns_drugs:
-  description: Clinical domains and both CV and CNS drugs, causal attention
-  scheme: |
-    [sex,diseases,cv_drugs,ns_drugs,lifestyle,death]:causal(mask_ties=true)
 
+# ── Drugs ──────────────────────────────────────────────────────────────────────
+
+cv_drugs_causal:
+  description: Clinical + cardiovascular drugs, fully causal
+  domains: diseases,death,cv_drugs,lifestyle,sex
+  scheme: "all:causal(mask_ties=True)"
+
+cns_drugs_causal:
+  description: Clinical + CNS drugs, fully causal
+  domains: diseases,death,ns_drugs,lifestyle,sex
+  scheme: "all:causal(mask_ties=True)"
+
+cv_cns_drugs_causal:
+  description: Clinical + cardiovascular and CNS drugs, fully causal
+  domains: diseases,death,cv_drugs,ns_drugs,lifestyle,sex
+  scheme: "all:causal(mask_ties=True)"
+
+cv_cns_drugs_hla_bidirectional:
+  description: Clinical + CV and CNS drugs + HLA; HLA/sex bidirectional, rest causal
+  domains: diseases,death,cv_drugs,ns_drugs,hla_alleles,lifestyle,sex
+  scheme: "[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"
