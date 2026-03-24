@@ -193,7 +193,13 @@ def get_dataloaders(
         seed=seed,
     )
 
-    collate = DelphiCollateFn(
+    domain_dropout = {
+        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate)
+        for dname, cfg in domain_cfg.items()
+        if cfg.dropout_mode is not None and cfg.dropout_rate > 0
+    }
+
+    collate_kwargs = dict(
         age_sampler=age_sampler,
         block_size=block_size,      # "auto" or int
         domain_to_int=model.domain_to_int,
@@ -201,18 +207,16 @@ def get_dataloaders(
         padding_domain_id=model.domain_to_int["padding"],
         no_event_token_id=1,
         continuous_domains=continuous_domains,
+        domain_dropout=domain_dropout,
     )
+    train_collate = DelphiCollateFn(**collate_kwargs, training=True)
+    eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
 
-    loader_kwargs = dict(
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate,
-    )
+    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
 
-    train_loader = DataLoader(train_dataset, shuffle=True,  **loader_kwargs)
-    valid_loader = DataLoader(valid_dataset, shuffle=False, **loader_kwargs)
-    test_loader  = DataLoader(test_dataset,  shuffle=False, **loader_kwargs)
+    train_loader = DataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **loader_kwargs)
+    valid_loader = DataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
+    test_loader  = DataLoader(test_dataset,  shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
 
     return [train_loader, valid_loader, test_loader]
 
@@ -239,11 +243,13 @@ if __name__ == "__main__":
         assert all([k in default_cfg_per_domain for k in domains])
         assert len(args.attention_scheme) in {1, args.n_layer}, \
             f"len of --attention_scheme should be 1 or n_layer (={args.n_layer})"
-        
-        if len(args.attention_scheme) == 1:
-            attention_scheme = args.n_layer * args.attention_scheme
-        elif args.n_layer == len(args.attention_scheme):
-            attention_scheme = args.attention_scheme
+
+        # Pass as-is: single string → same scheme for all layers,
+        # list of n_layer strings → per-layer schemes. The model expands internally.
+        attention_scheme = (
+            args.attention_scheme[0] if len(args.attention_scheme) == 1
+            else args.attention_scheme
+        )
         
         # ── Model ─────────────────────────────────────────────────────────
         delphi_config = DelphiConfig(

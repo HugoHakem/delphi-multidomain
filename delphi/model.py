@@ -59,6 +59,8 @@ class DomainConfig:
     n_latent_tokens: Optional[int] = None
     subdomain: Optional[str] = None        # filter tokens by metadata (e.g. "hla_a")
     group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
+    dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
+    dropout_rate: float = 0.0             # probability of dropping; 0 = disabled
 
     def set_freeze(self, freeze: bool):
         self.freeze = freeze
@@ -205,7 +207,10 @@ class AttentionMaskBuilder(nn.Module):
                 raise ValueError(f"Unknown attention type: {cfg['type']}")
 
         mask = mask.bool()
-        is_padding = (domains == self.domain2id["padding"]) & (local_token_ids == 0)
+        # Padding tokens have age == PADDING_AGE (-10000); no-event tokens share
+        # the padding domain but carry real positive ages, so age-based detection
+        # is more robust than checking local_token_ids (which may be global IDs).
+        is_padding = ages < 0.0
         mask &= ~(is_padding.unsqueeze(2) | is_padding.unsqueeze(1))
         mask = mask.int()
 
@@ -361,7 +366,7 @@ class Delphi(nn.Module):
         super().__init__()
 
         self.config = config
-        self.config.attention_scheme = self._adapt_attention_scheme(config.attention_scheme)
+        self._attention_schemes = self._adapt_attention_scheme(config.attention_scheme)
 
         # Derive shared metadata from config.domains
         self.domain_to_int = self._build_domain_to_int(list(config.domains.keys()))
@@ -448,7 +453,7 @@ class Delphi(nn.Module):
             drop=nn.Dropout(config.dropout),
             attn_mask_builder=nn.ModuleList([
                 nn.ModuleList([
-                    AttentionMaskBuilder(config.attention_scheme[i], self.domain_to_int)
+                    AttentionMaskBuilder(self._attention_schemes[i], self.domain_to_int)
                     for i in range(config.n_layer)
                 ]) for j in range(config.n_head)
             ]),

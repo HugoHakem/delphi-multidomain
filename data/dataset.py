@@ -908,6 +908,8 @@ class DelphiCollateFn:
         padding_domain_id: int,
         no_event_token_id: int = 1,
         continuous_domains: Optional[Dict[str, int]] = None,
+        domain_dropout: Optional[Dict[int, tuple]] = None,
+        training: bool = True,
     ):
         self.age_sampler = age_sampler
         self.block_size = block_size
@@ -916,6 +918,17 @@ class DelphiCollateFn:
         self.padding_domain_id = padding_domain_id
         self.no_event_token_id = no_event_token_id
         self.continuous_domains = continuous_domains or {}
+        # {domain_int: (mode, rate)}  mode in {"token", "block"}
+        self.domain_dropout = domain_dropout or {}
+        self.training = training
+
+    def train(self):
+        self.training = True
+        return self
+
+    def eval(self):
+        self.training = False
+        return self
 
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
@@ -976,6 +989,26 @@ class DelphiCollateFn:
                 ages[b_idx, start:end] = b_ages
                 local_token_ids[b_idx, start:end] = self.no_event_token_id
                 domain_ids[b_idx, start:end] = self.padding_domain_id
+
+        # ── 2.5. Domain dropout (training only) ──────────────────────────
+        if self.training and self.domain_dropout:
+            for d_int, (mode, rate) in self.domain_dropout.items():
+                if rate <= 0.0:
+                    continue
+                d_mask = domain_ids == d_int  # [B, T]
+                if mode == "token":
+                    drop = torch.bernoulli(torch.full((B, T), rate, dtype=torch.float)) > 0
+                    drop_mask = d_mask & drop
+                elif mode == "block":
+                    block_drop = torch.bernoulli(
+                        torch.full((B,), rate, dtype=torch.float)
+                    ).bool()
+                    drop_mask = d_mask & block_drop.unsqueeze(1)
+                else:
+                    continue
+                ages[drop_mask] = self.PADDING_AGE
+                domain_ids[drop_mask] = self.padding_domain_id
+                local_token_ids[drop_mask] = self.PADDING_TOKEN
 
         # ── 3. Sort by (age, domain_id) per subject ──────────────────────
         DOMAIN_SCALE = 0.001  # small enough to not affect age ordering

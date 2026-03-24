@@ -21,12 +21,14 @@ ns_drugs:
 lifestyle:
   projector: embed
   path: lifestyle
-  age_jitter: true
+  at_birth: true
 
 hla_alleles:
   projector: embed
   path: hla_alleles
   at_birth: true
+  # dropout_mode: block   # drop the entire HLA block with probability dropout_rate
+  # dropout_rate: 0.1
 
 sex:
   projector: embed
