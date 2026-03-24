@@ -2,6 +2,8 @@ diseases:
   projector: embed
   path: diseases
   predict: true
+  dropout_mode: token
+  dropout_rate: 0.1
 
 death:
   projector: embed
@@ -22,6 +24,8 @@ lifestyle:
   projector: embed
   path: lifestyle
   at_birth: true
+  dropout_mode: token
+  dropout_rate: 0.1
 
 hla_alleles:
   projector: embed
