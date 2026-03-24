@@ -57,7 +57,8 @@ def configure_optimizers(
     weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
     We are then returning the PyTorch optimizer object.
     """
-
+   
+    assert cfg.lr_decay_iters > cfg.warmup_iters, f"lr_decay_iters must be greater than warmup_iters, but got ({cfg.lr_decay_iters=}) <= ({cfg.warmup_iters=})"
     # separate out all parameters to those that will and won't experience regularizing weight decay
     decay = set()
     no_decay = set()
