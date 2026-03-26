@@ -43,7 +43,9 @@ from utils.trainer import (
 )
 
 from utils.cv_utils import get_data_partitions
-from utils.utils import load_domain_config
+from utils.utils import load_domain_config, setup_mlflow
+
+setup_mlflow()
 
 root_path = DELPHI_DIR / "data" / "transforms"
 ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config" / "attention_schemes.yaml").read_text() )

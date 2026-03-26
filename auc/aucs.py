@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import gc
 import os
+import sys
 import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(DELPHI_DIR))
 
 import numpy as np
 import pandas as pd
@@ -314,16 +318,20 @@ def evaluate_aucs(
         for (a0, a1) in AGE_RANGES
     ]
 
-    results = Parallel(n_jobs=n_jobs, backend="threading")(
-        delayed(extract_case_ctrl_for_sex_age)(
-            sex, sex_id, a0, a1,
-            all_sids, tok_subj, tok_sex, tok_gidx,
-            age_masks[(a0, a1)],
-            ctrl_subjects[sex],
-            disease_idx[sex_id],
-        )
+    _cc_args = (
+        (sex, sex_id, a0, a1,
+         all_sids, tok_subj, tok_sex, tok_gidx,
+         age_masks[(a0, a1)],
+         ctrl_subjects[sex],
+         disease_idx[sex_id])
         for sex, sex_id, a0, a1 in tqdm(tasks, desc="Case/ctrl indices")
     )
+    if n_jobs == 1:
+        results = [extract_case_ctrl_for_sex_age(*a) for a in _cc_args]
+    else:
+        results = Parallel(n_jobs=n_jobs, backend="threading")(
+            delayed(extract_case_ctrl_for_sex_age)(*a) for a in _cc_args
+        )
 
     ctrl_indices, case_indices = {}, {}
     for local_ctrl, local_case in results:
@@ -356,21 +364,23 @@ def evaluate_aucs(
     # ── 3. Compute AUCs ──────────────────────────────────────────────
     print("Computing AUCs...")
 
-    results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(process_disease)(
+    _auc_args = (
+        (
             (
                 all_output_embeddings
                 @ model.embed._get_domain_weight(domain_name)[token_id].half()
-            )
-            .detach()
-            .cpu()
-            .numpy(),
+            ).detach().cpu().numpy(),
             (domain_name, token_id),
             case_ctrl_lookup.get((domain_name, token_id), {}),
-            block_size=block_size,
         )
         for domain_name, token_id in tqdm(predicted_tokens, desc="AUC computation")
     )
+    if n_jobs == 1:
+        results = [process_disease(*a, block_size=block_size) for a in _auc_args]
+    else:
+        results = Parallel(n_jobs=n_jobs, backend="loky")(
+            delayed(process_disease)(*a, block_size=block_size) for a in _auc_args
+        )
 
     # ── 4. Assemble results ──────────────────────────────────────────
     auc_data = [row for sublist in results for row in sublist]
