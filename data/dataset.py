@@ -385,6 +385,9 @@ class DelphiDataset(Dataset):
         # continuous domain metadata
         continuous_domains: Optional[Dict[str, int]] = None,  # {name: n_latent_tokens}
         age_domains: Optional[List[str]] = None,  # domains to consider for max_age
+        # date cutoff for longitudinal evaluation
+        date_cutoff: Optional[str] = None,        # "YYYY-MM-DD"; None = no cutoff
+        birth_dates_file: Optional[str] = None,   # path to year_and_month_of_birth.txt
     ):
         super().__init__()
 
@@ -462,6 +465,13 @@ class DelphiDataset(Dataset):
 
         # ── Build cache ───────────────────────────────────────────────────
         self._build_cache(subject_set, block_size, no_event_token_rate)
+
+        # ── Date cutoff (longitudinal eval mask) ──────────────────────────
+        if date_cutoff is not None and birth_dates_file is not None:
+            self._build_eval_mask(date_cutoff, birth_dates_file)
+        else:
+            self._eval_mask = None
+            self._cutoff_ages = None
 
         print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, "
               f"domains={list(self.domains.keys())}")
@@ -838,6 +848,53 @@ class DelphiDataset(Dataset):
         self._continuous_cache = continuous_cache
         self._sid_to_idx       = {int(s): i for i, s in enumerate(sorted_subjects)}
 
+    def _build_eval_mask(self, date_cutoff: str, birth_dates_file: str) -> None:
+        """
+        Build a boolean mask [N, block_size] where True marks tokens that fall
+        after date_cutoff for each subject.  Used for longitudinal evaluation:
+        the model sees the full sequence as context but is only evaluated on
+        post-cutoff positions.
+
+        Subjects with no birth-date record are treated as having no post-cutoff
+        tokens (mask is all False).
+        """
+        from datetime import datetime
+        cutoff = datetime.strptime(date_cutoff, "%Y-%m-%d")
+
+        birth_df = pd.read_csv(birth_dates_file, sep="\t").set_index("eid")
+        sids = self._subject_ids.numpy()
+        birth_info = birth_df.reindex(sids)[["year", "month"]]
+
+        # Vectorised computation of per-subject cutoff age in days
+        valid = birth_info["year"].notna().values
+        cutoff_ages = np.full(len(sids), np.inf, dtype=np.float32)
+
+        if valid.any():
+            bi_valid = birth_info[valid]
+            birth_dates = pd.to_datetime({
+                "year":  bi_valid["year"].astype(int),
+                "month": bi_valid["month"].astype(int),
+                "day":   1,
+            })
+            cutoff_ages[valid] = (
+                (pd.Timestamp(cutoff) - birth_dates).dt.days.values.astype(np.float32)
+            )
+
+        self._cutoff_ages = torch.from_numpy(cutoff_ages)          # [N]
+        cutoff_ages_t = self._cutoff_ages.unsqueeze(1)             # [N, 1]
+
+        self._eval_mask = (
+            (self._ages > cutoff_ages_t) &
+            (self._ages > self.PADDING_AGE)
+        )
+
+        n_post = int(self._eval_mask.sum().item())
+        n_real = int((self._ages > self.PADDING_AGE).sum().item())
+        logger.info(
+            "date_cutoff=%s: %d/%d tokens are post-cutoff (longitudinal targets)",
+            date_cutoff, n_post, n_real,
+        )
+
     # ── Public interface ──────────────────────────────────────────────────
 
     @property
@@ -852,7 +909,7 @@ class DelphiDataset(Dataset):
         Returns copies of the cached tensors for one subject.
         Safe for multi-worker DataLoader.
         """
-        return {
+        item = {
             "domain_ids": self._domain_ids[index].clone(),
             "local_token_ids": self._local_token_ids[index].clone(),
             "ages": self._ages[index].clone(),
@@ -865,6 +922,9 @@ class DelphiDataset(Dataset):
                 for dname in self._continuous_cache
             },
         }
+        if self._eval_mask is not None:
+            item["eval_mask"] = self._eval_mask[index].clone()
+        return item
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
