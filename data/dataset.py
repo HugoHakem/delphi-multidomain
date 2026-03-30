@@ -472,6 +472,7 @@ class DelphiDataset(Dataset):
         else:
             self._eval_mask = None
             self._cutoff_ages = None
+            self._cutoff_date = None
 
         print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, "
               f"domains={list(self.domains.keys())}")
@@ -880,6 +881,7 @@ class DelphiDataset(Dataset):
                 (pd.Timestamp(cutoff) - birth_dates).dt.days.values.astype(np.float32)
             )
 
+        self._cutoff_date = pd.Timestamp(cutoff)                    # stored for date reconstruction
         self._cutoff_ages = torch.from_numpy(cutoff_ages)          # [N]
         cutoff_ages_t = self._cutoff_ages.unsqueeze(1)             # [N, 1]
 
