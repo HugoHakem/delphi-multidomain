@@ -118,10 +118,20 @@ In this configuration, all domains follow a strictly causal structure.
 Each domain may attend to **past tokens of itself and previous domains**, but never to the future
 nor to same-time tokens (`mask_ties=True`).
 
-You can also use the `all` alias to refer to every domain at once (brackets are optional):
-`"all:causal(mask_ties=True)"`
+Two built-in aliases are available for use in any domain group:
 
-This is equivalent to listing every domain explicitly and is handy when you don't want to enumerate them.
+| Alias | Expands to |
+|-------|-----------|
+| `all` | Every domain present in the model (equivalent to listing them all explicitly) |
+| `at_birth` | Every domain whose config entry has `at_birth: true` (resolved at model construction time from `config.domains`) |
+
+For example:
+```
+"all:causal(mask_ties=True)"
+"[at_birth]:bidirectional,all:causal(mask_ties=True)"
+```
+
+The second scheme gives every at-birth domain (e.g. `sex`, `hla_alleles`, `genetic_pcs`) a bidirectional block and makes all remaining domains causal — without having to enumerate them by name. If you later add or remove a domain from the config, the scheme automatically reflects the change.
 
 #### Example 2 — Bidirectional HLA block + causal domains
 On the other hand:
