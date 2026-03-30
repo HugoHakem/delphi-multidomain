@@ -437,6 +437,11 @@ class Delphi(nn.Module):
             attention_scheme = [attention_scheme]
         if len(attention_scheme) == 1:
             attention_scheme = self.config.n_layer * attention_scheme
+        if any("at_birth" in s for s in attention_scheme):
+            at_birth = ",".join(
+                name for name, cfg in self.config.domains.items() if cfg.at_birth
+            )
+            attention_scheme = [s.replace("at_birth", at_birth) for s in attention_scheme]
         return attention_scheme
 
     def _build_model(self, config):

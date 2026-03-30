@@ -40,6 +40,26 @@ def _load_attention_schemes():
 PREDEFINED_ATTENTION_SCHEMES = _load_attention_schemes()
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  at_birth alias
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+
+def _get_at_birth_domains(domain_config_path: str) -> list[str]:
+    """Return domain names with at_birth: true from a domain config YAML."""
+    path = Path(domain_config_path)
+    if not path.exists():
+        return []
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    return [name for name, cfg in data.items() if isinstance(cfg, dict) and cfg.get("at_birth")]
+
+
+def resolve_at_birth(s: str, at_birth_domains: list[str]) -> str:
+    return s.replace("at_birth", ",".join(at_birth_domains))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Predefined domain sets
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -100,6 +120,15 @@ with st.sidebar:
         format_func=lambda x: f"{x:.0e}",
     )
     test_folds = st.multiselect("test_fold", [1, 2, 3, 4, 5], default=[1, 2, 3, 4, 5])
+
+    st.subheader("Domain config")
+    _available_configs = sorted(_CONFIG_DIR.glob("domain_config*.yaml"))
+    _config_labels = {p.name: str(p) for p in _available_configs}
+    _config_choice = st.selectbox("domain_config", list(_config_labels.keys()))
+    domain_config_path = _config_labels.get(_config_choice, "")
+    at_birth_domains = _get_at_birth_domains(domain_config_path)
+    if at_birth_domains:
+        st.caption(f"at_birth → {', '.join(at_birth_domains)}")
 
     st.subheader("Other")
     num_workers = st.number_input("num_workers", min_value=0, max_value=16, value=4)
@@ -214,9 +243,9 @@ for i, cfg in enumerate(st.session_state.configs):
             if len(st.session_state.configs) > 1:
                 st.button("🗑️ Remove", key=f"remove_{i}", on_click=remove_config, args=(i,))
 
-        # Store resolved values
-        cfg["_domains"] = domains_str
-        cfg["_attn"] = attn_str
+        # Store resolved values (expand at_birth alias)
+        cfg["_domains"] = resolve_at_birth(domains_str, at_birth_domains)
+        cfg["_attn"] = resolve_at_birth(attn_str, at_birth_domains)
 
 col_add, _ = st.columns([1, 4])
 with col_add:
@@ -257,6 +286,7 @@ def generate_grid():
                     "learning_rate": lr,
                     "domains": domains,
                     "attention_scheme": attn,
+                    "domain_config": domain_config_path,
                     "num_workers": num_workers,
                     "seed": seed,
                     "use_amp": use_amp,
