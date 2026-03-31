@@ -1,3 +1,4 @@
+import time
 import pandas as pd
 from typing import List, Dict, Union
 import torch
@@ -349,6 +350,7 @@ class Trainer(BaseTrainer):
             t.add_column("Val dt",    justify="right",  width=10)
             t.add_column("Val tot",   justify="right",  width=10)
             t.add_column("LR",        justify="right",  width=9)
+            t.add_column("Time",      justify="right",  width=8)
             t.add_column("Improved?", justify="center", width=10)
             for row in epoch_rows:
                 t.add_row(*row)
@@ -387,6 +389,8 @@ class Trainer(BaseTrainer):
                 self.current_epoch = epoch
                 self.model.train()
 
+                t0 = time.perf_counter()
+
                 train_task = progress.add_task(
                     f"[green]Ep {epoch:>4d}  train", total=len(self.train_loader)
                 ) if progress else None
@@ -402,6 +406,10 @@ class Trainer(BaseTrainer):
                     n_batches=self.n_val_batches, _progress=progress, _task_id=val_task
                 )
                 if progress: progress.remove_task(val_task)
+
+                epoch_secs = time.perf_counter() - t0
+                epoch_time_str = (f"{int(epoch_secs//60)}m{int(epoch_secs%60):02d}s"
+                                  if epoch_secs >= 60 else f"{epoch_secs:.1f}s")
 
                 metrics = {"train_loss": train_loss}
                 if self.val_loss is not None:
@@ -457,6 +465,7 @@ class Trainer(BaseTrainer):
                     f"{self.val_loss['val_time_loss'].item():.4f}",
                     f"{self.val_loss['val_total'].item():.4f}",
                     f"{lr:.2e}",
+                    epoch_time_str,
                     "[yellow]★[/]" if improved else "",
                 ))
                 refresh_display()
@@ -503,6 +512,10 @@ class Trainer(BaseTrainer):
             # Mask: only compute loss on positions belonging to predicted domains
             predicted_ints = self._predicted_domain_ints.to(self.device)
             predict_mask = torch.isin(target_domain_ids, predicted_ints)  # [B, T-1]
+
+            # Exclude post-cutoff tokens from loss when eval_mask is present
+            if batch.eval_mask is not None:
+                predict_mask = predict_mask & ~batch.eval_mask[:, 1:]
 
             f_logits     = logits_cat[predict_mask]              # [N_pred, V_total]
             f_global_ids = target_global_ids[predict_mask]       # [N_pred]

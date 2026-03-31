@@ -3,7 +3,8 @@ import os, sys
 from pathlib import Path
 import yaml
 from dataclasses import dataclass, asdict
-from pprint import pformat    
+from pprint import pformat
+from dataclasses import fields as dc_fields
 import warnings
 import pandas as pd
 from auc.aucs import evaluate_aucs
@@ -56,6 +57,45 @@ torch.backends.cudnn.allow_tf32 = True
 
 USE_TQDM = sys.stdout.isatty()
 
+def _fmt(v):
+    if v is True:  return "✓"
+    if v is False: return "✗"
+    if v is None:  return "—"
+    return str(v)
+
+
+def format_delphi_config(cfg) -> str:
+    """Compact human-readable summary of a DelphiConfig."""
+    d = asdict(cfg)
+    domains = d.pop("domains", {})
+
+    # ── Scalar params ──────────────────────────────────────────────────
+    skip = {"path", "n_layers", "n_hidden", "input_size", "pretrained_path",
+            "subdomain", "group", "n_latent_tokens"}
+    lines = ["Model config:"]
+    for k, v in d.items():
+        lines.append(f"  {k}: {_fmt(v)}")
+
+    # ── Domains table ──────────────────────────────────────────────────
+    bool_cols   = ["predict", "at_birth", "age_jitter", "freeze"]
+    str_cols    = ["projector", "type", "dropout_mode", "dropout_rate"]
+    cols        = bool_cols + str_cols
+    col_widths  = {c: max(len(c), max(len(_fmt(d.get(c))) for d in domains.values()) if domains else 0)
+                   for c in cols}
+    dom_width   = max((len(n) for n in domains), default=6)
+
+    header = f"  {'domain':<{dom_width}}  " + "  ".join(f"{c:>{col_widths[c]}}" for c in cols)
+    sep    = "  " + "-" * (len(header) - 2)
+    lines += ["", "Domains:", header, sep]
+    for name, dc in domains.items():
+        row = f"  {name:<{dom_width}}  " + "  ".join(
+            f"{_fmt(dc.get(c)):>{col_widths[c]}}" for c in cols
+        )
+        lines.append(row)
+
+    return "\n".join(lines)
+
+
 def parse_attention_scheme(attention_scheme, as_list=True):
     
     if isinstance(attention_scheme, str):
@@ -105,6 +145,10 @@ def get_cli_args():
     parser.add_argument("--lr_decay_iters", default=10000, type=int)
     parser.add_argument("--test_fold",          default=1,    type=int)
     parser.add_argument("--subjects",           default=None, type=str)
+    parser.add_argument("--date_cutoff",        default=None, type=str,
+                        help="ISO date (YYYY-MM-DD). Tokens after this date are marked via eval_mask.")
+    parser.add_argument("--birth_dates_file",   default=None, type=str,
+                        help="Path to TSV with columns eid, year, month (used with --date_cutoff).")
     parser.add_argument("--seed",               default=142, type=int)
     parser.add_argument("--compute_aucs",           default=False, action="store_true")
     parser.add_argument("--log_loss_per_disease",   default=False, action="store_true",
@@ -182,6 +226,8 @@ def get_dataloaders(
         no_event_insertion_mode=no_event_insertion_mode,
         continuous_domains=continuous_domains,
         age_domains=["diseases", "death"],
+        date_cutoff=args.date_cutoff,
+        birth_dates_file=args.birth_dates_file,
     )
 
     train_dataset = DelphiDataset(subjects=train_ids, **dataset_kwargs)
@@ -258,13 +304,14 @@ if __name__ == "__main__":
             n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head,
             domains=domain_cfg, attention_scheme=attention_scheme,
             token_dropout=args.token_dropout,
-            block_size=cache_block_size,
+            # block_size=cache_block_size,
+            block_size=128,
             no_event_token_rate=args.no_event_token_rate, 
             no_event_token_insertion_mode=args.no_event_token_insertion_mode,
             seed=args.seed
         )
     
-        logging.info("Config:\n%s", pformat(asdict(delphi_config), sort_dicts=False))
+        logging.info("\n%s", format_delphi_config(delphi_config))
         model = Delphi(delphi_config).to(DEVICE)
         if not args.no_compile:
             logging.info("Compiling model with torch.compile (first batch will be slower)...")
@@ -367,7 +414,7 @@ if __name__ == "__main__":
         optim_config=optim_config,
     )
 
-    trainer.train(max_epochs=1000, patience=10)
+    trainer.train(max_epochs=1000, patience=20)
 
     if args.compute_aucs:
         

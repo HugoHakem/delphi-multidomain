@@ -55,6 +55,7 @@ class DelphiBatch:
     subject_ids: torch.Tensor                         # [B]     int
     continuous_data: Dict[str, torch.Tensor]           # {name: [B, dim]}
     continuous_positions: Dict[str, torch.Tensor]      # {name: [B, n_latent]}
+    eval_mask: Optional[torch.Tensor] = None          # [B, T]  bool; True = post-cutoff (exclude from loss)
 
     def to(self, device: Union[str, torch.device]) -> "DelphiBatch":
         """Move all tensors to device."""
@@ -69,6 +70,7 @@ class DelphiBatch:
             continuous_positions={
                 k: v.to(device) for k, v in self.continuous_positions.items()
             },
+            eval_mask=self.eval_mask.to(device) if self.eval_mask is not None else None,
         )
 
     @property
@@ -1072,6 +1074,10 @@ class DelphiCollateFn:
                 domain_ids[drop_mask] = self.padding_domain_id
                 local_token_ids[drop_mask] = self.PADDING_TOKEN
 
+        # ── 2.9. Stack eval_mask if present ──────────────────────────────
+        has_eval_mask = "eval_mask" in batch[0]
+        eval_mask = torch.stack([item["eval_mask"] for item in batch]) if has_eval_mask else None
+
         # ── 3. Sort by (age, domain_id) per subject ──────────────────────
         DOMAIN_SCALE = 0.001  # small enough to not affect age ordering
         sort_key = ages + domain_ids.float() * DOMAIN_SCALE
@@ -1080,6 +1086,8 @@ class DelphiCollateFn:
         domain_ids = domain_ids.gather(1, sort_indices)
         local_token_ids = local_token_ids.gather(1, sort_indices)
         ages = ages.gather(1, sort_indices)
+        if eval_mask is not None:
+            eval_mask = eval_mask.gather(1, sort_indices)
 
         # ── 4. Compute global token IDs ───────────────────────────────────
         global_token_ids = local_token_ids.clone()
@@ -1114,6 +1122,8 @@ class DelphiCollateFn:
                 global_token_ids = global_token_ids[:, trim_start:]
                 domain_ids       = domain_ids[:, trim_start:]
                 ages             = ages[:, trim_start:]
+                if eval_mask is not None:
+                    eval_mask = eval_mask[:, trim_start:]
                 for k in continuous_positions:
                     continuous_positions[k] = (continuous_positions[k] - trim_start).clamp(min=0)
 
@@ -1124,6 +1134,7 @@ class DelphiCollateFn:
             subject_ids=subject_ids,
             continuous_data=continuous_data,
             continuous_positions=continuous_positions,
+            eval_mask=eval_mask,
         )
 
 
