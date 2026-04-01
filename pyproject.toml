@@ -1,0 +1,78 @@
+[project]
+name = "delphi"
+version = "0.1.0"
+description = "Modelling human health trajectories using generative transformers Resources"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "torch==2.3.0",
+  "numpy<2.0",
+  "matplotlib",
+  "seaborn",
+  "shap",
+  "pandas",
+  "umap-learn",
+  "tqdm",
+  "statsmodels",
+  "easydict",
+  "ipywidgets",
+]
+
+[project.optional-dependencies]
+lint = ["ruff"]
+mypy = ["mypy"]
+log = [
+  "wandb>=0.25.1,<0.26",
+  "mlflow",
+  "loguru"
+]
+test = [
+  "pytest",
+]
+apps = [
+  "streamlit",
+  "jupytext",
+]
+dev = [
+    "delphi[lint,mypy,log,test,apps]"
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu118", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu118", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.ruff]
+line-length = 120
+extend-include = ["*.ipynb"]
+target-version = "py310"
+
+[tool.mypy]
+ignore_missing_imports = true
+explicit_package_bases = true
+check_untyped_defs = true
+warn_unreachable = true
+
+
+
+
+
+
+
+
