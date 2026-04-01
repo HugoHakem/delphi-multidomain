@@ -24,7 +24,7 @@ lint = ["ruff"]
 mypy = ["mypy"]
 log = [
   "wandb>=0.25.1,<0.26",
-  "mlflow",
+  "mlflow<3.6", # superior to 3.6 introduce sqlite as the recommended/default backend. 
   "loguru"
 ]
 test = [
