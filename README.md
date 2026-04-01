@@ -2,7 +2,6 @@
 >
 > The codebase is evolving and interfaces are not yet stable. Changes may affect the CLI, model architecture, configuration schema, default parameter values and output formats.
 
-
 # Multi-domain Delphi
 
 This repository extends the **Delphi** core codebase to support **multi-domain longitudinal data**, beyond standard diagnosis codes.
@@ -14,21 +13,25 @@ It focuses on:
 
 ## Table of contents
 
-- [Overview](#multi-domain-delphi)
-- [Training](#training)
-  - [Preparing the data for each domain](#preparing-the-data-for-each-domain)
-  - [Specifying the attention scheme](#specifying-the-attention-scheme)
-  - [Exemplar command](#exemplar-command)
-  - [Mixed precision (`--use_amp`)](#mixed-precision---use_amp)
-  - [AUC computation (`--compute_aucs`)](#auc-computation---compute_aucs)
-  - [Model tracking with MLflow](#model-tracking-with-mlflow)
-- [Evaluation](#evaluation)
-- [Model explainability](#model-explainability)
-- [Hyperparameter search with Slurm](#submitting-a-hyperparameter-search-as-slurm-job-array)
-- [Querying MLflow runs](#tips-for-querying-mlflow-runs)
-- [Developer notes](#notes-for-developers)
+- [Multi-domain Delphi](#multi-domain-delphi)
+  - [Table of contents](#table-of-contents)
+  - [Software environment](#software-environment)
+  - [Training](#training)
+    - [Preparing the data for each domain](#preparing-the-data-for-each-domain)
+    - [Specifying the attention scheme](#specifying-the-attention-scheme)
+      - [Example 1: Fully causal attention (with tie-masking, i.e. no same-time attention)](#example-1-fully-causal-attention-with-tie-masking-ie-no-same-time-attention)
+      - [Example 2 — Bidirectional HLA block + causal domains](#example-2--bidirectional-hla-block--causal-domains)
+    - [Exemplar command](#exemplar-command)
+    - [Mixed precision (`--use_amp`)](#mixed-precision---use_amp)
+    - [AUC computation (`--compute_aucs`)](#auc-computation---compute_aucs)
+    - [Model tracking with MLflow](#model-tracking-with-mlflow)
+  - [Model explainability](#model-explainability)
+  - [Submitting a hyperparameter search as Slurm job array](#submitting-a-hyperparameter-search-as-slurm-job-array)
+  - [Tips for querying MLflow runs](#tips-for-querying-mlflow-runs)
+  - [Notes for developers](#notes-for-developers)
 
 ## Software environment
+
 _To be completed_
 The code has been tested with the following versions:
 - `numpy=1.26.4`
@@ -36,11 +39,12 @@ The code has been tested with the following versions:
 - `mlflow=2.22.0`
 - `torch=2.3.0`
 
-## Training 
+## Training
 
 _To be completed_
 
 ### Preparing the data for each domain
+
 Domains are configured via a YAML file (see `config/domain_config_default.yaml` for a reference).
 Each entry defines one domain and its properties:
 
@@ -73,7 +77,8 @@ genetic_pcs:
 **`no_repeat: true`** should be set for domains where each token appears at most once per subject by construction (e.g. diseases recorded only at first diagnosis). When enabled, the logits for already-seen tokens are set to `-inf` after each forward pass, before the loss is computed. This prevents the model from learning the spurious pattern of suppressing a disease's logit once it has appeared - an artefact of the data, not a biological signal.
 
 Pass the config file via `--domain_config_yaml` and select which domains to activate with `--domains`:
-```
+
+```bash
 python train.py --domain_config_yaml config/domain_config_default.yaml --domains diseases,lifestyle,sex ...
 ```
 
@@ -84,6 +89,7 @@ For each domain, create a folder under `data/transforms/tokens/<domain_name>/` w
 - `tokenizer.yaml`: list of token names in order; position determines `token_id` (zero-based).
 
 ### Specifying the attention scheme
+
 The attention scheme within and across domains is specified via `--attention_scheme`. You can either pass a scheme string directly or use a named alias defined in `config/attention_schemes.yaml`:
 
 ```yaml
@@ -97,13 +103,14 @@ hla_causal:
   scheme: "all:causal(mask_ties=True)"
 ```
 
-```
+```bash
 python train.py --attention_scheme hla_bidir ...
 ```
 
 Add your own aliases to that file to avoid repeating long scheme strings across runs.
 
 #### Example 1: Fully causal attention (with tie-masking, i.e. no same-time attention)
+
 For instance:
 `"[sex,diseases,lifestyle,death,hla_alleles,rare_variants]:causal(mask_ties=True)"`
 
@@ -137,6 +144,7 @@ For example:
 The second scheme gives every at-birth domain (e.g. `sex`, `hla_alleles`, `genetic_pcs`) a bidirectional block and makes all remaining domains causal — without having to enumerate them by name. If you later add or remove a domain from the config, the scheme automatically reflects the change.
 
 #### Example 2 — Bidirectional HLA block + causal domains
+
 On the other hand:
 `"[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"`
 
@@ -153,8 +161,10 @@ contextualization of at-birth attributes. All downstream domains follow a causal
 ensuring temporal consistency while allowing conditioning on static information.
 
 ### Exemplar command
+
 This is an exemplar training command, training with the usual domains (`diseases,lifestyle,sex,death`) plus the `rare_variants` domain:
-```
+
+```bash
 python train.py \
   --domains diseases,death,lifestyle,sex,rare_variants \
   --attention_scheme "[sex,diseases,lifestyle,death,rare_variants]:causal(mask_ties=True)" \
@@ -162,29 +172,37 @@ python train.py \
   --n_embd 240 \
   --experiment_name rare_variants
 ```
+
 Note: `padding` is added automatically and does not need to be listed in `--domains` or `--attention_scheme`.
 
 ### Mixed precision (`--use_amp`)
+
 Enables automatic mixed precision using **bfloat16**, which reduces memory usage and speeds up training on supported GPUs (Ampere and newer):
-```
+
+```bash
 python train.py --use_amp ...
 ```
+
 bfloat16 has the same exponent range as float32, so gradient scaling is not required. If the GPU does not support bfloat16, the flag has no effect.
 
 ### AUC computation (`--compute_aucs`)
+
 If passed, AUCs are computed at the end of training and saved as a CSV file under the `aucs/` subdirectory of the run's MLflow artifact directory.
 
 ### Model tracking with MLflow
+
 You can specify a custom MLflow location by setting the `MLFLOW_TRACKING_URI` environment variable, otherwise it's the `mlruns` folder within this repo's root directory.
-The previous command will create an MLflow experiment called `rare_variants`. 
+The previous command will create an MLflow experiment called `rare_variants`.
 Instructions are provided later on how to query the information logged by MLflow.
 
 ## Model explainability
+
 _To be completed_
 
 This section will contain details on how to perform SHAP calculation using Nextflow.
 
 ## Submitting a hyperparameter search as Slurm job array
+
 _To be completed_
 
 This section will provide tips to explore different combinations of hyperparameters by using Slurm's job array feature.
@@ -210,18 +228,20 @@ mlflow runs list --exp-id $EXP_ID
 ## Notes for developers
 
 > **Note on Jupytext usage**
-> 
+>
 > This repository makes extensive use of Jupyter notebooks in `.py` format via **Jupytext**.
 > These files can be identified by `# %%` cell separators.
-> 
+>
 > This choice allows the same files to be run both as notebooks and as regular Python scripts, and improves readability and version control compared to `.ipynb` notebooks.
-> 
+>
 > Install:
+>
 > ```bash
 > pip install jupytext
 > ```
-> 
+>
 > Convert to `.ipynb`:
+>
 > ```bash
 > jupytext --to ipynb PATH_TO_FILE.py
 > ```
@@ -229,5 +249,5 @@ mlflow runs list --exp-id $EXP_ID
 _To be completed_
 
 This section will contain:
-- Notes on how to extend this codebase. 
+- Notes on how to extend this codebase.
 - Tips on unit tests.

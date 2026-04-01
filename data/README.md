@@ -32,7 +32,6 @@ The labels file should be a CSV with only one column:
 
 Place this file into the `data/%your_name%` folder.
 
-
 ## Conversion of UK Biobank records to delphi format
 
 We provide an example notebook to illustrate how to convert UK Biobank first occurances data into the format needed for Delphi:
@@ -58,4 +57,4 @@ Now you are ready to train the model.
 
 ```bash
 python train.py config/%my_config%.py --dataset %your_name% --out_dir=%your_model_name%
-``` 
+```

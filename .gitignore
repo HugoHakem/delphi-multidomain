@@ -15,3 +15,6 @@ checkpoints/
 *swp
 *output*
 data
+.mypy_cache/
+.vscode/
+.env
