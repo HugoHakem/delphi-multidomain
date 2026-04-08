@@ -160,7 +160,10 @@ def reconstruct_from_run(run_id, block_size=None, batch_size=512, num_workers=4)
     )
 
     model = Delphi(delphi_config)
-    model.load_state_dict(ckpt["state_dict"], strict=False)
+    state_dict = ckpt["state_dict"]
+    if any(k.startswith('_orig_mod.') for k in state_dict):
+        state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict, strict=False)
     model = model.to(DEVICE)
     model.eval()
 

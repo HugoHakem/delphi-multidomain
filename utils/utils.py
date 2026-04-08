@@ -264,7 +264,11 @@ def config_from_runid(runid):
 
     # ------------------------------------------------------------------------------------------------
     runinfo.data.params.pop("ema_alpha")
-    runinfo.data.params['attention_scheme'] = ast.literal_eval(runinfo.data.params['attention_scheme'])            
+    try:
+        runinfo.data.params['attention_scheme'] = ast.literal_eval(runinfo.data.params['attention_scheme'])
+    except (ValueError, SyntaxError):
+        # Stored as a plain scheme string, not a Python list repr
+        runinfo.data.params['attention_scheme'] = [runinfo.data.params['attention_scheme']]
     s = runinfo.data.params['domains']        
     s_clean = re.sub(r"PosixPath\(([^)]+)\)", r"\1", s)
     runinfo.data.params['domains'] = s_clean
@@ -283,12 +287,10 @@ def config_from_runid(runid):
             runinfo.data.params[param] = True if runinfo.data.params[param] == "True" else False
     # ------------------------------------------------------------------------------------------------
 
-    tracking_uri = Path(os.path.dirname(mlflow.get_tracking_uri()))
-
-    ckpt_dir = tracking_uri / (artifact_uri + "/checkpoints")
+    ckpt_dir = Path(re.sub(r"^file://", "", runinfo.info.artifact_uri)) / "checkpoints"
     ckpt_files = sorted(Path(ckpt_dir).glob("*.pt"))
     if not ckpt_files:
-        raise FileNotFoundError(f"No checkpoints found for run {runid}")
+        raise FileNotFoundError(f"No checkpoints found for run {runid} (looked in {ckpt_dir})")
     latest_ckpt = ckpt_files[-1]
 
     print(f"Loading latest checkpoint: {latest_ckpt}")    
@@ -305,12 +307,18 @@ def config_from_runid(runid):
             raise ValueError(f"Cannot parse optim_config string: {optim_config_raw!r}")
     else:
         optim_config = optim_config_raw
-    delphi_cfg = DelphiConfig(**runinfo.data.params)
+    from dataclasses import fields as dc_fields
+    valid_keys = {f.name for f in dc_fields(DelphiConfig)}
+    delphi_params = {k: v for k, v in runinfo.data.params.items() if k in valid_keys}
+    delphi_cfg = DelphiConfig(**delphi_params)
     model = Delphi(delphi_cfg)
     ckpt = torch.load(latest_ckpt)
 
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
-    model.load_state_dict(ckpt['state_dict'], strict=False)
+    state_dict = ckpt['state_dict']
+    if any(k.startswith('_orig_mod.') for k in state_dict):
+        state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict, strict=False)
 
     root_path = DELPHI_DIR / "data" / "transforms"
     continuous_domains = {
