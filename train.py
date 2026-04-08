@@ -417,10 +417,23 @@ if __name__ == "__main__":
     trainer.train(max_epochs=1000, patience=20)
 
     if args.compute_aucs:
-        
+
         from auc.aucs import evaluate_aucs
+        import copy
         model.eval()
-        test_loader = dataloaders[2]    
+
+        # evaluate_aucs requires fixed T across all batches; swap collate to use
+        # block_size=128 instead of "auto" so torch.cat on embeddings doesn't fail.
+        auc_collate = copy.copy(dataloaders[2].collate_fn)
+        auc_collate.block_size = 128
+        test_loader = DataLoader(
+            dataloaders[2].dataset,
+            batch_size=dataloaders[2].batch_size,
+            shuffle=False,
+            num_workers=dataloaders[2].num_workers,
+            pin_memory=True,
+            collate_fn=auc_collate,
+        )
         del dataloaders
     
         auc_df = evaluate_aucs(
