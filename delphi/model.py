@@ -61,6 +61,7 @@ class DomainConfig:
     group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
     dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
     dropout_rate: float = 0.0             # probability of dropping; 0 = disabled
+    no_repeat: bool = False               # mask already-seen tokens from logits (for domains where only first occurrence is recorded)
 
     def set_freeze(self, freeze: bool):
         self.freeze = freeze
@@ -699,3 +700,55 @@ class Delphi(nn.Module):
         model = model.to(device)
 
         return model
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Post-forward utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def mask_seen_token_logits(
+    model: Delphi,
+    batch: "DelphiBatch",
+    logits_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """
+    For domains with no_repeat=True, set logits of already-seen tokens to -inf.
+
+    At each prediction position t, any token that appeared in the input context
+    (positions 0..t) is masked out before the loss is computed. This prevents
+    the model from learning to suppress tokens that cannot recur by construction
+    of the dataset (e.g. diseases recorded only at first diagnosis).
+    """
+    no_repeat_domains = [
+        dname for dname, cfg in model.config.domains.items()
+        if cfg.no_repeat and dname in logits_dict
+    ]
+    if not no_repeat_domains:
+        return logits_dict
+
+    B, T = batch.domain_ids.shape
+    logits_dict = dict(logits_dict)  # shallow copy
+
+    for dname in no_repeat_domains:
+        d_int = model.domain_to_int[dname]
+        d_offset = model.domain_offsets[d_int]
+        domain_logits = logits_dict[dname]        # [B, T, D_vocab]
+        D_vocab = domain_logits.shape[-1]
+
+        # Use domain_ids to identify positions
+        is_domain = (batch.domain_ids == d_int)                       # [B, T]
+        b_idx, t_idx = is_domain.nonzero(as_tuple=True)
+        local_ids = batch.global_token_ids[b_idx, t_idx] - d_offset  # guaranteed in [0, D_vocab-1]
+
+        # one_hot[b, t, d] = True iff position t in sequence b is local token d
+        one_hot = torch.zeros(B, T, D_vocab, device=batch.domain_ids.device, dtype=torch.bool)
+        one_hot[b_idx, t_idx, local_ids] = True
+
+        # seen_up_to[b, t, d] = True iff token d appeared in positions 0..t
+        seen_up_to = one_hot.cumsum(dim=1).bool()  # [B, T, D_vocab]
+
+        # logits[:, t, :] predicts the next token after position t;
+        # the context available at that step is exactly positions 0..t.
+        logits_dict[dname] = domain_logits.masked_fill(seen_up_to, float('-inf'))
+
+    return logits_dict
