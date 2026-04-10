@@ -19,6 +19,8 @@ from dataclasses import asdict
 from pathlib import Path
 import json
 
+from delphi.model import mask_seen_token_logits
+
 
 def lod2dol(lod):
     """
@@ -495,6 +497,7 @@ class Trainer(BaseTrainer):
 
             # Forward pass
             logits_dict, att = model(batch, return_attention=return_att)
+            logits_dict = mask_seen_token_logits(model, batch, logits_dict)
 
             # ── Build targets from the batch ──────────────────────────────
             target_global_ids = batch.global_token_ids[:, 1:]    # [B, T-1]

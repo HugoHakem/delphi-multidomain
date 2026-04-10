@@ -2,6 +2,7 @@ diseases:
   projector: embed
   path: diseases
   predict: true
+  no_repeat: true
   dropout_mode: token
   dropout_rate: 0.1
 
