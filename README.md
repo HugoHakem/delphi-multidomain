@@ -49,6 +49,7 @@ diseases:
   projector: embed
   path: diseases
   predict: true
+  no_repeat: true   # each disease is recorded only at first diagnosis
 
 lifestyle:
   projector: embed
@@ -68,6 +69,8 @@ genetic_pcs:
   input_size: 40
   n_latent_tokens: 5
 ```
+
+**`no_repeat: true`** should be set for domains where each token appears at most once per subject by construction (e.g. diseases recorded only at first diagnosis). When enabled, the logits for already-seen tokens are set to `-inf` after each forward pass, before the loss is computed. This prevents the model from learning the spurious pattern of suppressing a disease's logit once it has appeared - an artefact of the data, not a biological signal.
 
 Pass the config file via `--domain_config_yaml` and select which domains to activate with `--domains`:
 ```
