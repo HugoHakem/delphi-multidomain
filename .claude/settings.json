@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/marimo-check.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "marimo-pair@marimo-pair": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(bash ~/.claude/skills/marimo-pair/scripts/discover-servers.sh *)",
+      "Bash(bash ~/.claude/skills/marimo-pair/scripts/execute-code.sh *)"
+    ]
+  }
+}
