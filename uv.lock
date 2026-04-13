@@ -380,7 +380,7 @@ wheels = [
 [[package]]
 name = "delphi"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "easydict" },
     { name = "ipywidgets" },
@@ -388,6 +388,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "seaborn" },
+    { name = "setuptools" },
     { name = "shap" },
     { name = "statsmodels" },
     { name = "torch", version = "2.3.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
@@ -399,65 +400,50 @@ dependencies = [
 
 [package.optional-dependencies]
 apps = [
-    { name = "plotly" },
-    { name = "streamlit" },
-]
-dev = [
-    { name = "ipykernel" },
-    { name = "jupytext" },
-    { name = "loguru" },
     { name = "marimo" },
-    { name = "mlflow" },
-    { name = "mypy" },
     { name = "plotly" },
-    { name = "pytest" },
-    { name = "ruff" },
     { name = "streamlit" },
-    { name = "wandb" },
-]
-lint = [
-    { name = "ruff" },
 ]
 log = [
     { name = "loguru" },
     { name = "mlflow" },
     { name = "wandb" },
 ]
-mypy = [
+
+[package.dev-dependencies]
+dev = [
+    { name = "delphi", extra = ["apps", "log"] },
+    { name = "ipykernel" },
+    { name = "jupytext" },
     { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+lint = [
+    { name = "mypy" },
+    { name = "ruff" },
 ]
 notebook = [
     { name = "ipykernel" },
     { name = "jupytext" },
-    { name = "marimo" },
 ]
 test = [
     { name = "pytest" },
 ]
 
-[package.dev-dependencies]
-app = [
-    { name = "plotly" },
-]
-
 [package.metadata]
 requires-dist = [
-    { name = "delphi", extras = ["lint", "mypy", "log", "test", "notebook", "apps"], marker = "extra == 'dev'" },
     { name = "easydict" },
-    { name = "ipykernel", marker = "extra == 'notebook'", specifier = ">=7.2.0" },
     { name = "ipywidgets" },
-    { name = "jupytext", marker = "extra == 'notebook'" },
     { name = "loguru", marker = "extra == 'log'" },
-    { name = "marimo", marker = "extra == 'notebook'" },
+    { name = "marimo", marker = "extra == 'apps'" },
     { name = "matplotlib" },
     { name = "mlflow", marker = "extra == 'log'", specifier = "<3.6" },
-    { name = "mypy", marker = "extra == 'mypy'" },
     { name = "numpy", specifier = "<2.0" },
     { name = "pandas" },
     { name = "plotly", marker = "extra == 'apps'" },
-    { name = "pytest", marker = "extra == 'test'" },
-    { name = "ruff", marker = "extra == 'lint'" },
     { name = "seaborn" },
+    { name = "setuptools" },
     { name = "shap" },
     { name = "statsmodels" },
     { name = "streamlit", marker = "extra == 'apps'" },
@@ -467,10 +453,26 @@ requires-dist = [
     { name = "umap-learn" },
     { name = "wandb", marker = "extra == 'log'", specifier = ">=0.25.1,<0.26" },
 ]
-provides-extras = ["lint", "mypy", "log", "test", "notebook", "apps", "dev"]
+provides-extras = ["log", "apps"]
 
 [package.metadata.requires-dev]
-app = [{ name = "plotly", specifier = ">=6.6.0" }]
+dev = [
+    { name = "delphi", extras = ["log", "apps"] },
+    { name = "ipykernel", specifier = ">=7.2.0" },
+    { name = "jupytext" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+lint = [
+    { name = "mypy" },
+    { name = "ruff" },
+]
+notebook = [
+    { name = "ipykernel", specifier = ">=7.2.0" },
+    { name = "jupytext" },
+]
+test = [{ name = "pytest" }]
 
 [[package]]
 name = "docker"
@@ -2417,6 +2419,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/de/df/5008954f5466085966468612a7d1638487596ee6d2fd7fb51783a85351bf/sentry_sdk-2.56.0.tar.gz", hash = "sha256:fdab72030b69625665b2eeb9738bdde748ad254e8073085a0ce95382678e8168", size = 426820, upload-time = "2026-03-24T09:56:36.575Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cd/1a/b3a3e9f6520493fed7997af4d2de7965d71549c62f994a8fd15f2ecd519e/sentry_sdk-2.56.0-py2.py3-none-any.whl", hash = "sha256:5afafb744ceb91d22f4cc650c6bd048ac6af5f7412dcc6c59305a2e36f4dbc02", size = 451568, upload-time = "2026-03-24T09:56:34.807Z" },
+]
+
+[[package]]
+name = "setuptools"
+version = "82.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/db/cfac1baf10650ab4d1c111714410d2fbb77ac5a616db26775db562c8fab2/setuptools-82.0.1.tar.gz", hash = "sha256:7d872682c5d01cfde07da7bccc7b65469d3dca203318515ada1de5eda35efbf9", size = 1152316, upload-time = "2026-03-09T12:47:17.221Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9d/76/f789f7a86709c6b087c5a2f52f911838cad707cc613162401badc665acfe/setuptools-82.0.1-py3-none-any.whl", hash = "sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb", size = 1006223, upload-time = "2026-03-09T12:47:15.026Z" },
 ]
 
 [[package]]
