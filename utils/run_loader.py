@@ -189,19 +189,19 @@ def reconstruct_model(run_id: str):
     from delphi.model import Delphi, DelphiConfig
     from utils.mlflow_utils import load_run_params, load_checkpoint, parse_domains_param
     from utils.ckpt_utils import (
-        infer_delphi_config_from_state_dict,
-        migrate_legacy_state_dict,
-        migrate_domain_embed_to_global_embed,
+        _infer_delphi_config_from_state_dict,
+        _migrate_legacy_state_dict,
+        _migrate_domain_embed_to_global_embed,
     )
 
     params = load_run_params(run_id)
     attn_scheme = params["attention_scheme"]
 
     ckpt, ckpt_path = load_checkpoint(run_id)
-    weights = migrate_legacy_state_dict(ckpt["state_dict"])
+    weights = _migrate_legacy_state_dict(ckpt["state_dict"])
     test_ids = ckpt["metadata"]["test_ids"]
 
-    cfg = infer_delphi_config_from_state_dict(weights)
+    cfg = _infer_delphi_config_from_state_dict(weights)
     domain_cfg = parse_domains_param(params["domains"])
 
     tokens_dir = DELPHI_DIR / "data" / "transforms" / "tokens"
@@ -219,7 +219,7 @@ def reconstruct_model(run_id: str):
     )
 
     model = Delphi(delphi_cfg)
-    weights = migrate_domain_embed_to_global_embed(weights, model)
+    weights = _migrate_domain_embed_to_global_embed(weights, model)
     model.load_state_dict(weights, strict=True)
     model.to("cpu")
     model.eval()
