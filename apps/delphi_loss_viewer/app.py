@@ -12,7 +12,7 @@ import mlflow
 DELPHI_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(DELPHI_DIR))
 
-from utils.utils import setup_mlflow
+from utils import setup_mlflow
 
 # local modules
 from helpers import load_labels, exponential_moving_average

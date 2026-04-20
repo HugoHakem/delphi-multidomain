@@ -1,15 +1,15 @@
 # %%
-import os, sys
+import os
+import sys
 from pathlib import Path
 import yaml
-from dataclasses import dataclass, asdict
-from pprint import pformat    
+from dataclasses import asdict
+from pprint import pformat
 import warnings
 import pandas as pd
 from auc.aucs import evaluate_aucs
 import torch
 from torch.utils.data import DataLoader
-from easydict import EasyDict
 import mlflow
 
 import logging
@@ -22,7 +22,6 @@ if ( DELPHI_DIR := Path(__file__).resolve().parent ) not in sys.path:
 from data.dataset import (
     DelphiDataset,
     DelphiCollateFn,
-    DelphiBatch,
     AgeSampler,
 )
 
@@ -43,18 +42,56 @@ from utils.trainer import (
 )
 
 from utils.cv_utils import get_data_partitions
-from utils.utils import load_domain_config, setup_mlflow
+from utils import load_domain_config, setup_mlflow, AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
 
 setup_mlflow()
 
 root_path = DELPHI_DIR / "data" / "transforms"
-ATTENTION_SCHEMES = yaml.safe_load( (DELPHI_DIR / "config" / "attention_schemes.yaml").read_text() )
-AUTO_BLOCK_SIZE = 512   # cache upper bound when block_size="auto"
+ATTENTION_SCHEMES = yaml.safe_load((DELPHI_DIR / "config" / "attention_schemes.yaml").read_text())
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
 
 USE_TQDM = sys.stdout.isatty()
+
+def _fmt(v):
+    if v is True:  return "✓"
+    if v is False: return "✗"
+    if v is None:  return "—"
+    return str(v)
+
+
+def format_delphi_config(cfg) -> str:
+    """Compact human-readable summary of a DelphiConfig."""
+    d = asdict(cfg)
+    domains = d.pop("domains", {})
+
+    # ── Scalar params ──────────────────────────────────────────────────
+    skip = {"path", "n_layers", "n_hidden", "input_size", "pretrained_path",
+            "subdomain", "group", "n_latent_tokens"}
+    lines = ["Model config:"]
+    for k, v in d.items():
+        lines.append(f"  {k}: {_fmt(v)}")
+
+    # ── Domains table ──────────────────────────────────────────────────
+    bool_cols   = ["predict", "at_birth", "age_jitter", "freeze"]
+    str_cols    = ["projector", "type", "dropout_mode", "dropout_rate"]
+    cols        = bool_cols + str_cols
+    col_widths  = {c: max(len(c), max(len(_fmt(d.get(c))) for d in domains.values()) if domains else 0)
+                   for c in cols}
+    dom_width   = max((len(n) for n in domains), default=6)
+
+    header = f"  {'domain':<{dom_width}}  " + "  ".join(f"{c:>{col_widths[c]}}" for c in cols)
+    sep    = "  " + "-" * (len(header) - 2)
+    lines += ["", "Domains:", header, sep]
+    for name, dc in domains.items():
+        row = f"  {name:<{dom_width}}  " + "  ".join(
+            f"{_fmt(dc.get(c)):>{col_widths[c]}}" for c in cols
+        )
+        lines.append(row)
+
+    return "\n".join(lines)
+
 
 def parse_attention_scheme(attention_scheme, as_list=True):
     
@@ -105,6 +142,10 @@ def get_cli_args():
     parser.add_argument("--lr_decay_iters", default=10000, type=int)
     parser.add_argument("--test_fold",          default=1,    type=int)
     parser.add_argument("--subjects",           default=None, type=str)
+    parser.add_argument("--date_cutoff",        default=None, type=str,
+                        help="ISO date (YYYY-MM-DD). Tokens after this date are marked via eval_mask.")
+    parser.add_argument("--birth_dates_file",   default=None, type=str,
+                        help="Path to TSV with columns eid, year, month (used with --date_cutoff).")
     parser.add_argument("--seed",               default=142, type=int)
     parser.add_argument("--compute_aucs",           default=False, action="store_true")
     parser.add_argument("--log_loss_per_disease",   default=False, action="store_true",
@@ -144,9 +185,9 @@ def get_continuous_domains(domain_cfg):
 
 
 def get_dataloaders(
-    domain_cfg,
+    domain_cfg, 
     model,
-    test_fold,
+    test_fold, 
     block_size,
     batch_size,
     num_workers=4,
@@ -154,7 +195,6 @@ def get_dataloaders(
     no_event_insertion_mode="random",
     seed=42,
     subjects_include_list=None,
-    use_compile=True,
 ):
     train_ids, val_ids, test_ids = get_data_partitions(
         "./data/transforms/subject_lists", fold=test_fold
@@ -183,6 +223,8 @@ def get_dataloaders(
         no_event_insertion_mode=no_event_insertion_mode,
         continuous_domains=continuous_domains,
         age_domains=["diseases", "death"],
+        date_cutoff=args.date_cutoff,
+        birth_dates_file=args.birth_dates_file,
     )
 
     train_dataset = DelphiDataset(subjects=train_ids, **dataset_kwargs)
@@ -216,14 +258,6 @@ def get_dataloaders(
     eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
 
     loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
-    if num_workers > 0 and use_compile:
-        # Fix: 
-        # Workers are re-forked at the end of each epoch (iterator GC). On exit,
-        # forked workers trigger LLVM thread cleanup which fails with pthread_join
-        # errors because torch.compile's LLVM thread pool is invalid in child processes.
-        # persistent_workers keeps workers alive across epochs so they never exit
-        # mid-training; the harmless LLVM error at program end is after training completes.
-        loader_kwargs["persistent_workers"] = True
 
     train_loader = DataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **loader_kwargs)
     valid_loader = DataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
@@ -267,13 +301,14 @@ if __name__ == "__main__":
             n_embd=args.n_embd, n_layer=args.n_layer, n_head=args.n_head,
             domains=domain_cfg, attention_scheme=attention_scheme,
             token_dropout=args.token_dropout,
-            block_size=cache_block_size,
+            # block_size=cache_block_size,
+            block_size=128,
             no_event_token_rate=args.no_event_token_rate, 
             no_event_token_insertion_mode=args.no_event_token_insertion_mode,
             seed=args.seed
         )
     
-        logging.info("Config:\n%s", pformat(asdict(delphi_config), sort_dicts=False))
+        logging.info("\n%s", format_delphi_config(delphi_config))
         model = Delphi(delphi_config).to(DEVICE)
         if not args.no_compile:
             logging.info("Compiling model with torch.compile (first batch will be slower)...")
@@ -291,7 +326,6 @@ if __name__ == "__main__":
             no_event_insertion_mode=args.no_event_token_insertion_mode,
             seed=args.seed,
             subjects_include_list=args.subjects,
-            use_compile=not args.no_compile,
         )
 
         # ── Optimizer ─────────────────────────────────────────────────────
@@ -306,7 +340,7 @@ if __name__ == "__main__":
             warmup_iters   = args.warmup_iters,
             lr_decay_iters = args.lr_decay_iters,
         )
-        logging.info(f"Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
+        logging.info("Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
         
         optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
         
@@ -325,7 +359,7 @@ if __name__ == "__main__":
     else:
   
         ################################ FROM PREVIOUS RUN ################################
-        from utils.utils import config_from_runid 
+        from utils.run_loader import config_from_runid
         model, \
         dataloaders, \
         optim_config, optimizer_state, scheduler_state, \
@@ -377,7 +411,7 @@ if __name__ == "__main__":
         optim_config=optim_config,
     )
 
-    trainer.train(max_epochs=1000, patience=10)
+    trainer.train(max_epochs=1000, patience=20)
 
     if args.compute_aucs:
         

@@ -33,7 +33,7 @@ if str(DELPHI_DIR) not in sys.path:
 
 from delphi.model import DomainConfig, DelphiConfig, Delphi, AttentionMaskBuilder
 from utils.cv_utils import get_data_partitions
-from utils.utils import load_domain_config
+from utils import load_domain_config
 
 from data.dataset import (
     DelphiDataset,
