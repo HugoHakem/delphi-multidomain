@@ -3,7 +3,7 @@ import re
 from easydict import EasyDict
 
 
-def _infer_delphi_config_from_state_dict(sd: dict) -> EasyDict:
+def infer_delphi_config_from_state_dict(sd: dict) -> EasyDict:
     cfg = EasyDict()
 
     layer_indices = []
@@ -41,7 +41,7 @@ def _infer_delphi_config_from_state_dict(sd: dict) -> EasyDict:
     return cfg
 
 
-def _migrate_legacy_state_dict(weights: dict) -> dict:
+def migrate_legacy_state_dict(weights: dict) -> dict:
     """
     Normalize old embedding key naming to the current layout.
 
@@ -61,7 +61,7 @@ def _migrate_legacy_state_dict(weights: dict) -> dict:
     return new_weights
 
 
-def _migrate_domain_embed_to_global_embed(weights: dict, model) -> dict:
+def migrate_domain_embed_to_global_embed(weights: dict, model) -> dict:
     """
     Migrate per-domain embedding weights to the unified global_embed table.
 
