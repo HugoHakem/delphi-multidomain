@@ -15,17 +15,7 @@ def setup_mlflow():
     return MLFLOW_TRACKING_URI
 
 
-def fix_artifact_uri(artifact_uri: str) -> Path:
-    artifact_uri = re.sub(r"^file://", "", artifact_uri)
-    artifact_uri = re.sub(r".*/mlruns", "mlruns", artifact_uri)
-    return Path(artifact_uri)
-
-
-def get_epoch_from_ckpt(ckpt_path: str) -> int:
-    return int(ckpt_path.split("_")[-1].split(".")[0])
-
-
-def get_experiment_id_from_runid(run_id: str) -> str:
+def _get_experiment_id_from_runid(run_id: str) -> str:
     return mlflow.get_run(run_id).info.experiment_id
 
 
@@ -77,7 +67,7 @@ def get_checkpoint_path(run_id: str) -> Path:
     return best_ckpt or ckpts[-1]
 
 
-def get_last_epoch_checkpoint(run_dir: str) -> tuple[Path, int]:
+def _get_last_epoch_checkpoint(run_dir: str) -> tuple[Path, int]:
     """Return (path, epoch) of the highest-epoch checkpoint under run_dir/artifacts/checkpoints."""
     ckpt_dir = Path(run_dir) / "artifacts" / "checkpoints"
     if not ckpt_dir.exists():
@@ -102,19 +92,11 @@ def get_last_epoch_checkpoint(run_dir: str) -> tuple[Path, int]:
     return best, best_epoch
 
 
-def get_best_ckpt(runinfo) -> Path:
-    """Return highest-epoch checkpoint path from a runinfo object."""
-    ckpt_dir = fix_artifact_uri(runinfo.artifact_uri) / "checkpoints"
-    best_ckpt_path = ckpt_dir / sorted(
-        os.listdir(ckpt_dir), key=get_epoch_from_ckpt
-    )[-1]
-    return best_ckpt_path
-
 
 def load_checkpoint(run_id: str) -> tuple[dict, Path]:
     """Load checkpoint from the last-epoch file for a run."""
     mlflow_uri = Path(mlflow.get_tracking_uri().replace("file:", ""))
-    experiment_id = get_experiment_id_from_runid(run_id)
-    ckpt_path, _ = get_last_epoch_checkpoint(mlflow_uri / experiment_id / run_id)
+    experiment_id = _get_experiment_id_from_runid(run_id)
+    ckpt_path, _ = _get_last_epoch_checkpoint(mlflow_uri / experiment_id / run_id)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     return ckpt, ckpt_path

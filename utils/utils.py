@@ -39,20 +39,3 @@ def read_ids(path, type=int):
     )
 
 
-def get_top_counts(data, labels, top_n=200, ignored_tokens=[]):
-    id_to_token = dict(zip(labels.index - 1, labels.name))
-    counts = (
-        pd.DataFrame(data, columns=["subject_id", "age", "token_id"])
-        .query("token_id not in @ignored_tokens")
-        .assign(token=lambda df: df.token_id.map(id_to_token))
-        .token.value_counts(ascending=False)
-        .head(top_n)
-        .sort_values()
-    )
-    return counts
-
-
-def get_domain_configs_from_string(s: str) -> dict:
-    """Alias for parse_domains_param kept for backward compatibility."""
-    from utils.mlflow_utils import parse_domains_param
-    return parse_domains_param(s)
