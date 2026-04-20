@@ -30,7 +30,7 @@ if str(DELPHI_DIR) not in sys.path:
 os.chdir(DELPHI_DIR)
 
 from data.dataset import DelphiDataset, DelphiDataloader
-from utils.utils import reconstruct_model, read_ids
+from utils import reconstruct_model, read_ids
 
 device = 'cpu'
 DAYS_PER_YEAR = 365.25
