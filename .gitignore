@@ -18,3 +18,5 @@ data
 .mypy_cache/
 .vscode/
 .env
+.claude/skills/
+.nfs*
