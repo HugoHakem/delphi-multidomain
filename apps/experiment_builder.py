@@ -149,7 +149,7 @@ with st.sidebar:
 
     st.subheader("Boolean flags")
     use_amp = st.checkbox("use_amp (mixed precision)", value=True)
-    compute_auc = st.checkbox("compute_auc (evaluate after training)", value=True)
+    compute_aucs = st.checkbox("compute_aucs (evaluate after training)", value=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -290,7 +290,7 @@ def generate_grid():
                     "num_workers": num_workers,
                     "seed": seed,
                     "use_amp": use_amp,
-                    "compute_auc": compute_auc,
+                    "compute_aucs": compute_aucs,
                 }
 
                 if subjects_path:
