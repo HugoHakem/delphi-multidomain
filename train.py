@@ -67,8 +67,6 @@ def format_delphi_config(cfg) -> str:
     domains = d.pop("domains", {})
 
     # ── Scalar params ──────────────────────────────────────────────────
-    skip = {"path", "n_layers", "n_hidden", "input_size", "pretrained_path",
-            "subdomain", "group", "n_latent_tokens"}
     lines = ["Model config:"]
     for k, v in d.items():
         lines.append(f"  {k}: {_fmt(v)}")

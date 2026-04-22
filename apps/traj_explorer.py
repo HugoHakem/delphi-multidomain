@@ -106,16 +106,6 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
     default_cfg = load_domain_config(domain_config_yaml, root_path / "tokens")
     domain_cfg = {k: v for k, v in default_cfg.items() if k in domains}
 
-    # Build model (just to get metadata — we won't run forward)
-    delphi_config = DelphiConfig(
-        n_embd=120, n_layer=1, n_head=6,
-        domains=domain_cfg,
-        block_size=block_size,
-        no_event_token_rate=no_event_token_rate,
-        no_event_token_insertion_mode=no_event_insertion_mode,
-        seed=seed,
-    )
-
     domain_to_int = Delphi._build_domain_to_int(list(domain_cfg.keys()))
     int_to_domain = {v: k for k, v in domain_to_int.items()}
     domain_offsets, global_vocab_size = Delphi._build_domain_offsets(domain_to_int, domain_cfg)

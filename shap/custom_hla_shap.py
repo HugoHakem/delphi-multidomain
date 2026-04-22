@@ -215,7 +215,6 @@ def inject_hla_dicts(
     sids_new = dict(sids_rec)
 
     tok_rec = x_rec[hla_domain]
-    age_rec = ages_rec[hla_domain]
     sid_rec = sids_rec[hla_domain]
 
     tok_don = x_don[hla_domain]
