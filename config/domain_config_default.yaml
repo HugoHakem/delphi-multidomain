@@ -24,9 +24,11 @@ ns_drugs:
 lifestyle:
   projector: embed
   path: lifestyle
-  at_birth: true
   dropout_mode: token
   dropout_rate: 0.1
+  age_jitter: true
+  age_jitter_min: -14610   # -40 years in days
+  age_jitter_max: 7300   # +20 years in days
 
 hla_alleles:
   projector: embed
