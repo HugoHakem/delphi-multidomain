@@ -161,6 +161,12 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
         seed=seed,
     )
 
+    age_jitter_config = {
+        domain_to_int[dname]: (cfg.age_jitter_min, cfg.age_jitter_max)
+        for dname, cfg in domain_cfg.items()
+        if getattr(cfg, "age_jitter", False) and dname in domain_to_int
+    }
+
     collate = DelphiCollateFn(
         age_sampler=age_sampler,
         block_size=block_size,
@@ -169,6 +175,7 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
         padding_domain_id=domain_to_int["padding"],
         no_event_token_id=1,
         continuous_domains=continuous_domains,
+        age_jitter=age_jitter_config,
     )
 
     return SimpleNamespace(
@@ -635,6 +642,20 @@ def main():
         if dname in data.domain_to_int
     }
 
+    # Age-jitter toggle — only shown when at least one domain has jitter configured
+    apply_age_jitter = False
+    if data.collate.age_jitter:
+        with st.sidebar:
+            st.markdown("---")
+            apply_age_jitter = st.checkbox(
+                "Apply age jitter",
+                value=True,
+                help=", ".join(
+                    f"{data.int_to_domain.get(d, d)}: [{lo:.0f}, {hi:.0f}] days"
+                    for d, (lo, hi) in data.collate.age_jitter.items()
+                ),
+            )
+
     def make_live_collate(training: bool) -> DelphiCollateFn:
         return DelphiCollateFn(
             age_sampler=data.collate.age_sampler,
@@ -645,6 +666,7 @@ def main():
             no_event_token_id=1,
             continuous_domains=data.continuous_domains,
             domain_dropout=dropout_config,
+            age_jitter=data.collate.age_jitter if apply_age_jitter else {},
             training=training,
         )
 
@@ -689,7 +711,7 @@ def main():
         batch = None
     else:
         item = data.dataset[subject_idx]
-        batch: DelphiBatch = make_live_collate(training=bool(dropout_config))([item])
+        batch: DelphiBatch = make_live_collate(training=True)([item])
         df = batch_subject_to_df(data, batch, 0)
 
         if dropout_config:
