@@ -264,6 +264,7 @@ class Trainer(BaseTrainer):
           logger=NullLogger(), mlflow_params=dict(), start_epoch=0, log_loss_per_disease=False,
           use_tqdm=True, use_amp=True, use_rich=True,
           checkpoint_every=None, optim_config=None,
+          batch_size_scheduler=None,
         ):
 
         self.model           = model
@@ -271,15 +272,17 @@ class Trainer(BaseTrainer):
         self.scheduler       = scheduler
         self.early_stopper   = EarlyStopping(patience=patience, min_delta=0.001, mode='min')
 
-        assert isinstance(dataloaders, list), \
-               "Argument 'dataloaders' should be a list of either 2 or 3 dataloaders (train/val[/test])"
-
-        if len(dataloaders) == 2:
+        from data.dataset import DataModule
+        if isinstance(dataloaders, DataModule):
+            self.train_loader = dataloaders.train
+            self.valid_loader = dataloaders.val
+            self.test_loader  = dataloaders.test
+        elif isinstance(dataloaders, list) and len(dataloaders) == 2:
             self.train_loader, self.valid_loader = dataloaders
-        elif len(dataloaders) == 3:
+        elif isinstance(dataloaders, list) and len(dataloaders) == 3:
             self.train_loader, self.valid_loader, self.test_loader = dataloaders
         else:
-            raise ValueError(f"{len(dataloaders)=} ")
+            raise ValueError("dataloaders must be a DataModule or a list of 2 or 3 DataLoaders")
 
         self.n_train_batches, self.n_val_batches = n_train_batches or 'all', n_val_batches or 'all'
 
@@ -301,6 +304,13 @@ class Trainer(BaseTrainer):
         self.use_rich        = use_rich
         self.checkpoint_every = checkpoint_every   # None = only save on improvement
         self.optim_config = optim_config
+        self.batch_size_scheduler = batch_size_scheduler
+
+        if batch_size_scheduler is not None:
+            stage0 = batch_size_scheduler.step(start_epoch)
+            self.grad_accum_steps = stage0.grad_accum_steps
+        else:
+            self.grad_accum_steps = 1
 
         self.ce_ema = None
         self.time_ema = None
@@ -610,21 +620,28 @@ class Trainer(BaseTrainer):
             disable=not use_tqdm,
         ) if use_tqdm else None
 
+        total_batches = len(self.train_loader) if n_batches == 'all' else n_batches
+        self.optimizer.zero_grad()
         for i, batch in enumerate(self.train_loader):
 
-            self.optimizer.zero_grad()
+            is_last_batch = (i + 1 >= total_batches)
+            is_optim_step = ((i + 1) % self.grad_accum_steps == 0) or is_last_batch
+
             loss = self.shared_step(
                 batch, batch_idx=i, epoch=self.current_epoch,
                 stage="training", add_prefix="train"
             )
 
-            self.scaler.scale(loss['train_total']).backward()
-            if self.optim_config is not None and self.optim_config.grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.optim_config.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.scheduler.step()
+            self.scaler.scale(loss['train_total'] / self.grad_accum_steps).backward()
+
+            if is_optim_step:
+                if self.optim_config is not None and self.optim_config.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.optim_config.grad_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
 
             with torch.no_grad():
                 ce_val = loss['train_ce_loss'].detach()
@@ -649,18 +666,23 @@ class Trainer(BaseTrainer):
                 self.val_step += 1
 
             current_loss = self.train_outputs[-1]
+            accum_pos = (i % self.grad_accum_steps) + 1
             if pbar:
-                pbar.set_postfix({
-                    "ce":  f"{current_loss['train_ce_loss'].item():.3f} ({current_loss['train_ce_ema_loss'].item():.3f})",
-                    "dt":  f"{current_loss['train_time_loss'].item():.1f} ({current_loss['train_time_ema_loss'].item():.1f})",
-                })
+                postfix = {
+                    "ce": f"{current_loss['train_ce_loss'].item():.3f} ({current_loss['train_ce_ema_loss'].item():.3f})",
+                    "dt": f"{current_loss['train_time_loss'].item():.1f} ({current_loss['train_time_ema_loss'].item():.1f})",
+                }
+                if self.grad_accum_steps > 1:
+                    postfix["accum"] = f"{accum_pos}/{self.grad_accum_steps}"
+                pbar.set_postfix(postfix)
                 pbar.update(self.train_loader.batch_size)
 
             if _progress is not None and _task_id is not None:
                 _progress.advance(_task_id)
+                accum_str = f" [{accum_pos}/{self.grad_accum_steps}]" if self.grad_accum_steps > 1 else ""
                 _progress.update(_task_id, description=(
                     f"[green]Ep {self.current_epoch:>4d}  train  "
-                    f"ce={current_loss['train_ce_ema_loss'].item():.3f}"
+                    f"ce={current_loss['train_ce_ema_loss'].item():.3f}{accum_str}"
                 ))
 
             if (n_batches is not None) and (i == n_batches):
@@ -735,7 +757,11 @@ class Trainer(BaseTrainer):
 
     def on_train_epoch_end(self, epoch):
         """Hook called after each train_epoch(). Override in subclasses."""
-        pass
+        if self.batch_size_scheduler is not None:
+            stage = self.batch_size_scheduler.step(epoch + 1)
+            if stage.batch_size != self.train_loader.batch_size:
+                self.train_loader.set_batch_size(stage.batch_size)
+            self.grad_accum_steps = stage.grad_accum_steps
 
     def epoch_end(self):
         self.train_outputs = []
