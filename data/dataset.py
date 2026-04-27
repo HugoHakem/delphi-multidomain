@@ -953,6 +953,7 @@ class DelphiCollateFn:
         no_event_token_id: int = 1,
         continuous_domains: Optional[Dict[str, int]] = None,
         domain_dropout: Optional[Dict[int, tuple]] = None,
+        age_jitter: Optional[Dict[int, tuple]] = None,
         training: bool = True,
     ):
         self.age_sampler = age_sampler
@@ -964,6 +965,8 @@ class DelphiCollateFn:
         self.continuous_domains = continuous_domains or {}
         # {domain_int: (mode, rate)}  mode in {"token", "block"}
         self.domain_dropout = domain_dropout or {}
+        # {domain_int: (min_days, max_days)} — applied during training only
+        self.age_jitter = age_jitter or {}
         self.training = training
 
     def train(self):
@@ -1053,6 +1056,16 @@ class DelphiCollateFn:
                 ages[drop_mask] = self.PADDING_AGE
                 domain_ids[drop_mask] = self.padding_domain_id
                 local_token_ids[drop_mask] = self.PADDING_TOKEN
+
+        # ── 2.7. Age jitter (training only) ──────────────────────────────
+        if self.training and self.age_jitter:
+            for d_int, (lo, hi) in self.age_jitter.items():
+                real_mask = (domain_ids == d_int) & (ages > self.PADDING_AGE)
+                n = int(real_mask.sum().item())
+                if n == 0:
+                    continue
+                jitter = ages.new_empty(n).uniform_(lo, hi)
+                ages[real_mask] = (ages[real_mask] + jitter).clamp(min=0.0)
 
         # ── 2.9. Stack eval_mask if present ──────────────────────────────
         has_eval_mask = "eval_mask" in batch[0]
