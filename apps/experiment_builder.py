@@ -111,7 +111,23 @@ with st.sidebar:
     n_heads = st.multiselect("n_head", [1, 2, 3, 4, 6, 8, 12, 16], default=[12])
 
     st.subheader("Training grid")
-    batch_sizes = st.multiselect("batch_size", [32, 64, 128, 256, 512], default=[128])
+    batch_size_mode = st.radio("Batch size mode", ["Fixed", "Schedule"], horizontal=True)
+    if batch_size_mode == "Fixed":
+        batch_sizes = st.multiselect("batch_size", [32, 64, 128, 256, 512], default=[128])
+        batch_size_schedules = []
+    else:
+        batch_sizes = []
+        _schedules_raw = st.text_area(
+            "batch_size_schedule(s) — one per line",
+            value="*:128",
+            help=(
+                "Format: n_epochs:batch_size or n_epochs:batch_sizexgrad_accum. "
+                "Use * for the last (open-ended) stage. "
+                "Example: 10:32,10:64,*:256x4"
+            ),
+        )
+        batch_size_schedules = [s.strip() for s in _schedules_raw.splitlines() if s.strip()]
+
     block_sizes = st.multiselect("block_size", ["auto", 32, 64, 96, 128, 192, 256], default=[128])
     learning_rates = st.multiselect(
         "learning_rate",
@@ -262,9 +278,10 @@ st.subheader("Generated parameter grid")
 
 def generate_grid():
     rows = []
+    batch_dim = batch_size_schedules if batch_size_mode == "Schedule" else batch_sizes
     for fold in test_folds:
-        for n_layer, n_embd, n_head, batch_size, block_size, lr, seed in itertools.product(
-            n_layers, n_embds, n_heads, batch_sizes, block_sizes, learning_rates, seeds
+        for n_layer, n_embd, n_head, batch_val, block_size, lr, seed in itertools.product(
+            n_layers, n_embds, n_heads, batch_dim, block_sizes, learning_rates, seeds
         ):
             for cfg in st.session_state.configs:
                 domains = cfg["_domains"]
@@ -281,7 +298,6 @@ def generate_grid():
                     "n_embd": n_embd,
                     "n_head": n_head,
                     "test_fold": fold,
-                    "batch_size": batch_size,
                     "block_size": block_size,
                     "learning_rate": lr,
                     "domains": domains,
@@ -292,6 +308,11 @@ def generate_grid():
                     "use_amp": use_amp,
                     "compute_aucs": compute_aucs,
                 }
+
+                if batch_size_mode == "Schedule":
+                    row["batch_size_schedule"] = batch_val
+                else:
+                    row["batch_size"] = batch_val
 
                 if subjects_path:
                     row["subjects"] = subjects_path
@@ -311,11 +332,13 @@ df = generate_grid()
 if df.empty:
     st.warning("No experiments generated. Check your configuration.")
 else:
+    _batch_dim_vals = batch_size_schedules if batch_size_mode == "Schedule" else batch_sizes
+    _batch_label = "schedules" if batch_size_mode == "Schedule" else "batch_sizes"
     st.info(
         f"**{len(df)} experiments** = "
         f"{len(test_folds)} folds × "
         f"{len(n_layers)}×{len(n_embds)}×{len(n_heads)} arch × "
-        f"{len(batch_sizes)}×{len(block_sizes)}×{len(learning_rates)} training × "
+        f"{len(_batch_dim_vals)} {_batch_label}×{len(block_sizes)}×{len(learning_rates)} training × "
         f"{len(seeds)} seeds × "
         f"{len(st.session_state.configs)} configs"
     )
@@ -333,7 +356,8 @@ else:
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("**Unique values per parameter:**")
-            for col in ["n_layer", "n_embd", "n_head", "batch_size", "block_size", "learning_rate"]:
+            batch_col = "batch_size_schedule" if batch_size_mode == "Schedule" else "batch_size"
+            for col in ["n_layer", "n_embd", "n_head", batch_col, "block_size", "learning_rate"]:
                 if col in edited_df.columns:
                     vals = sorted(edited_df[col].unique())
                     st.text(f"  {col}: {vals}")

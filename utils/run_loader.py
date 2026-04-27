@@ -14,6 +14,7 @@ from typing import Union
 
 import torch
 from torch.utils.data import DataLoader
+from data.dataset import FlexibleDataLoader, BatchSizeScheduler, DataModule
 
 DELPHI_DIR = Path(__file__).resolve().parent.parent
 
@@ -250,6 +251,13 @@ def config_from_runid(runid: str):
     runinfo.data.params.pop("learning_rate", None)
     runinfo.data.params.pop("ema_alpha", None)
 
+    bs_schedule_str = runinfo.data.params.pop("batch_size_schedule", None)
+    bs_scheduler = (
+        BatchSizeScheduler.from_string(bs_schedule_str)
+        if bs_schedule_str and bs_schedule_str != "None"
+        else None
+    )
+
     try:
         runinfo.data.params["attention_scheme"] = ast.literal_eval(
             runinfo.data.params["attention_scheme"]
@@ -338,14 +346,21 @@ def config_from_runid(runid: str):
         continuous_domains=continuous_domains,
     )
 
-    dataloaders = [
-        DataLoader(train_dataset, batch_size=batch_size,     shuffle=True,  pin_memory=True, collate_fn=collate),
-        DataLoader(valid_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
-        DataLoader(test_dataset,  batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
-    ]
+    train_batch_size = (
+        bs_scheduler.step(start_epoch).batch_size if bs_scheduler is not None else batch_size
+    )
+    dataloaders = DataModule(
+        FlexibleDataLoader(train_dataset, batch_size=train_batch_size, shuffle=True,  pin_memory=True, collate_fn=collate),
+        DataLoader(valid_dataset,         batch_size=VAL_BATCH_SIZE,   shuffle=False, pin_memory=True, collate_fn=collate),
+        DataLoader(test_dataset,          batch_size=VAL_BATCH_SIZE,   shuffle=False, pin_memory=True, collate_fn=collate),
+    )
 
     previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
-    logged_params = {"test_fold": test_fold, "batch_size": batch_size}
+    logged_params = {
+        "test_fold": test_fold,
+        "batch_size": batch_size,
+        "batch_size_scheduler": bs_scheduler,
+    }
 
     optimizer_state = ckpt.get("optimizer_state", None)
     scheduler_state = ckpt.get("scheduler_state", None)
