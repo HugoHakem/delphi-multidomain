@@ -66,13 +66,22 @@ def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_r
     for k, v in old_run.data.tags.items():
         mlflow.set_tag(k, v)
     mlflow.set_tag("resumed_from", old_run_id)
+    mlflow.set_tag("parent_run", old_run_id)
 
     src_dir = mlflow.artifacts.download_artifacts(run_id=old_run_id)
     dst_dir = Path(mlflow.get_artifact_uri()).as_posix().replace("file://", "")
     dst_dir = Path(dst_dir)
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
-    print(f"Cloned run {old_run_id} → {new_run_id} (experiment: {new_experiment_name})")
+    import logging as _logging
+    _logging.info(
+        "Resuming: new run created.\n"
+        "  Original run : %s\n"
+        "  New run ID   : %s\n"
+        "  Experiment   : %s\n"
+        "  parent_run tag set to original run ID.",
+        old_run_id, new_run_id, new_experiment_name,
+    )
     mlflow.end_run()
     return new_run_id
 
@@ -232,7 +241,7 @@ class MLFlowLogger:
         shutil.rmtree(tmp_dir)
 
         uri = mlflow.get_artifact_uri("checkpoints")
-        return Path(uri) / filename
+        return Path(self._strip_file_prefix(uri)) / filename
 
 
 # ———————————————————————————————————————————————————————————————————————————————
