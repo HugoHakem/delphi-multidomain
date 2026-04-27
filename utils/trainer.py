@@ -397,8 +397,17 @@ class Trainer(BaseTrainer):
         eval_every = None if self.n_validations_per_epoch <= 1 else \
                      max(1, n_batches_epoch // self.n_validations_per_epoch)
 
+        import socket
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
+        self.logger.log_params({"hostname": socket.gethostname()})
+
+        if self.batch_size_scheduler is not None:
+            import logging as _logging
+            sched = self.batch_size_scheduler
+            lines = [f"  epoch {start:>4} – {end:>4}  batch_size={bs:<6}  grad_accum={ga}  effective={bs*ga}"
+                     for start, end, bs, ga in sched._describe_stages(self.current_epoch, max_epochs)]
+            _logging.info("Batch size schedule:\n%s", "\n".join(lines))
 
         epoch_rows = []
         progress, live_ctx, refresh_display = self._setup_display(epoch_rows)
@@ -440,6 +449,11 @@ class Trainer(BaseTrainer):
 
                 self.logger.log_metrics(metrics['val_loss'], step=epoch)
                 self.logger.log_metrics(metrics['train_loss'], step=epoch)
+                self.logger.log_metrics({
+                    "learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "batch_size":    self.train_loader.batch_size,
+                    "epoch_secs":    epoch_secs,
+                }, step=epoch)
 
                 should_stop, improved = self.early_stopper.step(self.mean_val_loss)
 
