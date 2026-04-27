@@ -882,16 +882,25 @@ def main():
 
                 mask_style = st.radio(
                     "Visualization style",
-                    ["Compact (domain-colored axes)", "Detailed (labeled axes)"],
+                    ["Domain-blended (age-sorted)", "Compact (domain-colored axes)", "Detailed (labeled axes)"],
                     horizontal=True,
                 )
 
-                if mask_style.startswith("Compact"):
+                if mask_style.startswith("Domain-blended"):
+                    fig_mask = plot_attention_mask_blended(
+                        mask,
+                        batch.domain_ids[0],
+                        batch.ages[0],
+                        data.int_to_domain,
+                    )
+                    st.pyplot(fig_mask)
+                    plt.close(fig_mask)
+                elif mask_style.startswith("Compact"):
                     fig_mask = plot_attention_mask_compact(mask, df, DOMAIN_COLORS)
+                    st.plotly_chart(fig_mask, use_container_width=True)
                 else:
                     fig_mask = plot_attention_mask(mask, df, title=f"Attention Mask — Subject {subject_list[subject_idx]}")
-
-                st.plotly_chart(fig_mask, use_container_width=True)
+                    st.plotly_chart(fig_mask, use_container_width=True)
 
                 # Stats
                 T = mask.shape[0]
@@ -909,4 +918,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import streamlit.runtime
+    if streamlit.runtime.exists():
+        # Invoked by `streamlit run` — normal app execution.
+        main()
+    else:
+        # Invoked directly with `python traj_explorer.py`.
+        # Print the SSH tunnel hint, then replace this process with streamlit.
+        _port = 8501
+        _args = sys.argv[1:]
+        for _i, _a in enumerate(_args):
+            if _a == "--server.port" and _i + 1 < len(_args):
+                _port = int(_args[_i + 1])
+        print(
+            f"\n  ssh -J mitigate -L {_port}:localhost:{_port} {getpass.getuser()}@{socket.gethostname()}\n",
+            flush=True,
+        )
+        os.execv(sys.executable, [sys.executable, "-m", "streamlit", "run", __file__] + _args)
