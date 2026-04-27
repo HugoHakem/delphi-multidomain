@@ -161,10 +161,6 @@ class TokenDomain:
                 for old_id in old_ids
             }
 
-            logger.info(
-                "TokenDomain '%s': subdomain '%s' → %d/%d tokens",
-                name, subdomain, len(self.tokenizer), len(full_tokenizer),
-            )
         else:
             self._old_to_new = None
             self.tokenizer = full_tokenizer
@@ -419,11 +415,6 @@ class DelphiDataset(Dataset):
                 subdomain=getattr(dinfo, "subdomain", None),
             )
 
-        logger.info(
-            "DelphiDataset | root=%s | domains=%s | required=%s",
-            self.root, list(domains_cfg.keys()), required_domains,
-        )
-
         # ── Resolve subject set ───────────────────────────────────────────
         if subjects is None:
             raise ValueError("Must provide subject IDs or paths to subject lists.")
@@ -439,15 +430,10 @@ class DelphiDataset(Dataset):
             included = pd.DataFrame({"subject_id": subjects})
 
         excluded = self._get_excluded_subjects(exclusions)
-        if exclusions:
-            logger.info("Excluding %d subjects from %s", len(excluded), exclusions)
-
         subject_df = included[~included["subject_id"].astype(str).isin(excluded)]
         subject_df = self._filter_for_required_domains(subject_df, required_domains)
-        logger.info("Subjects after required-domain filter: %d", len(subject_df))
 
         if n_samples is not None:
-            logger.info("Subsampling to n_samples=%d", n_samples)
             subject_df = subject_df.sample(n_samples)
 
         subject_set = set(subject_df.subject_id.tolist())
@@ -476,8 +462,6 @@ class DelphiDataset(Dataset):
             self._cutoff_ages = None
             self._cutoff_date = None
 
-        print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, "
-              f"domains={list(self.domains.keys())}")
 
     # ── Private helpers ───────────────────────────────────────────────────
 
@@ -894,10 +878,6 @@ class DelphiDataset(Dataset):
 
         n_post = int(self._eval_mask.sum().item())
         n_real = int((self._ages > self.PADDING_AGE).sum().item())
-        logger.info(
-            "date_cutoff=%s: %d/%d tokens are post-cutoff (longitudinal targets)",
-            date_cutoff, n_post, n_real,
-        )
 
     # ── Public interface ──────────────────────────────────────────────────
 
