@@ -580,7 +580,7 @@ if __name__ == "__main__":
             dataloaders[2].dataset,
             batch_size=dataloaders[2].batch_size,
             shuffle=False,
-            num_workers=dataloaders[2].num_workers,
+            num_workers=dataloaders[2]._num_workers,
             pin_memory=True,
             collate_fn=auc_collate,
         )
