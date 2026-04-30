@@ -175,6 +175,9 @@ def get_cli_args():
     parser.add_argument("--birth_dates_file", "--birth-dates-file", dest="birth_dates_file", default=None, type=str,
                         help="Path to TSV with columns eid, year, month (used with --date_cutoff).")
     parser.add_argument("--seed",                                                   default=142,   type=int)
+    parser.add_argument("--max_epochs", "--max-epochs", dest="max_epochs", default=1000, type=int)
+    parser.add_argument("--min_epochs", "--min-epochs", dest="min_epochs", default=0,    type=int)
+    parser.add_argument("--patience",                                       default=20,   type=int)
     parser.add_argument("--compute_aucs", "--compute-aucs", dest="compute_aucs",   default=False, action="store_true")
     parser.add_argument("--log_loss_per_disease", "--log-loss-per-disease", dest="log_loss_per_disease",
                         default=False, action="store_true",
@@ -474,7 +477,10 @@ if __name__ == "__main__":
             "batch_size_schedule": args.batch_size_schedule,
             "learning_rate": args.lr,
             "seed": args.seed,
-            "optim_config": optim_config
+            "optim_config": optim_config,
+            "max_epochs": args.max_epochs,
+            "min_epochs": args.min_epochs,
+            "patience": args.patience,
         }
      
     else:
@@ -567,7 +573,7 @@ if __name__ == "__main__":
         start_epoch=start_epoch,
     )
 
-    trainer.train(max_epochs=1000, patience=20)
+    trainer.train(max_epochs=args.max_epochs, min_epochs=args.min_epochs, patience=args.patience)
 
     if args.compute_aucs:
 

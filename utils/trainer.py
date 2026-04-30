@@ -387,7 +387,7 @@ class Trainer(BaseTrainer):
         live = Live(Group(build_table(), progress), refresh_per_second=4)
         return progress, live, lambda: live.update(Group(build_table(), progress))
 
-    def train(self, max_epochs=1000, patience=None):
+    def train(self, max_epochs=1000, min_epochs=0, patience=None):
 
         if patience is not None:
             self.early_stopper.set_patience(patience)
@@ -505,7 +505,7 @@ class Trainer(BaseTrainer):
                 ))
                 refresh_display()
 
-                if should_stop:
+                if should_stop and epoch >= min_epochs:
                     _print(f"Early stopping at epoch {epoch}")
                     break
 
