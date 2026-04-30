@@ -23,7 +23,7 @@ import logging
 from pathlib import Path
 from copy import deepcopy
 from typing import (
-    Any, Callable, Dict, List, Optional, Set, Tuple, Union,
+    Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union,
 )
 from collections import defaultdict
 from dataclasses import dataclass
@@ -161,10 +161,6 @@ class TokenDomain:
                 for old_id in old_ids
             }
 
-            logger.info(
-                "TokenDomain '%s': subdomain '%s' → %d/%d tokens",
-                name, subdomain, len(self.tokenizer), len(full_tokenizer),
-            )
         else:
             self._old_to_new = None
             self.tokenizer = full_tokenizer
@@ -419,11 +415,6 @@ class DelphiDataset(Dataset):
                 subdomain=getattr(dinfo, "subdomain", None),
             )
 
-        logger.info(
-            "DelphiDataset | root=%s | domains=%s | required=%s",
-            self.root, list(domains_cfg.keys()), required_domains,
-        )
-
         # ── Resolve subject set ───────────────────────────────────────────
         if subjects is None:
             raise ValueError("Must provide subject IDs or paths to subject lists.")
@@ -439,15 +430,10 @@ class DelphiDataset(Dataset):
             included = pd.DataFrame({"subject_id": subjects})
 
         excluded = self._get_excluded_subjects(exclusions)
-        if exclusions:
-            logger.info("Excluding %d subjects from %s", len(excluded), exclusions)
-
         subject_df = included[~included["subject_id"].astype(str).isin(excluded)]
         subject_df = self._filter_for_required_domains(subject_df, required_domains)
-        logger.info("Subjects after required-domain filter: %d", len(subject_df))
 
         if n_samples is not None:
-            logger.info("Subsampling to n_samples=%d", n_samples)
             subject_df = subject_df.sample(n_samples)
 
         subject_set = set(subject_df.subject_id.tolist())
@@ -476,8 +462,6 @@ class DelphiDataset(Dataset):
             self._cutoff_ages = None
             self._cutoff_date = None
 
-        print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, "
-              f"domains={list(self.domains.keys())}")
 
     # ── Private helpers ───────────────────────────────────────────────────
 
@@ -894,10 +878,6 @@ class DelphiDataset(Dataset):
 
         n_post = int(self._eval_mask.sum().item())
         n_real = int((self._ages > self.PADDING_AGE).sum().item())
-        logger.info(
-            "date_cutoff=%s: %d/%d tokens are post-cutoff (longitudinal targets)",
-            date_cutoff, n_post, n_real,
-        )
 
     # ── Public interface ──────────────────────────────────────────────────
 
@@ -973,6 +953,7 @@ class DelphiCollateFn:
         no_event_token_id: int = 1,
         continuous_domains: Optional[Dict[str, int]] = None,
         domain_dropout: Optional[Dict[int, tuple]] = None,
+        age_jitter: Optional[Dict[int, tuple]] = None,
         training: bool = True,
     ):
         self.age_sampler = age_sampler
@@ -984,6 +965,8 @@ class DelphiCollateFn:
         self.continuous_domains = continuous_domains or {}
         # {domain_int: (mode, rate)}  mode in {"token", "block"}
         self.domain_dropout = domain_dropout or {}
+        # {domain_int: (min_days, max_days)} — applied during training only
+        self.age_jitter = age_jitter or {}
         self.training = training
 
     def train(self):
@@ -1073,6 +1056,16 @@ class DelphiCollateFn:
                 ages[drop_mask] = self.PADDING_AGE
                 domain_ids[drop_mask] = self.padding_domain_id
                 local_token_ids[drop_mask] = self.PADDING_TOKEN
+
+        # ── 2.7. Age jitter (training only) ──────────────────────────────
+        if self.training and self.age_jitter:
+            for d_int, (lo, hi) in self.age_jitter.items():
+                real_mask = (domain_ids == d_int) & (ages > self.PADDING_AGE)
+                n = int(real_mask.sum().item())
+                if n == 0:
+                    continue
+                jitter = ages.new_empty(n).uniform_(lo, hi)
+                ages[real_mask] = (ages[real_mask] + jitter).clamp(min=0.0)
 
         # ── 2.9. Stack eval_mask if present ──────────────────────────────
         has_eval_mask = "eval_mask" in batch[0]
@@ -1211,6 +1204,247 @@ def color_by_domain(row):
 #  DataLoader convenience
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class FlexibleDataLoader:
+    """DataLoader wrapper that allows changing batch_size between epochs."""
+
+    def __init__(
+        self,
+        dataset: DelphiDataset,
+        batch_size: int,
+        shuffle: bool = False,
+        num_workers: int = 0,
+        pin_memory: bool = True,
+        collate_fn: Optional[DelphiCollateFn] = None,
+        **kwargs,
+    ):
+        self._dataset     = dataset
+        self._shuffle     = shuffle
+        self._num_workers = num_workers
+        self._pin_memory  = pin_memory
+        self._collate_fn  = collate_fn
+        self._kwargs      = kwargs
+        self._loader      = self._build(batch_size)
+
+    def _build(self, batch_size: int) -> DataLoader:
+        return DataLoader(
+            self._dataset,
+            batch_size=batch_size,
+            shuffle=self._shuffle,
+            num_workers=self._num_workers,
+            pin_memory=self._pin_memory,
+            collate_fn=self._collate_fn,
+            **self._kwargs,
+        )
+
+    def set_batch_size(self, batch_size: int) -> None:
+        self._loader = self._build(batch_size)
+
+    # ---- transparent delegation ----
+
+    def __iter__(self):
+        return iter(self._loader)
+
+    def __len__(self):
+        return len(self._loader)
+
+    @property
+    def batch_size(self) -> int:
+        return self._loader.batch_size
+
+    @property
+    def dataset(self):
+        return self._dataset
+
+
+class StageConfig(NamedTuple):
+    batch_size: int
+    grad_accum_steps: int
+
+
+class BatchSizeScheduler:
+    """Resolves batch_size and grad_accum_steps for a given epoch.
+
+    Schedule format: list of (n_epochs, batch_size, grad_accum_steps) tuples.
+    The last entry may use n_epochs=None to mean "for all remaining epochs".
+
+    Use BatchSizeScheduler.from_string() to build from a CLI-friendly string:
+
+        "10:32,10:64,*:256x4"
+
+    Each stage is "n_epochs:batch_size" or "n_epochs:batch_sizexgrad_accum".
+    Use "*" as n_epochs for the last open-ended stage.
+
+    Example:
+        scheduler = BatchSizeScheduler.from_string("10:32,10:64,*:256x4")
+        trainer = Trainer(..., batch_size_scheduler=scheduler)
+        # epochs 0-9   → batch_size=32,  grad_accum=1  (effective batch=32)
+        # epochs 10-19 → batch_size=64,  grad_accum=1  (effective batch=64)
+        # epoch 20+    → batch_size=256, grad_accum=4  (effective batch=1024)
+    """
+
+    def __init__(self, schedule: List[Tuple[Optional[int], int, int]]):
+        if not schedule:
+            raise ValueError("schedule must have at least one entry")
+        for i, (n, _, _) in enumerate(schedule):
+            if n is None and i != len(schedule) - 1:
+                raise ValueError("Only the last schedule entry may have n_epochs=None")
+        self._schedule = list(schedule)
+
+    def _describe_stages(self, start_epoch: int, max_epochs: int) -> List[Tuple[int, str, int, int]]:
+        """Return [(stage_start, stage_end_str, batch_size, grad_accum)] for display."""
+        rows = []
+        epoch = 0
+        for n_epochs, batch_size, grad_accum in self._schedule:
+            stage_start = epoch
+            if n_epochs is None:
+                stage_end = max_epochs - 1
+                end_str = f"{stage_end}+"
+            else:
+                stage_end = epoch + n_epochs - 1
+                end_str = str(stage_end)
+            if stage_end >= start_epoch:
+                rows.append((max(stage_start, start_epoch), end_str, batch_size, grad_accum))
+            if n_epochs is None:
+                break
+            epoch += n_epochs
+        return rows
+
+    def __str__(self) -> str:
+        parts = []
+        for n_epochs, batch_size, grad_accum in self._schedule:
+            n_str = "*" if n_epochs is None else str(n_epochs)
+            bs_str = f"{batch_size}x{grad_accum}" if grad_accum > 1 else str(batch_size)
+            parts.append(f"{n_str}:{bs_str}")
+        return ",".join(parts)
+
+    def step(self, epoch: int) -> StageConfig:
+        """Return the StageConfig (batch_size, grad_accum_steps) for the given epoch."""
+        elapsed = 0
+        for n_epochs, batch_size, grad_accum in self._schedule:
+            if n_epochs is None or epoch < elapsed + n_epochs:
+                return StageConfig(batch_size, grad_accum)
+            elapsed += n_epochs
+        n, bs, ga = self._schedule[-1]
+        return StageConfig(bs, ga)
+
+    @classmethod
+    def from_string(cls, s: str) -> "BatchSizeScheduler":
+        """Parse a schedule string.
+
+        Format: comma-separated "n_epochs:batch_size[xgrad_accum]" pairs.
+
+        Examples:
+            "5:32,10:64,*:128"       # no accumulation
+            "10:32,10:64,*:256x4"    # last stage: batch=256, accum=4
+        """
+        schedule = []
+        for part in s.split(","):
+            part = part.strip()
+            n_str, rest = part.split(":")
+            n = None if n_str.strip() == "*" else int(n_str.strip())
+            if "x" in rest:
+                bs_str, ga_str = rest.split("x")
+                grad_accum = int(ga_str.strip())
+            else:
+                bs_str, grad_accum = rest, 1
+            schedule.append((n, int(bs_str.strip()), grad_accum))
+        return cls(schedule)
+
+
+class DataModule:
+    """Lightweight container for train/val/test dataloaders with rich logging.
+
+    Attributes
+    ----------
+    train, val, test : FlexibleDataLoader or DataLoader
+    """
+
+    SPLITS = ("train", "val", "test")
+
+    def __init__(
+        self,
+        train: "FlexibleDataLoader",
+        val,
+        test,
+    ):
+        self.train = train
+        self.val   = val
+        self.test  = test
+
+    def __iter__(self):
+        """Iterate as a list [train, val, test] for backwards compatibility."""
+        return iter([self.train, self.val, self.test])
+
+    def __getitem__(self, idx):
+        return [self.train, self.val, self.test][idx]
+
+    def log_info(self) -> None:
+        """Print a formatted table with dataset and loader stats per split."""
+        import logging as _logging
+
+        # Collect all domain names across splits (excluding padding)
+        all_domains: List[str] = []
+        for loader in [self.train, self.val, self.test]:
+            ds = loader.dataset
+            for dname in ds.domain_to_int:
+                if dname != "padding" and dname not in all_domains:
+                    all_domains.append(dname)
+
+        rows = []
+        for split, loader in zip(self.SPLITS, [self.train, self.val, self.test]):
+            ds = loader.dataset
+            real_counts = ds._real_counts.float()
+
+            # Tokens per domain: count non-padding positions matching each domain int
+            domain_counts: Dict[str, str] = {}
+            for dname in all_domains:
+                if dname in ds.domain_to_int:
+                    d_int = ds.domain_to_int[dname]
+                    n = int((ds._domain_ids == d_int).sum())
+                    domain_counts[dname] = str(n)
+                else:
+                    domain_counts[dname] = "-"
+
+            row: Dict[str, str] = {
+                "split":       split,
+                "subjects":    str(len(ds)),
+                "batches":     str(len(loader)),
+                "batch_size":  str(loader.batch_size),
+                "tokens/subj": f"{real_counts.mean():.1f}±{real_counts.std():.1f}",
+                "max_age(yr)": f"{ds._max_ages.max() / 365.25:.1f}",
+                "shuffle":     str(getattr(loader, "_shuffle", "?")),
+            }
+            row.update(domain_counts)
+            rows.append(row)
+
+        col_order = (
+            ["split", "subjects", "batches", "batch_size", "tokens/subj", "max_age(yr)", "shuffle"]
+            + all_domains
+        )
+        widths = {c: max(len(c), max(len(r.get(c, "-")) for r in rows)) for c in col_order}
+
+        sep  = "+-" + "-+-".join("-" * widths[c] for c in col_order) + "-+"
+        hdr  = "| " + " | ".join(c.ljust(widths[c]) for c in col_order) + " |"
+        lines = [sep, hdr, sep]
+        for r in rows:
+            lines.append("| " + " | ".join(r.get(c, "-").ljust(widths[c]) for c in col_order) + " |")
+        lines.append(sep)
+
+        _logging.info("DataModule summary:\n%s", "\n".join(lines))
+
+    @property
+    def n_train(self) -> int:
+        return len(self.train.dataset)
+
+    @property
+    def n_val(self) -> int:
+        return len(self.val.dataset)
+
+    @property
+    def n_test(self) -> int:
+        return len(self.test.dataset)
+
+
 def create_dataloader(
     dataset: DelphiDataset,
     batch_size: int,
@@ -1219,11 +1453,8 @@ def create_dataloader(
     pin_memory: bool = True,
     collate_fn: Optional[DelphiCollateFn] = None,
     **kwargs,
-) -> DataLoader:
-    """
-    Convenience wrapper that creates a DataLoader with the Delphi collate.
-    """
-    return DataLoader(
+) -> FlexibleDataLoader:
+    return FlexibleDataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,

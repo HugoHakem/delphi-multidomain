@@ -54,6 +54,8 @@ class DomainConfig:
     path: Optional[str] = None
     predict: bool = False
     age_jitter: bool = False
+    age_jitter_min: float = -20 * 365.25   # days
+    age_jitter_max: float =  40 * 365.25   # days
     type: str = "categorical"
     at_birth: bool = False
     n_latent_tokens: Optional[int] = None
