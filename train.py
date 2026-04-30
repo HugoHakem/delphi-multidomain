@@ -10,6 +10,7 @@ import pandas as pd
 from auc.aucs import evaluate_aucs
 import torch
 from data.dataset import FlexibleDataLoader, BatchSizeScheduler, DataModule
+from torch.utils.data import DataLoader
 import mlflow
 
 import logging
@@ -275,9 +276,9 @@ def get_continuous_domains(domain_cfg):
 
 
 def get_dataloaders(
-    domain_cfg,
+    domain_cfg, 
     model,
-    test_fold,
+    test_fold, 
     block_size,
     batch_size,
     num_workers=4,
@@ -285,7 +286,6 @@ def get_dataloaders(
     no_event_insertion_mode="random",
     seed=42,
     subjects_include_list=None,
-    use_compile=True,
 ):
     train_ids, val_ids, test_ids = get_data_partitions(
         "./data/transforms/subject_lists", fold=test_fold
@@ -361,14 +361,6 @@ def get_dataloaders(
     eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
 
     loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
-    if num_workers > 0 and use_compile:
-        # Fix: 
-        # Workers are re-forked at the end of each epoch (iterator GC). On exit,
-        # forked workers trigger LLVM thread cleanup which fails with pthread_join
-        # errors because torch.compile's LLVM thread pool is invalid in child processes.
-        # persistent_workers keeps workers alive across epochs so they never exit
-        # mid-training; the harmless LLVM error at program end is after training completes.
-        loader_kwargs["persistent_workers"] = True
 
     train_loader = FlexibleDataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **loader_kwargs)
     valid_loader = FlexibleDataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
@@ -447,7 +439,6 @@ if __name__ == "__main__":
             no_event_insertion_mode=args.no_event_token_insertion_mode,
             seed=args.seed,
             subjects_include_list=args.subjects,
-            use_compile=not args.no_compile,
         )
 
         # ── Optimizer ─────────────────────────────────────────────────────
