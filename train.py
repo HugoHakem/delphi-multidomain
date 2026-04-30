@@ -567,7 +567,7 @@ if __name__ == "__main__":
 
         # evaluate_aucs requires fixed T across all batches; swap collate to use
         # block_size=128 instead of "auto" so torch.cat on embeddings doesn't fail.
-        auc_collate = copy.copy(dataloaders[2].collate_fn)
+        auc_collate = copy.copy(dataloaders[2]._collate_fn)
         auc_collate.block_size = 128
         test_loader = DataLoader(
             dataloaders[2].dataset,
