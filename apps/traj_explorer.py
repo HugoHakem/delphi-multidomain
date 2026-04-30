@@ -918,20 +918,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import streamlit.runtime
-    if streamlit.runtime.exists():
-        # Invoked by `streamlit run` — normal app execution.
-        main()
-    else:
-        # Invoked directly with `python traj_explorer.py`.
-        # Print the SSH tunnel hint, then replace this process with streamlit.
-        _port = 8501
-        _args = sys.argv[1:]
-        for _i, _a in enumerate(_args):
-            if _a == "--server.port" and _i + 1 < len(_args):
-                _port = int(_args[_i + 1])
-        print(
-            f"\n  ssh -J mitigate -L {_port}:localhost:{_port} {getpass.getuser()}@{socket.gethostname()}\n",
-            flush=True,
-        )
-        os.execv(sys.executable, [sys.executable, "-m", "streamlit", "run", __file__] + _args)
+    main()
