@@ -69,8 +69,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 USE_TQDM = sys.stdout.isatty()
 
-def print_config_rich(delphi_config, args, overrides: list[str] | None = None,
-                      domain_config_yaml=None) -> None:
+def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -> None:
     """Print a Rich-formatted config summary and exit cleanly (used by --dryrun)."""
     from dataclasses import asdict as _asdict
     from rich import box
@@ -122,15 +121,7 @@ def print_config_rich(delphi_config, args, overrides: list[str] | None = None,
             continue
         table.add_row(name, *[_cell(name, c, dc.get(c)) for c in cols])
 
-    if domain_config_yaml:
-        try:
-            cfg_path_display = Path(domain_config_yaml).relative_to(DELPHI_DIR)
-        except ValueError:
-            cfg_path_display = domain_config_yaml
-        cfg_subtitle = f"[dim]from {cfg_path_display}[/dim]"
-    else:
-        cfg_subtitle = ""
-    console.print(Panel(table, title=f"[bold]Domain configuration[/bold]  {cfg_subtitle}", border_style="blue"))
+    console.print(Panel(table, title="[bold]Domain configuration[/bold]", border_style="blue"))
 
     # ── Model params ──────────────────────────────────────────────────────
     attn = args.attention_scheme
@@ -438,9 +429,6 @@ if __name__ == "__main__":
         raise ValueError("--resume_from_previous requires --interactive or --resume_run_id.")
 
     cache_block_size = AUTO_BLOCK_SIZE if args.block_size == "auto" else args.block_size
-    logging.info(
-        "block_size=%s  cache_block_size=%d", args.block_size, cache_block_size
-    )
 
     bs_scheduler = None
     start_epoch = 0
@@ -479,8 +467,8 @@ if __name__ == "__main__":
             seed=args.seed
         )
     
-        print_config_rich(delphi_config, args, overrides=args.domain_config_overrides,
-                          domain_config_yaml=domain_config_yaml)
+        logging.info("Domain config: %s", domain_config_yaml)
+        print_config_rich(delphi_config, args, overrides=args.domain_config_overrides)
 
         if args.dry_run:
             sys.exit(0)
