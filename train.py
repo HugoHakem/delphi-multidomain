@@ -69,13 +69,6 @@ torch.backends.cudnn.allow_tf32 = True
 
 USE_TQDM = sys.stdout.isatty()
 
-def _fmt(v):
-    if v is True:  return "✓"
-    if v is False: return "✗"
-    if v is None:  return "—"
-    return str(v)
-
-
 def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -> None:
     """Print a Rich-formatted config summary and exit cleanly (used by --dryrun)."""
     from dataclasses import asdict as _asdict
@@ -157,38 +150,6 @@ def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -
 
     if overridden:
         console.print(f"[yellow]Overrides:[/yellow] {', '.join(overrides)}")
-
-
-def format_delphi_config(cfg) -> str:
-    """Compact human-readable summary of a DelphiConfig."""
-    d = asdict(cfg)
-    domains = d.pop("domains", {})
-
-    # ── Scalar params ──────────────────────────────────────────────────
-    skip = {"path", "n_layers", "n_hidden", "input_size", "pretrained_path",
-            "subdomain", "group", "n_latent_tokens"}
-    lines = ["Model config:"]
-    for k, v in d.items():
-        lines.append(f"  {k}: {_fmt(v)}")
-
-    # ── Domains table ──────────────────────────────────────────────────
-    bool_cols   = ["predict", "at_birth", "age_jitter", "freeze"]
-    str_cols    = ["projector", "type", "dropout_mode", "dropout_rate"]
-    cols        = bool_cols + str_cols
-    col_widths  = {c: max(len(c), max(len(_fmt(d.get(c))) for d in domains.values()) if domains else 0)
-                   for c in cols}
-    dom_width   = max((len(n) for n in domains), default=6)
-
-    header = f"  {'domain':<{dom_width}}  " + "  ".join(f"{c:>{col_widths[c]}}" for c in cols)
-    sep    = "  " + "-" * (len(header) - 2)
-    lines += ["", "Domains:", header, sep]
-    for name, dc in domains.items():
-        row = f"  {name:<{dom_width}}  " + "  ".join(
-            f"{_fmt(dc.get(c)):>{col_widths[c]}}" for c in cols
-        )
-        lines.append(row)
-
-    return "\n".join(lines)
 
 
 def parse_attention_scheme(attention_scheme, as_list=True):
@@ -509,10 +470,9 @@ if __name__ == "__main__":
             seed=args.seed
         )
     
-        logging.info("\n%s", format_delphi_config(delphi_config))
+        print_config_rich(delphi_config, args, overrides=args.domain_config_overrides)
 
         if args.dry_run:
-            print_config_rich(delphi_config, args, overrides=args.domain_config_overrides)
             sys.exit(0)
         model = Delphi(delphi_config).to(DEVICE)
         if not args.no_compile:
