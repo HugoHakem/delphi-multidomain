@@ -69,7 +69,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 USE_TQDM = sys.stdout.isatty()
 
-def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -> None:
+def print_config_rich(delphi_config, args, overrides: list[str] | None = None,
+                      domain_config_yaml=None) -> None:
     """Print a Rich-formatted config summary and exit cleanly (used by --dryrun)."""
     from dataclasses import asdict as _asdict
     from rich import box
@@ -121,15 +122,23 @@ def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -
             continue
         table.add_row(name, *[_cell(name, c, dc.get(c)) for c in cols])
 
-    console.print(Panel(table, title="[bold]Domain configuration[/bold]", border_style="blue"))
+    if domain_config_yaml:
+        try:
+            cfg_path_display = Path(domain_config_yaml).relative_to(DELPHI_DIR)
+        except ValueError:
+            cfg_path_display = domain_config_yaml
+        cfg_subtitle = f"[dim]from {cfg_path_display}[/dim]"
+    else:
+        cfg_subtitle = ""
+    console.print(Panel(table, title=f"[bold]Domain configuration[/bold]  {cfg_subtitle}", border_style="blue"))
 
     # ── Model params ──────────────────────────────────────────────────────
     attn = args.attention_scheme
     attn_str = attn[0] if isinstance(attn, list) and len(attn) == 1 else str(attn)
     attn_str = attn_str.replace("[", r"\[")  # escape Rich markup
     model_text = (
-        f"n_layer=[cyan]{args.n_layer}[/]  n_head=[cyan]{args.n_head}[/]  n_embd=[cyan]{args.n_embd}[/]\n"
-        f"block_size=[cyan]{args.block_size}[/]  no_event_token_rate=[cyan]{args.no_event_token_rate}[/]\n"
+        f"n_layer=[cyan]{args.n_layer}[/]  n_head=[cyan]{args.n_head}[/]  n_embd=[cyan]{args.n_embd}[/]  "
+        f"no_event_token_rate=[cyan]{args.no_event_token_rate}[/]\n"
         f"attention_scheme: [cyan]{attn_str}[/]"
     )
     console.print(Panel(model_text, title="[bold]Model[/bold]", border_style="blue"))
@@ -470,7 +479,8 @@ if __name__ == "__main__":
             seed=args.seed
         )
     
-        print_config_rich(delphi_config, args, overrides=args.domain_config_overrides)
+        print_config_rich(delphi_config, args, overrides=args.domain_config_overrides,
+                          domain_config_yaml=domain_config_yaml)
 
         if args.dry_run:
             sys.exit(0)
