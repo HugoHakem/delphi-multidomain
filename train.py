@@ -76,6 +76,89 @@ def _fmt(v):
     return str(v)
 
 
+def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -> None:
+    """Print a Rich-formatted config summary and exit cleanly (used by --dryrun)."""
+    from dataclasses import asdict as _asdict
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    import shutil
+    term_width = max(shutil.get_terminal_size(fallback=(120, 40)).columns, 120)
+    console = Console(width=term_width)
+
+    # Which (domain, field) pairs were explicitly overridden
+    overridden: set[tuple[str, str]] = set()
+    for ov in (overrides or []):
+        if "=" in ov and "." in ov.split("=", 1)[0]:
+            domain, field = ov.split("=", 1)[0].split(".", 1)
+            overridden.add((domain, field))
+
+    domains = _asdict(delphi_config).get("domains", {})
+
+    # ── Domain table ──────────────────────────────────────────────────────
+    cols = ["predict", "at_birth", "projector", "type", "dropout_mode", "dropout_rate", "age_jitter", "freeze"]
+
+    col_labels = {
+        "predict": "predict", "at_birth": "at_birth", "projector": "projector",
+        "type": "type", "dropout_mode": "drop_mode", "dropout_rate": "drop_rate",
+        "age_jitter": "jitter", "freeze": "freeze",
+    }
+
+    table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan",
+                  show_edge=False, expand=False)
+    table.add_column("domain", style="bold white", no_wrap=True)
+    for c in cols:
+        table.add_column(col_labels[c], justify="center", no_wrap=True)
+
+    def _cell(domain_name: str, field: str, value) -> Text:
+        override_style = (domain_name, field) in overridden
+        if value is True:
+            return Text("✓", style="bold yellow" if override_style else "green")
+        if value is False:
+            return Text("✗", style="bold yellow" if override_style else "dim")
+        if value is None:
+            return Text("—", style="bold yellow" if override_style else "dim")
+        return Text(str(value), style="bold yellow" if override_style else "")
+
+    for name, dc in domains.items():
+        if name == "padding":
+            continue
+        table.add_row(name, *[_cell(name, c, dc.get(c)) for c in cols])
+
+    console.print(Panel(table, title="[bold]Domain configuration[/bold]", border_style="blue"))
+
+    # ── Model params ──────────────────────────────────────────────────────
+    attn = args.attention_scheme
+    attn_str = attn[0] if isinstance(attn, list) and len(attn) == 1 else str(attn)
+    attn_str = attn_str.replace("[", r"\[")  # escape Rich markup
+    model_text = (
+        f"n_layer=[cyan]{args.n_layer}[/]  n_head=[cyan]{args.n_head}[/]  n_embd=[cyan]{args.n_embd}[/]\n"
+        f"block_size=[cyan]{args.block_size}[/]  no_event_token_rate=[cyan]{args.no_event_token_rate}[/]\n"
+        f"attention_scheme: [cyan]{attn_str}[/]"
+    )
+    console.print(Panel(model_text, title="[bold]Model[/bold]", border_style="blue"))
+
+    # ── Training params ───────────────────────────────────────────────────
+    lr_str     = str(args.lr) if args.lr is not None else "1e-4 (default)"
+    min_lr_str = str(args.min_lr) if args.min_lr is not None else "lr/10 (default)"
+    bs_str = str(args.batch_size)
+    if args.batch_size_schedule:
+        bs_str += f"  schedule=[cyan]{args.batch_size_schedule}[/]"
+    train_text = (
+        f"max_epochs=[cyan]{args.max_epochs}[/]  min_epochs=[cyan]{args.min_epochs}[/]  patience=[cyan]{args.patience}[/]\n"
+        f"lr=[cyan]{lr_str}[/]  min_lr=[cyan]{min_lr_str}[/]  schedule=[cyan]{args.schedule}[/]  warmup_iters=[cyan]{args.warmup_iters}[/]\n"
+        f"batch_size=[cyan]{bs_str}[/]\n"
+        f"test_fold=[cyan]{args.test_fold}[/]  seed=[cyan]{args.seed}[/]"
+    )
+    console.print(Panel(train_text, title="[bold]Training[/bold]", border_style="blue"))
+
+    if overridden:
+        console.print(f"[yellow]Overrides:[/yellow] {', '.join(overrides)}")
+
+
 def format_delphi_config(cfg) -> str:
     """Compact human-readable summary of a DelphiConfig."""
     d = asdict(cfg)
@@ -217,7 +300,7 @@ def get_cli_args():
 
     args = parser.parse_args()
 
-    if args.experiment_name is None and not args.resume_run_id and not args.resume_from_previous:
+    if args.experiment_name is None and not args.resume_run_id and not args.resume_from_previous and not args.dry_run:
         parser.error("--experiment_name / -x is required unless --resume_run_id or --resume_from_previous is set.")
 
     return args
@@ -427,6 +510,10 @@ if __name__ == "__main__":
         )
     
         logging.info("\n%s", format_delphi_config(delphi_config))
+
+        if args.dry_run:
+            print_config_rich(delphi_config, args, overrides=args.domain_config_overrides)
+            sys.exit(0)
         model = Delphi(delphi_config).to(DEVICE)
         if not args.no_compile:
             logging.info("Compiling model with torch.compile (first batch will be slower)...")
