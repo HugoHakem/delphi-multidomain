@@ -13,6 +13,18 @@ from delphi.model import DomainConfig
 _DOMAIN_CONFIG_FIELDS = {f.name for f in dc_fields(DomainConfig)}
 
 
+def _normalize_domain_cfg(cfg: dict) -> dict:
+    """Apply consistency rules to a domain config dict in-place.
+
+    Current rules:
+    - dropout_rate == 0 → dropout_mode = None
+    """
+    for dc in cfg.values():
+        if dc.dropout_rate == 0:
+            dc.dropout_mode = None
+    return cfg
+
+
 def load_domain_config(cfg_path, tokens_path):
     raw = yaml.safe_load(Path(cfg_path).read_text())
     cfg = {}
@@ -24,7 +36,7 @@ def load_domain_config(cfg_path, tokens_path):
             p["path"] = tokens_path / p["path"]
         cfg[domain] = DomainConfig(**p)
     cfg["padding"] = DomainConfig(projector="embed")
-    return cfg
+    return _normalize_domain_cfg(cfg)
 
 
 def apply_domain_overrides(domain_cfg: dict, overrides: list[str]) -> dict:
@@ -58,7 +70,7 @@ def apply_domain_overrides(domain_cfg: dict, overrides: list[str]) -> dict:
         value = yaml.safe_load(value_str)
         setattr(domain_cfg[domain], field, value)
 
-    return domain_cfg
+    return _normalize_domain_cfg(domain_cfg)
 
 
 def read_ids(path, type=int):
