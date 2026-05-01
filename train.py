@@ -43,7 +43,7 @@ from utils.trainer import (
 )
 
 from utils.cv_utils import get_data_partitions
-from utils import load_domain_config, setup_mlflow, AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
+from utils import load_domain_config, apply_domain_overrides, setup_mlflow, AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
 
 setup_mlflow()
 
@@ -128,6 +128,10 @@ def get_cli_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--domain_config_yaml", "--domain-config-yaml", dest="domain_config_yaml", default="config/domain_config_default.yaml")
+    parser.add_argument("--domain_config", "--override_domain_config", "--domain-config", "--override-domain-config",
+                        dest="domain_config_overrides", action="append", default=[], metavar="DOMAIN.FIELD=VALUE",
+                        help="Override a specific domain config field after loading the YAML, "
+                             "e.g. diseases.predict=True. Repeatable.")
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex")
     parser.add_argument("--attention_scheme", "--attention-scheme", dest="attention_scheme",
                         default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
@@ -395,6 +399,9 @@ if __name__ == "__main__":
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
         default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / 'tokens')
         domain_cfg = {k: v for k, v in default_cfg_per_domain.items() if k in domains or k == "padding"}
+
+        if args.domain_config_overrides:
+            apply_domain_overrides(domain_cfg, args.domain_config_overrides)
 
         assert all([k in default_cfg_per_domain for k in domains])
         assert len(args.attention_scheme) in {1, args.n_layer}, \
