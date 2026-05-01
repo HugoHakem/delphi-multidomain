@@ -467,7 +467,7 @@ if __name__ == "__main__":
             seed=args.seed
         )
     
-        logging.info("Domain config: %s", domain_config_yaml)
+        logging.info("Domain config: %s", Path(domain_config_yaml).relative_to(Path.cwd()))
         print_config_rich(delphi_config, args, overrides=args.domain_config_overrides)
 
         if args.dry_run:
