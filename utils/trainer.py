@@ -124,6 +124,7 @@ class EarlyStopping:
 
 class NullLogger:
     def log_params(self, params):      pass
+    def log_tags(self, tags):          pass
     def log_metrics(self, metrics, step=None): pass
     def log_artifact(self, path, artifact_path=None): pass
     def log_model(self, model, artifact_path="model"): pass
@@ -161,6 +162,9 @@ class MLFlowLogger:
 
     def log_params(self, params):
         mlflow.log_params(params)
+
+    def log_tags(self, tags):
+        mlflow.set_tags(tags)
 
     def log_metrics(self, metrics, step=None):
         mlflow.log_metrics(metrics, step=step)
@@ -203,11 +207,28 @@ class MLFlowLogger:
             git_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=cwd
             ).decode().strip()
-            git_dirty = bool(subprocess.check_output(
+            porcelain = subprocess.check_output(
                 ["git", "status", "--porcelain"], cwd=cwd
-            ).decode().strip())
+            ).decode().strip()
+            # "??" prefix = untracked file; skip those, only show tracked changes
+            dirty_files = "\n".join(l for l in porcelain.splitlines() if not l.startswith("??"))
+            git_dirty = bool(dirty_files)
         except Exception:
-            git_commit, git_dirty = "unknown", False
+            git_commit, git_dirty, dirty_files = "unknown", False, ""
+
+        if git_dirty:
+            import logging
+            logging.warning("Git worktree is dirty — results may not be reproducible.\n%s", dirty_files)
+            try:
+                diff = subprocess.check_output(
+                    ["git", "diff", "HEAD"], cwd=cwd
+                ).decode(errors="replace")
+                tmp_dir = tempfile.mkdtemp()
+                diff_path = Path(tmp_dir) / "git_diff.patch"
+                diff_path.write_text(diff)
+                mlflow.log_artifact(str(diff_path))
+            except Exception:
+                pass
 
         mlflow.set_tags({
             "git_commit":   git_commit,
@@ -373,7 +394,7 @@ class Trainer(BaseTrainer):
             t.add_column("LR",        justify="right",  width=9)
             t.add_column("Time",      justify="right",  width=8)
             t.add_column("Improved?", justify="center", width=10)
-            for row in epoch_rows:
+            for row in reversed(epoch_rows):
                 t.add_row(*row)
             return t
 
@@ -397,10 +418,8 @@ class Trainer(BaseTrainer):
         eval_every = None if self.n_validations_per_epoch <= 1 else \
                      max(1, n_batches_epoch // self.n_validations_per_epoch)
 
-        import socket
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
-        self.logger.log_params({"hostname": socket.gethostname()})
 
         if self.batch_size_scheduler is not None:
             import logging as _logging
