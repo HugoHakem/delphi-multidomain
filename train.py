@@ -119,7 +119,17 @@ def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -
     for name, dc in domains.items():
         if name == "padding":
             continue
-        table.add_row(name, *[_cell(name, c, dc.get(c)) for c in cols])
+        cells = []
+        for c in cols:
+            val = dc.get(c)
+            if c == "age_jitter" and val:
+                lo = (dc.get("age_jitter_min") or -20 * 365.25) / 365.25
+                hi = (dc.get("age_jitter_max") or  40 * 365.25) / 365.25
+                style = "bold yellow" if (name, c) in overridden else "green"
+                cells.append(Text(f"Unif({lo:+.0f}y,{hi:+.0f}y)", style=style))
+            else:
+                cells.append(_cell(name, c, val))
+        table.add_row(name, *cells)
 
     console.print(Panel(table, title="[bold]Domain configuration[/bold]", border_style="blue"))
 
@@ -169,13 +179,28 @@ def parse_attention_scheme(attention_scheme, as_list=True):
 def get_cli_args():
 
     import argparse
+
+    class _AppendFlat(argparse.Action):
+        """Accumulate multiple values per flag invocation into a flat list."""
+        def __call__(self, parser, namespace, values, option_string=None):
+            current = getattr(namespace, self.dest) or []
+            setattr(namespace, self.dest, current + list(values))
+
+    def _parse_kv_list(pairs, flag):
+        result = {}
+        for item in pairs:
+            if "=" not in item:
+                raise argparse.ArgumentTypeError(f"Invalid {flag} value {item!r}: expected 'KEY=VALUE'")
+            k, _, v = item.partition("=")
+            result[k.strip()] = v.strip()
+        return result
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--domain_config_yaml", "--domain-config-yaml", dest="domain_config_yaml", default="config/domain_config_default.yaml")
-    parser.add_argument("--domain_config", "--override_domain_config", "--domain-config", "--override-domain-config",
-                        dest="domain_config_overrides", action="append", default=[], metavar="DOMAIN.FIELD=VALUE",
-                        help="Override a specific domain config field after loading the YAML, "
-                             "e.g. diseases.predict=True. Repeatable.")
+    parser.add_argument("--domain_config", "--override_domain_config", "--domain-config", "--override-domain-config", "--dcfg",
+                        dest="domain_config_overrides", nargs="+", action=_AppendFlat, default=[], metavar="DOMAIN.FIELD=VALUE",
+                        help="Override domain config fields, e.g. --dcfg diseases.predict=True hla.dropout_rate=0.1")
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex")
     parser.add_argument("--attention_scheme", "--attention-scheme", dest="attention_scheme",
                         default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
@@ -227,7 +252,9 @@ def get_cli_args():
     parser.add_argument("--max_epochs", "--max-epochs", dest="max_epochs", default=1000, type=int)
     parser.add_argument("--min_epochs", "--min-epochs", dest="min_epochs", default=0,    type=int)
     parser.add_argument("--patience",                                       default=20,   type=int)
-    parser.add_argument("--compute_aucs", "--compute-aucs", dest="compute_aucs",   default=False, action="store_true")
+    parser.add_argument("--compute_aucs", "--compute-aucs", "--aucs", "--auc", dest="compute_aucs", default=False, action="store_true")
+    parser.add_argument("--eval_batch_size", "--eval-batch-size", dest="eval_batch_size", default=512, type=int,
+                        help="Batch size for validation and AUC evaluation (default: 512)")
     parser.add_argument("--log_loss_per_disease", "--log-loss-per-disease", dest="log_loss_per_disease",
                         default=False, action="store_true",
                         help="Log per-disease CE loss breakdown as a CSV artifact each validation epoch")
@@ -243,7 +270,12 @@ def get_cli_args():
                         help="Enable mixed precision training (float16)")
 
     parser.add_argument("--experiment_name", "--experiment-name", "--exp_name", "--exp-name", "-x", dest="experiment_name", default=None)
-    parser.add_argument("--run_name", "--run-name", dest="run_name", default=None)
+    parser.add_argument("--run_name", "--run-name", "--run_name_prefix", "--run-name-prefix", dest="run_name_prefix", default=None)
+    parser.add_argument("--run_name_suffix", "--run-name-suffix", dest="run_name_suffix", default="")
+    parser.add_argument("--param", dest="extra_params", nargs="+", action=_AppendFlat, default=[], metavar="KEY=VALUE",
+                        help="Extra MLflow params logged alongside training params, e.g. --param setup=baseline note=v2")
+    parser.add_argument("--tag", dest="extra_tags", nargs="+", action=_AppendFlat, default=[], metavar="KEY=VALUE",
+                        help="Extra MLflow tags, e.g. --tag env=cluster status=production")
     parser.add_argument("--resume_run_id", "--resume-run-id", "--resume_runid", "--resume-runid",
                         dest="resume_run_id", type=str, default=None,
                         help="Resume training from the latest checkpoint of this MLflow run")
@@ -254,7 +286,7 @@ def get_cli_args():
                         action="store_true", default=False,
                         help="Resume from a previous run. With --interactive (-i), prompts to select experiment and run.")
 
-    parser.add_argument("--dryrun", "--dry-run", "--dry_run", dest="dry_run", action="store_true", default=False)
+    parser.add_argument("--dryrun", "--dry-run", "--dry_run", "--dry", dest="dry_run", action="store_true", default=False)
 
     parser.add_argument("--no_rich", "--no-rich", dest="no_rich", action="store_true", default=False,
                     help="Disable rich display (use tqdm instead, e.g. for cluster log files)")
@@ -263,6 +295,14 @@ def get_cli_args():
 
     if args.experiment_name is None and not args.resume_run_id and not args.resume_from_previous and not args.dry_run:
         parser.error("--experiment_name / -x is required unless --resume_run_id or --resume_from_previous is set.")
+
+    prefix = args.run_name_prefix or ""
+    args.run_name = (prefix + args.run_name_suffix) or None
+
+    if args.extra_params:
+        args.extra_params = _parse_kv_list(args.extra_params, "--param")
+    if args.extra_tags:
+        args.extra_tags = _parse_kv_list(args.extra_tags, "--tag")
 
     return args
 
@@ -324,11 +364,12 @@ def get_continuous_domains(domain_cfg):
 
 
 def get_dataloaders(
-    domain_cfg, 
+    domain_cfg,
     model,
-    test_fold, 
+    test_fold,
     block_size,
     batch_size,
+    eval_batch_size=None,
     num_workers=4,
     no_event_token_rate=2.0,
     no_event_insertion_mode="random",
@@ -388,12 +429,7 @@ def get_dataloaders(
         for dname, cfg in domain_cfg.items()
         if cfg.age_jitter and dname in model.domain_to_int
     }
-    if age_jitter:
-        logging.info(
-            "Age jitter enabled for: %s",
-            {dname: (cfg.age_jitter_min, cfg.age_jitter_max)
-             for dname, cfg in domain_cfg.items() if cfg.age_jitter},
-        )
+
 
     collate_kwargs = dict(
         age_sampler=age_sampler,
@@ -408,11 +444,12 @@ def get_dataloaders(
     train_collate = DelphiCollateFn(**collate_kwargs, age_jitter=age_jitter, training=True)
     eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
 
-    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    train_kwargs = dict(batch_size=batch_size,                              num_workers=num_workers, pin_memory=True)
+    eval_kwargs  = dict(batch_size=eval_batch_size or batch_size,           num_workers=num_workers, pin_memory=True)
 
-    train_loader = FlexibleDataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **loader_kwargs)
-    valid_loader = FlexibleDataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
-    test_loader  = FlexibleDataLoader(test_dataset,  shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
+    train_loader = FlexibleDataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **train_kwargs)
+    valid_loader = FlexibleDataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **eval_kwargs)
+    test_loader  = FlexibleDataLoader(test_dataset,  shuffle=False, collate_fn=eval_collate,  **eval_kwargs)
 
     return DataModule(train_loader, valid_loader, test_loader)
 
@@ -435,6 +472,10 @@ if __name__ == "__main__":
 
     if (train_from_scratch := not args.resume_run_id):
   
+        _raw = args.attention_scheme
+        if isinstance(_raw, list):
+            _raw = _raw[0] if len(set(_raw)) == 1 else None
+        attention_scheme_alias = _raw if _raw in ATTENTION_SCHEMES else None
         args.attention_scheme = parse_attention_scheme(args.attention_scheme)
         domains = [d for d in args.domains.split(",") if d != "padding"]
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
@@ -486,6 +527,7 @@ if __name__ == "__main__":
             test_fold=args.test_fold,
             block_size=args.block_size,
             batch_size=initial_batch_size,
+            eval_batch_size=args.eval_batch_size,
             num_workers=args.num_workers,
             no_event_token_rate=args.no_event_token_rate,
             no_event_insertion_mode=args.no_event_token_insertion_mode,
@@ -506,8 +548,6 @@ if __name__ == "__main__":
             warmup_iters   = args.warmup_iters,
             lr_decay_iters = args.lr_decay_iters,
         )
-        logging.info("Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
-        
         optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
         
         logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
@@ -524,6 +564,7 @@ if __name__ == "__main__":
             "max_epochs": args.max_epochs,
             "min_epochs": args.min_epochs,
             "patience": args.patience,
+            "attention_scheme_alias": attention_scheme_alias,
         }
      
     else:
@@ -589,6 +630,10 @@ if __name__ == "__main__":
 
     # ── Run metadata ──────────────────────────────────────────────────────────────────
     logger.log_run_metadata(cwd=DELPHI_DIR)
+    if args.extra_params:
+        logger.log_params(args.extra_params)
+    if args.extra_tags:
+        logger.log_tags(args.extra_tags)
 
     n_params = sum(p.numel() for p in model.parameters())
     logged_params["n_params"] = n_params
@@ -630,7 +675,7 @@ if __name__ == "__main__":
         auc_collate.block_size = 128
         test_loader = DataLoader(
             dataloaders[2].dataset,
-            batch_size=dataloaders[2].batch_size,
+            batch_size=args.eval_batch_size,
             shuffle=False,
             num_workers=dataloaders[2]._num_workers,
             pin_memory=True,
@@ -647,3 +692,36 @@ if __name__ == "__main__":
             logger=logger,
         )
         logging.info("AUCs:\n%s", pformat(auc_df, sort_dicts=False))
+
+        diseases_domain = "diseases"
+        if diseases_domain in model.config.domains:
+            metadata_path = Path(model.config.domains[diseases_domain].path) / "token_metadata.tsv"
+            if metadata_path.exists():
+                metadata = pd.read_csv(metadata_path, sep="\t")
+                _d = auc_df[auc_df["domain"] == diseases_domain].copy()
+                _d["_w"] = _d["n_case"] + _d["n_ctrl"]
+                # age bins 40-70 only
+                _d4070 = _d[(_d["age_start"] >= 40) & (_d["age_end"] <= 70)]
+                # per (token_id, age_bin): weighted mean across sexes
+                _by_age = (
+                    _d4070.groupby(["token_id", "age_start"])
+                    .apply(lambda g: (g["auc_delong"] * g["_w"]).sum() / g["_w"].sum(), include_groups=False)
+                    .rename("auc")
+                    .reset_index()
+                )
+                pivoted = _by_age.pivot(index="token_id", columns="age_start", values="auc")
+                pivoted.columns = [f"{int(c)}-{int(c)+5}" for c in pivoted.columns]
+                # overall weighted mean (40-70, both sexes)
+                pivoted["mean_auc"] = (
+                    _d4070.groupby("token_id")
+                    .apply(lambda g: (g["auc_delong"] * g["_w"]).sum() / g["_w"].sum(), include_groups=False)
+                )
+                age_cols = [c for c in pivoted.columns if c != "mean_auc"]
+                top50 = (
+                    metadata
+                    .merge(pivoted.reset_index(), on="token_id", how="inner")
+                    .sort_values("n_subjects", ascending=False)
+                    .head(50)
+                    [["name", "n_subjects", "mean_auc"] + age_cols]
+                )
+                logging.info("Top 50 diseases by case count:\n%s", top50.to_string(index=False))
