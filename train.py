@@ -258,6 +258,10 @@ def get_cli_args():
     parser.add_argument("--log_loss_per_disease", "--log-loss-per-disease", dest="log_loss_per_disease",
                         default=False, action="store_true",
                         help="Log per-disease CE loss breakdown as a CSV artifact each validation epoch")
+    parser.add_argument("--baseline_incidence_path", "--baseline-incidence-path", dest="baseline_incidence_path",
+                        default=None, type=str,
+                        help="Path to age-sex stratified disease incidence parquet "
+                             "(from auc/compute_disease_incidence.py). Enables relative CCE logging.")
     parser.add_argument("--checkpoint_every", "--checkpoint-every", dest="checkpoint_every", default=None, type=int,
                         help="Save a periodic checkpoint every N epochs (in addition to best-model checkpoints)")
 
@@ -650,6 +654,7 @@ if __name__ == "__main__":
         model, dataloaders,
         optimizer, scheduler,
         log_loss_per_disease=args.log_loss_per_disease,
+        baseline_incidence_path=args.baseline_incidence_path,
         checkpoint_every=args.checkpoint_every,
         logger=logger,
         mlflow_params=logged_params,
