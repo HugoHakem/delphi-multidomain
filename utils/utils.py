@@ -27,14 +27,35 @@ def _normalize_domain_cfg(cfg: dict) -> dict:
 
 def load_domain_config(cfg_path, tokens_path):
     raw = yaml.safe_load(Path(cfg_path).read_text())
-    cfg = {}
-    for domain, params in raw.items():
-        if domain == "padding":
+
+    # First pass: collect raw dicts (excluding padding)
+    raw_configs = {k: dict(v) for k, v in raw.items() if k != "padding" and v is not None}
+
+    # Second pass: resolve parent inheritance
+    for domain, params in raw_configs.items():
+        parent_name = params.get("parent")
+        if parent_name is None:
             continue
+        if parent_name not in raw_configs:
+            raise ValueError(
+                f"Domain '{domain}' references unknown parent '{parent_name}'. "
+                f"Available domains: {sorted(raw_configs)}"
+            )
+        parent_params = {
+            k: v for k, v in raw_configs[parent_name].items()
+            if k not in ("parent", "subdomain", "subdomain_column", "predict", "group")
+        }
+        raw_configs[domain] = {**parent_params, **params}
+
+    # Third pass: build DomainConfig objects
+    cfg = {}
+    for domain, params in raw_configs.items():
         p = dict(params)
+        p.pop("parent", None)
         if "path" in p:
             p["path"] = tokens_path / p["path"]
         cfg[domain] = DomainConfig(**p)
+
     cfg["padding"] = DomainConfig(projector="embed")
     return _normalize_domain_cfg(cfg)
 

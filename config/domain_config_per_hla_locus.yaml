@@ -1,0 +1,81 @@
+diseases:
+  projector: embed
+  path: diseases
+  predict: true
+
+sex:
+  projector: embed
+  path: sex
+  at_birth: true
+
+death:
+  projector: embed
+  path: death
+  predict: true
+
+lifestyle:
+  projector: embed
+  path: lifestyle
+  age_jitter: true
+
+genetic_pcs:
+  type: continuous
+  projector: linear
+  path: genetic_pcs
+  at_birth: true
+  input_size: 40
+  n_latent_tokens: 5
+
+# Parent domain — defines path, projector, at_birth and default subdomain_column.
+# Children reference this via `parent: hla_alleles` and only specify their subdomain.
+hla_alleles:
+  projector: embed
+  path: hla_alleles
+  at_birth: true
+  subdomain_column: locus
+
+hla_a:
+  parent: hla_alleles
+  subdomain: hla_a
+
+hla_b:
+  parent: hla_alleles
+  subdomain: hla_b
+
+hla_c:
+  parent: hla_alleles
+  subdomain: hla_c
+
+hla_dpa:
+  parent: hla_alleles
+  subdomain: hla_dpa
+
+hla_dpb:
+  parent: hla_alleles
+  subdomain: hla_dpb
+
+hla_dqa:
+  parent: hla_alleles
+  subdomain: hla_dqa
+
+hla_dqb:
+  parent: hla_alleles
+  subdomain: hla_dqb
+
+hla_drb:
+  parent: hla_alleles
+  subdomain: hla_drb
+
+# Group-level domains (use locus_group column once metadata is updated)
+# hla_dp:
+#   parent: hla_alleles
+#   subdomain: hla_dp
+#   subdomain_column: locus_group
+#
+# hla_dq:
+#   parent: hla_alleles
+#   subdomain: hla_dq
+#   subdomain_column: locus_group
+
+padding:
+  projector: embed

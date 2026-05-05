@@ -86,6 +86,8 @@ class DomainConfig:
     at_birth: bool = False
     n_latent_tokens: Optional[int] = None
     subdomain: Optional[str] = None        # filter tokens by metadata (e.g. "hla_a")
+    subdomain_column: str = "locus"        # metadata column used for subdomain filtering
+    parent: Optional[str] = None          # inherit config from this domain (resolved at load time)
     group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
     dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
     dropout_rate: float = 0.0             # probability of dropping; 0 = disabled

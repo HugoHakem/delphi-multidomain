@@ -413,6 +413,7 @@ class DelphiDataset(Dataset):
                 type=dinfo.type,
                 at_birth=dinfo.at_birth,
                 subdomain=getattr(dinfo, "subdomain", None),
+                subdomain_column=getattr(dinfo, "subdomain_column", "locus"),
             )
 
         # ── Resolve subject set ───────────────────────────────────────────
