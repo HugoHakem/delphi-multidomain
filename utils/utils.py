@@ -47,11 +47,13 @@ def load_domain_config(cfg_path, tokens_path):
         }
         raw_configs[domain] = {**parent_params, **params}
 
-    # Third pass: build DomainConfig objects
+    # Third pass: build DomainConfig objects, skipping abstract domains
     cfg = {}
     for domain, params in raw_configs.items():
         p = dict(params)
         p.pop("parent", None)
+        if p.pop("abstract", False):
+            continue
         if "path" in p:
             p["path"] = tokens_path / p["path"]
         cfg[domain] = DomainConfig(**p)

@@ -26,9 +26,11 @@ genetic_pcs:
   input_size: 40
   n_latent_tokens: 5
 
-# Parent domain — defines path, projector, at_birth and default subdomain_column.
-# Children reference this via `parent: hla_alleles` and only specify their subdomain.
+# Abstract parent — defines shared config for all HLA loci.
+# Not included as an active domain; use hla_alleles from domain_config_default.yaml
+# if you want the full unsplit domain.
 hla_alleles:
+  abstract: true
   projector: embed
   path: hla_alleles
   at_birth: true
@@ -66,16 +68,16 @@ hla_drb:
   parent: hla_alleles
   subdomain: hla_drb
 
-# Group-level domains (use locus_group column once metadata is updated)
-# hla_dp:
-#   parent: hla_alleles
-#   subdomain: hla_dp
-#   subdomain_column: locus_group
-#
-# hla_dq:
-#   parent: hla_alleles
-#   subdomain: hla_dq
-#   subdomain_column: locus_group
+# Group-level domains (DPA+DPB, DQA+DQB merged by locus_group column)
+hla_dp:
+  parent: hla_alleles
+  subdomain: hla_dp
+  subdomain_column: locus_group
+
+hla_dq:
+  parent: hla_alleles
+  subdomain: hla_dq
+  subdomain_column: locus_group
 
 padding:
   projector: embed

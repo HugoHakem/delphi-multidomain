@@ -88,6 +88,7 @@ class DomainConfig:
     subdomain: Optional[str] = None        # filter tokens by metadata (e.g. "hla_a")
     subdomain_column: str = "locus"        # metadata column used for subdomain filtering
     parent: Optional[str] = None          # inherit config from this domain (resolved at load time)
+    abstract: bool = False                 # template-only domain; excluded from the active config
     group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
     dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
     dropout_rate: float = 0.0             # probability of dropping; 0 = disabled
@@ -477,7 +478,7 @@ class Delphi(nn.Module):
                 running += 2  # PADDING_TOKEN=0, NO_EVENT_TOKEN=1
             elif cfg is None:
                 offsets[d_int] = running
-            elif cfg.type == "categorical" and cfg.projector in ("embed", "Embed"):
+            elif cfg.type == "categorical" and cfg.projector in ("embed", "Embed", "pretrained"):
                 offsets[d_int] = running
                 running += Delphi._resolve_vocab_size(cfg)
             else:
