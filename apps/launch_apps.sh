@@ -31,9 +31,9 @@ echo "    -L ${PORT_LOSS}:localhost:${PORT_LOSS} \\"
 echo "    ${USER}@${HOST}"
 echo ""
 
-python "${SCRIPT_DIR}/apps/run_mlflow_ui.py" --port "${PORT_MLFLOW}" 2>&1 | grep -v "^$\|ssh -J" &
-python -m streamlit run "${SCRIPT_DIR}/apps/traj_explorer.py"         --server.port "${PORT_TRAJ}"        --server.headless true &
-python -m streamlit run "${SCRIPT_DIR}/apps/experiment_builder.py"    --server.port "${PORT_EXPBUILDER}"  --server.headless true &
-python -m streamlit run "${SCRIPT_DIR}/apps/delphi_loss_viewer/app.py" --server.port "${PORT_LOSS}"       --server.headless true &
+python "${SCRIPT_DIR}/run_mlflow_ui.py" --port "${PORT_MLFLOW}" 2>&1 | grep -v "^$\|ssh -J" &
+python -m streamlit run "${SCRIPT_DIR}/traj_explorer.py"         --server.port "${PORT_TRAJ}"        --server.headless true &
+python -m streamlit run "${SCRIPT_DIR}/experiment_builder.py"    --server.port "${PORT_EXPBUILDER}"  --server.headless true &
+python -m streamlit run "${SCRIPT_DIR}/delphi_loss_viewer/app.py" --server.port "${PORT_LOSS}"       --server.headless true &
 
 wait

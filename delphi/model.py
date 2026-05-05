@@ -38,6 +38,32 @@ from delphi.embedding import MultiDomainEmbedding
 logger = logging.getLogger(__name__)
 
 DAYS_PER_YEAR = 365.25
+_DAYS_PER_MONTH = 365.25 / 12
+
+
+def parse_duration(s) -> float:
+    """Parse a duration string to days.
+
+    Accepted formats: ``-20y`` (years), ``6m`` (months), ``1000d`` (days).
+    A unit suffix is always required. Numeric values (int/float) are returned
+    as-is (assumed to already be in days).
+
+    Examples::
+        parse_duration("-20y")  →  -7305.0
+        parse_duration("6m")    →   182.625
+        parse_duration("365d")  →   365.0
+    """
+    if isinstance(s, (int, float)):
+        return float(s)
+    s = str(s).strip()
+    _units = {"d": 1.0, "m": _DAYS_PER_MONTH, "y": DAYS_PER_YEAR}
+    if not s or s[-1] not in _units:
+        raise ValueError(
+            f"Duration {s!r} requires a unit suffix: d (days), m (months), y (years). "
+            f"Examples: '-20y', '6m', '1000d'."
+        )
+    return float(s[:-1]) * _units[s[-1]]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Config
@@ -64,6 +90,33 @@ class DomainConfig:
     dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
     dropout_rate: float = 0.0             # probability of dropping; 0 = disabled
     no_repeat: bool = False               # mask already-seen tokens from logits (for domains where only first occurrence is recorded)
+
+    def __post_init__(self):
+        if self.at_birth and self.age_jitter:
+            raise ValueError(
+                "DomainConfig: at_birth and age_jitter are mutually exclusive — set only one."
+            )
+        object.__setattr__(self, '_initialized', True)
+
+    _DURATION_FIELDS = frozenset({"age_jitter_min", "age_jitter_max"})
+
+    def __setattr__(self, name, value):
+        if name in DomainConfig._DURATION_FIELDS and isinstance(value, str):
+            value = parse_duration(value)
+        if getattr(self, '_initialized', False):
+            if name == 'at_birth' and value:
+                object.__setattr__(self, 'age_jitter', False)
+            elif name == 'age_jitter' and value:
+                object.__setattr__(self, 'at_birth', False)
+        object.__setattr__(self, name, value)
+
+    def set_age_jitter(self, value: bool, min: Optional[float] = None, max: Optional[float] = None):
+        self.age_jitter = value
+        if min is not None:
+            self.age_jitter_min = min
+        if max is not None:
+            self.age_jitter_max = max
+        return self
 
     def set_freeze(self, freeze: bool):
         self.freeze = freeze

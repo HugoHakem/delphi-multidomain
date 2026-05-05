@@ -43,7 +43,7 @@ from utils.trainer import (
 )
 
 from utils.cv_utils import get_data_partitions
-from utils import load_domain_config, setup_mlflow, AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
+from utils import load_domain_config, apply_domain_overrides, setup_mlflow, AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
 
 setup_mlflow()
 
@@ -69,43 +69,97 @@ torch.backends.cudnn.allow_tf32 = True
 
 USE_TQDM = sys.stdout.isatty()
 
-def _fmt(v):
-    if v is True:  return "✓"
-    if v is False: return "✗"
-    if v is None:  return "—"
-    return str(v)
+def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -> None:
+    """Print a Rich-formatted config summary and exit cleanly (used by --dryrun)."""
+    from dataclasses import asdict as _asdict
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
 
+    import shutil
+    term_width = max(shutil.get_terminal_size(fallback=(120, 40)).columns, 120)
+    console = Console(width=term_width)
 
-def format_delphi_config(cfg) -> str:
-    """Compact human-readable summary of a DelphiConfig."""
-    d = asdict(cfg)
-    domains = d.pop("domains", {})
+    # Which (domain, field) pairs were explicitly overridden
+    overridden: set[tuple[str, str]] = set()
+    for ov in (overrides or []):
+        if "=" in ov and "." in ov.split("=", 1)[0]:
+            domain, field = ov.split("=", 1)[0].split(".", 1)
+            overridden.add((domain, field))
 
-    # ── Scalar params ──────────────────────────────────────────────────
-    skip = {"path", "n_layers", "n_hidden", "input_size", "pretrained_path",
-            "subdomain", "group", "n_latent_tokens"}
-    lines = ["Model config:"]
-    for k, v in d.items():
-        lines.append(f"  {k}: {_fmt(v)}")
+    domains = _asdict(delphi_config).get("domains", {})
 
-    # ── Domains table ──────────────────────────────────────────────────
-    bool_cols   = ["predict", "at_birth", "age_jitter", "freeze"]
-    str_cols    = ["projector", "type", "dropout_mode", "dropout_rate"]
-    cols        = bool_cols + str_cols
-    col_widths  = {c: max(len(c), max(len(_fmt(d.get(c))) for d in domains.values()) if domains else 0)
-                   for c in cols}
-    dom_width   = max((len(n) for n in domains), default=6)
+    # ── Domain table ──────────────────────────────────────────────────────
+    cols = ["predict", "at_birth", "projector", "type", "dropout_mode", "dropout_rate", "age_jitter", "freeze"]
 
-    header = f"  {'domain':<{dom_width}}  " + "  ".join(f"{c:>{col_widths[c]}}" for c in cols)
-    sep    = "  " + "-" * (len(header) - 2)
-    lines += ["", "Domains:", header, sep]
+    col_labels = {
+        "predict": "predict", "at_birth": "at_birth", "projector": "projector",
+        "type": "type", "dropout_mode": "drop_mode", "dropout_rate": "drop_rate",
+        "age_jitter": "jitter", "freeze": "freeze",
+    }
+
+    table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan",
+                  show_edge=False, expand=False)
+    table.add_column("domain", style="bold white", no_wrap=True)
+    for c in cols:
+        table.add_column(col_labels[c], justify="center", no_wrap=True)
+
+    def _cell(domain_name: str, field: str, value) -> Text:
+        override_style = (domain_name, field) in overridden
+        if value is True:
+            return Text("✓", style="bold yellow" if override_style else "green")
+        if value is False:
+            return Text("✗", style="bold yellow" if override_style else "dim")
+        if value is None:
+            return Text("—", style="bold yellow" if override_style else "dim")
+        return Text(str(value), style="bold yellow" if override_style else "")
+
     for name, dc in domains.items():
-        row = f"  {name:<{dom_width}}  " + "  ".join(
-            f"{_fmt(dc.get(c)):>{col_widths[c]}}" for c in cols
-        )
-        lines.append(row)
+        if name == "padding":
+            continue
+        cells = []
+        for c in cols:
+            val = dc.get(c)
+            if c == "age_jitter" and val:
+                lo = (dc.get("age_jitter_min") or -20 * 365.25) / 365.25
+                hi = (dc.get("age_jitter_max") or  40 * 365.25) / 365.25
+                style = "bold yellow" if (name, c) in overridden else "green"
+                cells.append(Text(f"Unif({lo:+.0f}y,{hi:+.0f}y)", style=style))
+            else:
+                cells.append(_cell(name, c, val))
+        table.add_row(name, *cells)
 
-    return "\n".join(lines)
+    console.print(Panel(table, title="[bold]Domain configuration[/bold]", border_style="blue"))
+
+    # ── Model params ──────────────────────────────────────────────────────
+    attn = args.attention_scheme
+    attn_str = attn[0] if isinstance(attn, list) and len(attn) == 1 else str(attn)
+    attn_str = attn_str.replace("[", r"\[")  # escape Rich markup
+    model_text = (
+        f"n_layer=[cyan]{args.n_layer}[/]  n_head=[cyan]{args.n_head}[/]  n_embd=[cyan]{args.n_embd}[/]  "
+        f"no_event_token_rate=[cyan]{args.no_event_token_rate}[/]\n"
+        f"attention_scheme: [cyan]{attn_str}[/]"
+    )
+    console.print(Panel(model_text, title="[bold]Model[/bold]", border_style="blue"))
+
+    # ── Training params ───────────────────────────────────────────────────
+    lr_str     = str(args.lr) if args.lr is not None else "1e-4 (default)"
+    min_lr_str = str(args.min_lr) if args.min_lr is not None else "lr/10 (default)"
+    bs_str = str(args.batch_size)
+    if args.batch_size_schedule:
+        bs_str += f"  schedule=[cyan]{args.batch_size_schedule}[/]"
+    train_text = (
+        f"max_epochs=[cyan]{args.max_epochs}[/]  min_epochs=[cyan]{args.min_epochs}[/]  patience=[cyan]{args.patience}[/]\n"
+        f"lr=[cyan]{lr_str}[/]  min_lr=[cyan]{min_lr_str}[/]  schedule=[cyan]{args.schedule}[/]  warmup_iters=[cyan]{args.warmup_iters}[/]\n"
+        f"batch_size=[cyan]{bs_str}[/]\n"
+        f"test_fold=[cyan]{args.test_fold}[/]  seed=[cyan]{args.seed}[/]"
+    )
+    console.print(Panel(train_text, title="[bold]Training[/bold]", border_style="blue"))
+
+    if overridden:
+        console.print(f"[yellow]Overrides:[/yellow] {', '.join(overrides)}")
 
 
 def parse_attention_scheme(attention_scheme, as_list=True):
@@ -125,9 +179,28 @@ def parse_attention_scheme(attention_scheme, as_list=True):
 def get_cli_args():
 
     import argparse
+
+    class _AppendFlat(argparse.Action):
+        """Accumulate multiple values per flag invocation into a flat list."""
+        def __call__(self, parser, namespace, values, option_string=None):
+            current = getattr(namespace, self.dest) or []
+            setattr(namespace, self.dest, current + list(values))
+
+    def _parse_kv_list(pairs, flag):
+        result = {}
+        for item in pairs:
+            if "=" not in item:
+                raise argparse.ArgumentTypeError(f"Invalid {flag} value {item!r}: expected 'KEY=VALUE'")
+            k, _, v = item.partition("=")
+            result[k.strip()] = v.strip()
+        return result
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--domain_config_yaml", "--domain-config-yaml", dest="domain_config_yaml", default="config/domain_config_default.yaml")
+    parser.add_argument("--domain_config", "--override_domain_config", "--domain-config", "--override-domain-config", "--dcfg",
+                        dest="domain_config_overrides", nargs="+", action=_AppendFlat, default=[], metavar="DOMAIN.FIELD=VALUE",
+                        help="Override domain config fields, e.g. --dcfg diseases.predict=True hla.dropout_rate=0.1")
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex")
     parser.add_argument("--attention_scheme", "--attention-scheme", dest="attention_scheme",
                         default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
@@ -179,10 +252,16 @@ def get_cli_args():
     parser.add_argument("--max_epochs", "--max-epochs", dest="max_epochs", default=1000, type=int)
     parser.add_argument("--min_epochs", "--min-epochs", dest="min_epochs", default=0,    type=int)
     parser.add_argument("--patience",                                       default=20,   type=int)
-    parser.add_argument("--compute_aucs", "--compute-aucs", dest="compute_aucs",   default=False, action="store_true")
+    parser.add_argument("--compute_aucs", "--compute-aucs", "--aucs", "--auc", dest="compute_aucs", default=False, action="store_true")
+    parser.add_argument("--eval_batch_size", "--eval-batch-size", dest="eval_batch_size", default=512, type=int,
+                        help="Batch size for validation and AUC evaluation (default: 512)")
     parser.add_argument("--log_loss_per_disease", "--log-loss-per-disease", dest="log_loss_per_disease",
                         default=False, action="store_true",
                         help="Log per-disease CE loss breakdown as a CSV artifact each validation epoch")
+    parser.add_argument("--baseline_incidence_path", "--baseline-incidence-path", dest="baseline_incidence_path",
+                        default=None, type=str,
+                        help="Path to age-sex stratified disease incidence parquet "
+                             "(from auc/compute_disease_incidence.py). Enables relative CCE logging.")
     parser.add_argument("--checkpoint_every", "--checkpoint-every", dest="checkpoint_every", default=None, type=int,
                         help="Save a periodic checkpoint every N epochs (in addition to best-model checkpoints)")
 
@@ -195,7 +274,12 @@ def get_cli_args():
                         help="Enable mixed precision training (float16)")
 
     parser.add_argument("--experiment_name", "--experiment-name", "--exp_name", "--exp-name", "-x", dest="experiment_name", default=None)
-    parser.add_argument("--run_name", "--run-name", dest="run_name", default=None)
+    parser.add_argument("--run_name", "--run-name", "--run_name_prefix", "--run-name-prefix", dest="run_name_prefix", default=None)
+    parser.add_argument("--run_name_suffix", "--run-name-suffix", dest="run_name_suffix", default="")
+    parser.add_argument("--param", dest="extra_params", nargs="+", action=_AppendFlat, default=[], metavar="KEY=VALUE",
+                        help="Extra MLflow params logged alongside training params, e.g. --param setup=baseline note=v2")
+    parser.add_argument("--tag", dest="extra_tags", nargs="+", action=_AppendFlat, default=[], metavar="KEY=VALUE",
+                        help="Extra MLflow tags, e.g. --tag env=cluster status=production")
     parser.add_argument("--resume_run_id", "--resume-run-id", "--resume_runid", "--resume-runid",
                         dest="resume_run_id", type=str, default=None,
                         help="Resume training from the latest checkpoint of this MLflow run")
@@ -206,15 +290,23 @@ def get_cli_args():
                         action="store_true", default=False,
                         help="Resume from a previous run. With --interactive (-i), prompts to select experiment and run.")
 
-    parser.add_argument("--dryrun", "--dry-run", "--dry_run", dest="dry_run", action="store_true", default=False)
+    parser.add_argument("--dryrun", "--dry-run", "--dry_run", "--dry", dest="dry_run", action="store_true", default=False)
 
     parser.add_argument("--no_rich", "--no-rich", dest="no_rich", action="store_true", default=False,
                     help="Disable rich display (use tqdm instead, e.g. for cluster log files)")
 
     args = parser.parse_args()
 
-    if args.experiment_name is None and not args.resume_run_id and not args.resume_from_previous:
+    if args.experiment_name is None and not args.resume_run_id and not args.resume_from_previous and not args.dry_run:
         parser.error("--experiment_name / -x is required unless --resume_run_id or --resume_from_previous is set.")
+
+    prefix = args.run_name_prefix or ""
+    args.run_name = (prefix + args.run_name_suffix) or None
+
+    if args.extra_params:
+        args.extra_params = _parse_kv_list(args.extra_params, "--param")
+    if args.extra_tags:
+        args.extra_tags = _parse_kv_list(args.extra_tags, "--tag")
 
     return args
 
@@ -276,11 +368,12 @@ def get_continuous_domains(domain_cfg):
 
 
 def get_dataloaders(
-    domain_cfg, 
+    domain_cfg,
     model,
-    test_fold, 
+    test_fold,
     block_size,
     batch_size,
+    eval_batch_size=None,
     num_workers=4,
     no_event_token_rate=2.0,
     no_event_insertion_mode="random",
@@ -340,12 +433,7 @@ def get_dataloaders(
         for dname, cfg in domain_cfg.items()
         if cfg.age_jitter and dname in model.domain_to_int
     }
-    if age_jitter:
-        logging.info(
-            "Age jitter enabled for: %s",
-            {dname: (cfg.age_jitter_min, cfg.age_jitter_max)
-             for dname, cfg in domain_cfg.items() if cfg.age_jitter},
-        )
+
 
     collate_kwargs = dict(
         age_sampler=age_sampler,
@@ -360,11 +448,12 @@ def get_dataloaders(
     train_collate = DelphiCollateFn(**collate_kwargs, age_jitter=age_jitter, training=True)
     eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
 
-    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    train_kwargs = dict(batch_size=batch_size,                              num_workers=num_workers, pin_memory=True)
+    eval_kwargs  = dict(batch_size=eval_batch_size or batch_size,           num_workers=num_workers, pin_memory=True)
 
-    train_loader = FlexibleDataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **loader_kwargs)
-    valid_loader = FlexibleDataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
-    test_loader  = FlexibleDataLoader(test_dataset,  shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
+    train_loader = FlexibleDataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **train_kwargs)
+    valid_loader = FlexibleDataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **eval_kwargs)
+    test_loader  = FlexibleDataLoader(test_dataset,  shuffle=False, collate_fn=eval_collate,  **eval_kwargs)
 
     return DataModule(train_loader, valid_loader, test_loader)
 
@@ -381,20 +470,24 @@ if __name__ == "__main__":
         raise ValueError("--resume_from_previous requires --interactive or --resume_run_id.")
 
     cache_block_size = AUTO_BLOCK_SIZE if args.block_size == "auto" else args.block_size
-    logging.info(
-        "block_size=%s  cache_block_size=%d", args.block_size, cache_block_size
-    )
 
     bs_scheduler = None
     start_epoch = 0
 
     if (train_from_scratch := not args.resume_run_id):
   
+        _raw = args.attention_scheme
+        if isinstance(_raw, list):
+            _raw = _raw[0] if len(set(_raw)) == 1 else None
+        attention_scheme_alias = _raw if _raw in ATTENTION_SCHEMES else None
         args.attention_scheme = parse_attention_scheme(args.attention_scheme)
         domains = [d for d in args.domains.split(",") if d != "padding"]
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
         default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / 'tokens')
         domain_cfg = {k: v for k, v in default_cfg_per_domain.items() if k in domains or k == "padding"}
+
+        if args.domain_config_overrides:
+            apply_domain_overrides(domain_cfg, args.domain_config_overrides)
 
         assert all([k in default_cfg_per_domain for k in domains])
         assert len(args.attention_scheme) in {1, args.n_layer}, \
@@ -419,7 +512,11 @@ if __name__ == "__main__":
             seed=args.seed
         )
     
-        logging.info("\n%s", format_delphi_config(delphi_config))
+        logging.info("Domain config: %s", Path(domain_config_yaml).relative_to(Path.cwd()))
+        print_config_rich(delphi_config, args, overrides=args.domain_config_overrides)
+
+        if args.dry_run:
+            sys.exit(0)
         model = Delphi(delphi_config).to(DEVICE)
         if not args.no_compile:
             logging.info("Compiling model with torch.compile (first batch will be slower)...")
@@ -434,6 +531,7 @@ if __name__ == "__main__":
             test_fold=args.test_fold,
             block_size=args.block_size,
             batch_size=initial_batch_size,
+            eval_batch_size=args.eval_batch_size,
             num_workers=args.num_workers,
             no_event_token_rate=args.no_event_token_rate,
             no_event_insertion_mode=args.no_event_token_insertion_mode,
@@ -454,8 +552,6 @@ if __name__ == "__main__":
             warmup_iters   = args.warmup_iters,
             lr_decay_iters = args.lr_decay_iters,
         )
-        logging.info("Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
-        
         optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
         
         logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
@@ -472,6 +568,7 @@ if __name__ == "__main__":
             "max_epochs": args.max_epochs,
             "min_epochs": args.min_epochs,
             "patience": args.patience,
+            "attention_scheme_alias": attention_scheme_alias,
         }
      
     else:
@@ -537,6 +634,10 @@ if __name__ == "__main__":
 
     # ── Run metadata ──────────────────────────────────────────────────────────────────
     logger.log_run_metadata(cwd=DELPHI_DIR)
+    if args.extra_params:
+        logger.log_params(args.extra_params)
+    if args.extra_tags:
+        logger.log_tags(args.extra_tags)
 
     n_params = sum(p.numel() for p in model.parameters())
     logged_params["n_params"] = n_params
@@ -553,6 +654,7 @@ if __name__ == "__main__":
         model, dataloaders,
         optimizer, scheduler,
         log_loss_per_disease=args.log_loss_per_disease,
+        baseline_incidence_path=args.baseline_incidence_path,
         checkpoint_every=args.checkpoint_every,
         logger=logger,
         mlflow_params=logged_params,
@@ -578,7 +680,7 @@ if __name__ == "__main__":
         auc_collate.block_size = 128
         test_loader = DataLoader(
             dataloaders[2].dataset,
-            batch_size=dataloaders[2].batch_size,
+            batch_size=args.eval_batch_size,
             shuffle=False,
             num_workers=dataloaders[2]._num_workers,
             pin_memory=True,
@@ -595,3 +697,36 @@ if __name__ == "__main__":
             logger=logger,
         )
         logging.info("AUCs:\n%s", pformat(auc_df, sort_dicts=False))
+
+        diseases_domain = "diseases"
+        if diseases_domain in model.config.domains:
+            metadata_path = Path(model.config.domains[diseases_domain].path) / "token_metadata.tsv"
+            if metadata_path.exists():
+                metadata = pd.read_csv(metadata_path, sep="\t")
+                _d = auc_df[auc_df["domain"] == diseases_domain].copy()
+                _d["_w"] = _d["n_case"] + _d["n_ctrl"]
+                # age bins 40-70 only
+                _d4070 = _d[(_d["age_start"] >= 40) & (_d["age_end"] <= 70)]
+                # per (token_id, age_bin): weighted mean across sexes
+                _by_age = (
+                    _d4070.groupby(["token_id", "age_start"])
+                    .apply(lambda g: (g["auc_delong"] * g["_w"]).sum() / g["_w"].sum(), include_groups=False)
+                    .rename("auc")
+                    .reset_index()
+                )
+                pivoted = _by_age.pivot(index="token_id", columns="age_start", values="auc")
+                pivoted.columns = [f"{int(c)}-{int(c)+5}" for c in pivoted.columns]
+                # overall weighted mean (40-70, both sexes)
+                pivoted["mean_auc"] = (
+                    _d4070.groupby("token_id")
+                    .apply(lambda g: (g["auc_delong"] * g["_w"]).sum() / g["_w"].sum(), include_groups=False)
+                )
+                age_cols = [c for c in pivoted.columns if c != "mean_auc"]
+                top50 = (
+                    metadata
+                    .merge(pivoted.reset_index(), on="token_id", how="inner")
+                    .sort_values("n_subjects", ascending=False)
+                    .head(50)
+                    [["name", "n_subjects", "mean_auc"] + age_cols]
+                )
+                logging.info("Top 50 diseases by case count:\n%s", top50.to_string(index=False))

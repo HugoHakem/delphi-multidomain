@@ -12,7 +12,7 @@ __all__ = [
     # run_loader
     "reconstruct_from_run", "reconstruct_model", "config_from_runid", "AUTO_BLOCK_SIZE",
     # utils
-    "load_domain_config", "read_ids",
+    "load_domain_config", "apply_domain_overrides", "read_ids",
 ]
 
 from utils.mlflow_utils import (
@@ -36,5 +36,6 @@ from utils.run_loader import (
 
 from utils.utils import (
     load_domain_config,
+    apply_domain_overrides,
     read_ids,
 )

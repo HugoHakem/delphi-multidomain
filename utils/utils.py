@@ -1,4 +1,5 @@
 import sys
+from dataclasses import fields as dc_fields
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +9,20 @@ DELPHI_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DELPHI_DIR))
 
 from delphi.model import DomainConfig
+
+_DOMAIN_CONFIG_FIELDS = {f.name for f in dc_fields(DomainConfig)}
+
+
+def _normalize_domain_cfg(cfg: dict) -> dict:
+    """Apply consistency rules to a domain config dict in-place.
+
+    Current rules:
+    - dropout_rate == 0 → dropout_mode = None
+    """
+    for dc in cfg.values():
+        if dc.dropout_rate == 0:
+            dc.dropout_mode = None
+    return cfg
 
 
 def load_domain_config(cfg_path, tokens_path):
@@ -21,7 +36,41 @@ def load_domain_config(cfg_path, tokens_path):
             p["path"] = tokens_path / p["path"]
         cfg[domain] = DomainConfig(**p)
     cfg["padding"] = DomainConfig(projector="embed")
-    return cfg
+    return _normalize_domain_cfg(cfg)
+
+
+def apply_domain_overrides(domain_cfg: dict, overrides: list[str]) -> dict:
+    """Apply dot-notation overrides to a loaded domain config dict.
+
+    Each override must be a string of the form ``domain.field=value``.
+    Values are parsed with ``yaml.safe_load`` so Python types are inferred
+    correctly: ``True``/``False`` → bool, integers → int, floats → float,
+    ``null`` → None, plain strings stay as str.
+
+    Raises ``ValueError`` for unknown domains or unknown DomainConfig fields.
+    """
+    for override in overrides:
+        if "=" not in override or "." not in override.split("=", 1)[0]:
+            raise ValueError(
+                f"Invalid override {override!r}: expected 'domain.field=value'"
+            )
+        lhs, value_str = override.split("=", 1)
+        domain, field = lhs.split(".", 1)
+
+        if domain not in domain_cfg:
+            raise ValueError(
+                f"Domain {domain!r} not in config. Available: {sorted(domain_cfg)}"
+            )
+        if field not in _DOMAIN_CONFIG_FIELDS:
+            raise ValueError(
+                f"Field {field!r} is not a valid DomainConfig field. "
+                f"Valid fields: {sorted(_DOMAIN_CONFIG_FIELDS)}"
+            )
+
+        value = yaml.safe_load(value_str)
+        setattr(domain_cfg[domain], field, value)
+
+    return _normalize_domain_cfg(domain_cfg)
 
 
 def read_ids(path, type=int):

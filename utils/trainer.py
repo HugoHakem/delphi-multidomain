@@ -124,6 +124,7 @@ class EarlyStopping:
 
 class NullLogger:
     def log_params(self, params):      pass
+    def log_tags(self, tags):          pass
     def log_metrics(self, metrics, step=None): pass
     def log_artifact(self, path, artifact_path=None): pass
     def log_model(self, model, artifact_path="model"): pass
@@ -161,6 +162,9 @@ class MLFlowLogger:
 
     def log_params(self, params):
         mlflow.log_params(params)
+
+    def log_tags(self, tags):
+        mlflow.set_tags(tags)
 
     def log_metrics(self, metrics, step=None):
         mlflow.log_metrics(metrics, step=step)
@@ -203,11 +207,28 @@ class MLFlowLogger:
             git_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=cwd
             ).decode().strip()
-            git_dirty = bool(subprocess.check_output(
+            porcelain = subprocess.check_output(
                 ["git", "status", "--porcelain"], cwd=cwd
-            ).decode().strip())
+            ).decode().strip()
+            # "??" prefix = untracked file; skip those, only show tracked changes
+            dirty_files = "\n".join(l for l in porcelain.splitlines() if not l.startswith("??"))
+            git_dirty = bool(dirty_files)
         except Exception:
-            git_commit, git_dirty = "unknown", False
+            git_commit, git_dirty, dirty_files = "unknown", False, ""
+
+        if git_dirty:
+            import logging
+            logging.warning("Git worktree is dirty — results may not be reproducible.\n%s", dirty_files)
+            try:
+                diff = subprocess.check_output(
+                    ["git", "diff", "HEAD"], cwd=cwd
+                ).decode(errors="replace")
+                tmp_dir = tempfile.mkdtemp()
+                diff_path = Path(tmp_dir) / "git_diff.patch"
+                diff_path.write_text(diff)
+                mlflow.log_artifact(str(diff_path))
+            except Exception:
+                pass
 
         mlflow.set_tags({
             "git_commit":   git_commit,
@@ -265,6 +286,7 @@ class Trainer(BaseTrainer):
           use_tqdm=True, use_amp=True, use_rich=True,
           checkpoint_every=None, optim_config=None,
           batch_size_scheduler=None,
+          baseline_incidence_path=None,
         ):
 
         self.model           = model
@@ -330,6 +352,26 @@ class Trainer(BaseTrainer):
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.allow_tf32 = True
 
+        # Relative CCE baseline
+        self.baseline_cce_calc = None
+        self._baseline_records_buffer = []
+        if baseline_incidence_path is not None:
+            self._setup_baseline_cce(model, baseline_incidence_path)
+
+    def _setup_baseline_cce(self, model, incidence_path: str):
+        from delphi.model import Delphi
+        from utils.baseline_cce import BaselineCCECalculator
+        if "diseases" not in model.domain_to_int or "sex" not in model.domain_to_int:
+            print("[Trainer] Skipping baseline CCE: requires 'diseases' and 'sex' domains.")
+            return
+        disease_int = model.domain_to_int["diseases"]
+        disease_vocab_size = Delphi._resolve_vocab_size(model.config.domains["diseases"])
+        self._disease_domain_int = disease_int
+        self._disease_domain_offset = model.domain_offsets[disease_int]
+        self._sex_domain_int = model.domain_to_int["sex"]
+        self._sex_domain_offset = model.domain_offsets[self._sex_domain_int]
+        self.baseline_cce_calc = BaselineCCECalculator(incidence_path, disease_vocab_size)
+
     # ——————————————————————————————————————————————————————————————————————
 
     @property
@@ -370,10 +412,12 @@ class Trainer(BaseTrainer):
             t.add_column("Val CE",    justify="right",  width=9)
             t.add_column("Val dt",    justify="right",  width=10)
             t.add_column("Val tot",   justify="right",  width=10)
+            if self.baseline_cce_calc is not None:
+                t.add_column("Val relCCE", justify="right", width=11)
             t.add_column("LR",        justify="right",  width=9)
             t.add_column("Time",      justify="right",  width=8)
             t.add_column("Improved?", justify="center", width=10)
-            for row in epoch_rows:
+            for row in reversed(epoch_rows):
                 t.add_row(*row)
             return t
 
@@ -397,10 +441,8 @@ class Trainer(BaseTrainer):
         eval_every = None if self.n_validations_per_epoch <= 1 else \
                      max(1, n_batches_epoch // self.n_validations_per_epoch)
 
-        import socket
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
-        self.logger.log_params({"hostname": socket.gethostname()})
 
         if self.batch_size_scheduler is not None:
             import logging as _logging
@@ -491,7 +533,7 @@ class Trainer(BaseTrainer):
 
                 # Add row to epoch table
                 lr = self.optimizer.param_groups[0]['lr']
-                epoch_rows.append((
+                row = [
                     str(epoch),
                     f"{train_loss['train_ce_loss'].item():.4f}",
                     f"{train_loss['train_time_loss'].item():.4f}",
@@ -499,10 +541,12 @@ class Trainer(BaseTrainer):
                     f"{self.val_loss['val_ce_loss'].item():.4f}",
                     f"{self.val_loss['val_time_loss'].item():.4f}",
                     f"{self.val_loss['val_total'].item():.4f}",
-                    f"{lr:.2e}",
-                    epoch_time_str,
-                    "[yellow]★[/]" if improved else "",
-                ))
+                ]
+                if self.baseline_cce_calc is not None:
+                    rcc = self.val_loss.get("val_relative_cce")
+                    row.append(f"{rcc.item():.4f}" if rcc is not None and not rcc.isnan() else "-")
+                row += [f"{lr:.2e}", epoch_time_str, "[yellow]★[/]" if improved else ""]
+                epoch_rows.append(tuple(row))
                 refresh_display()
 
                 if should_stop and epoch >= min_epochs:
@@ -555,6 +599,8 @@ class Trainer(BaseTrainer):
 
             f_logits     = logits_cat[predict_mask]              # [N_pred, V_total]
             f_global_ids = target_global_ids[predict_mask]       # [N_pred]
+            f_domain_ids = target_domain_ids[predict_mask]       # [N_pred]
+            f_ages       = target_ages[predict_mask]             # [N_pred]
 
             # ── Cross-entropy loss ────────────────────────────────────────
             loss_ce = model.cross_entropy_loss(f_logits, f_global_ids)
@@ -577,11 +623,63 @@ class Trainer(BaseTrainer):
                 f_logits.float(), f_global_ids, agg="per_disease"
             )  # pd.Series indexed by token_id
 
+        if self.baseline_cce_calc is not None and stage == "validation":
+            self._accumulate_baseline_records(
+                model, batch, f_logits, f_global_ids, f_domain_ids, f_ages
+            )
+
         if return_att and return_logits: return loss, logits_cat, att
         elif return_logits:              return loss, logits_cat
         elif return_att:                 return loss, att
         else:                            return loss
 
+
+    def _accumulate_baseline_records(self, model, batch, f_logits, f_global_ids, f_domain_ids, f_ages):
+        """Collect per-token (model NLL, baseline NLL, sex, age_bin) for disease predictions."""
+        import numpy as np
+
+        disease_mask = (f_domain_ids == self._disease_domain_int)
+        if not disease_mask.any():
+            return
+
+        f_d_global  = f_global_ids[disease_mask]
+        f_d_local   = f_d_global - self._disease_domain_offset
+        f_d_ages    = f_ages[disease_mask]
+
+        # Extract sex per subject from the batch, then broadcast to disease positions
+        B = batch.global_token_ids.size(0)
+        sex_token_mask = (batch.domain_ids == self._sex_domain_int)         # [B, T]
+        sex_global = (batch.global_token_ids * sex_token_mask.long()).sum(1) # [B]
+        sex_local  = (sex_global - self._sex_domain_offset).clamp(0, 1)     # [B]
+
+        # Recover the batch-row index for each disease prediction.
+        # Replicate the predict_mask logic from shared_step to find which [B, T-1] positions
+        # are both (a) in a predicted domain and (b) a disease token.
+        target_domain_ids_full = batch.domain_ids[:, 1:]
+        predicted_ints = self._predicted_domain_ints.to(batch.domain_ids.device)
+        predict_mask_full = torch.isin(target_domain_ids_full, predicted_ints)
+        if batch.eval_mask is not None:
+            predict_mask_full = predict_mask_full & ~batch.eval_mask[:, 1:]
+        disease_in_pred = (target_domain_ids_full == self._disease_domain_int) & predict_mask_full
+        subj_indices = disease_in_pred.nonzero(as_tuple=False)[:, 0]       # [N_disease]
+
+        f_d_sex = sex_local[subj_indices]
+
+        _, baseline_nll, age_bins = self.baseline_cce_calc.compute(
+            f_d_local, f_d_ages, f_d_sex
+        )
+        model_log_p = model.cross_entropy_loss(
+            f_logits[disease_mask].float(), f_d_global, agg="per_token"
+        )
+        model_nll = -model_log_p  # positive NLL
+
+        self._baseline_records_buffer.append({
+            "token_id":    f_d_local.cpu().numpy().astype(np.int32),
+            "sex":         f_d_sex.cpu().numpy().astype(np.int8),
+            "age_bin":     age_bins.cpu().numpy().astype(np.int8),
+            "model_nll":   model_nll.detach().cpu().float().numpy(),
+            "baseline_nll": baseline_nll.cpu().float().numpy(),
+        })
 
     def valid_epoch_end(self, loss_outputs):
         self._validation_counter += 1
@@ -601,6 +699,29 @@ class Trainer(BaseTrainer):
                 .sort_values("log_p_total")
                 .reset_index()
             )
+
+        if self._baseline_records_buffer:
+            import numpy as np
+            from utils.baseline_cce import AGE_BIN_LABELS, SEX_LABELS
+            keys = self._baseline_records_buffer[0].keys()
+            all_data = {k: np.concatenate([r[k] for r in self._baseline_records_buffer]) for k in keys}
+            self._baseline_records_buffer.clear()
+
+            df = pd.DataFrame(all_data)
+
+            # Scalar metric: ratio of epoch-level means (ratio of sums = ratio of means)
+            self._val_relative_cce = float(df["model_nll"].mean() / df["baseline_nll"].mean())
+
+            # Per-(disease, sex, age_bin) artifact
+            agg = (
+                df.groupby(["token_id", "sex", "age_bin"])
+                .agg(model_cce=("model_nll", "mean"), baseline_cce=("baseline_nll", "mean"))
+                .reset_index()
+            )
+            agg["relative_cce"] = agg["model_cce"] / agg["baseline_cce"]
+            agg["sex_label"]     = agg["sex"].map(dict(enumerate(SEX_LABELS)))
+            agg["age_bin_label"] = agg["age_bin"].map(dict(enumerate(AGE_BIN_LABELS)))
+            self._val_relative_cce_df = agg
 
         return 1
 
@@ -762,7 +883,21 @@ class Trainer(BaseTrainer):
                 artifact_path="val_loss_per_disease"
             )
 
+        if hasattr(self, "_val_relative_cce_df"):
+            relative_cce_file = self.LOSSES_PER_EPOCH_FILEPATTERN.format(
+                current_epoch=self.current_epoch, val_step=self.val_step
+            )
+            self.logger.log_df_as_artifact(
+                df=self._val_relative_cce_df,
+                filename=relative_cce_file,
+                artifact_path="val_relative_cce",
+            )
+
         mean_val = self.compute_mean(loss_outputs)
+
+        if hasattr(self, "_val_relative_cce"):
+            mean_val["val_relative_cce"] = torch.tensor(self._val_relative_cce)
+            del self._val_relative_cce
 
         self.model.train()
 
