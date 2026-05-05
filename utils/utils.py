@@ -43,7 +43,7 @@ def load_domain_config(cfg_path, tokens_path):
             )
         parent_params = {
             k: v for k, v in raw_configs[parent_name].items()
-            if k not in ("parent", "subdomain", "subdomain_column", "predict", "group")
+            if k not in ("parent", "subdomain", "subdomain_column", "predict", "group", "abstract")
         }
         raw_configs[domain] = {**parent_params, **params}
 
