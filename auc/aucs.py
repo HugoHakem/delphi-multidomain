@@ -213,6 +213,8 @@ def evaluate_aucs(
     -------
     auc_df : pd.DataFrame
     """
+    import logging
+
     device = model.device
     block_size = block_size or model.block_size
 

@@ -80,7 +80,7 @@ def main():
     )
     parser.add_argument(
         "--output_path",
-        default="data/transforms/tokens/hla_alleles/token_metadata.tsv",
+        default="data/transforms/tokens/hla_alleles/token_metadata.csv",
     )
     args = parser.parse_args()
 
@@ -112,7 +112,7 @@ def main():
 
     # Save
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_path, index=False, sep="\t")
+    df.to_csv(output_path, index=False)
     print(f"\nSaved to {output_path}")
     print(df.head(20).to_string())
 

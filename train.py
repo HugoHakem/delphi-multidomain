@@ -285,10 +285,19 @@ def get_cli_args():
                         help="Resume training from the latest checkpoint of this MLflow run")
 
     parser.add_argument("--interactive", "-i", dest="interactive", action="store_true", default=False,
-                        help="Run in interactive mode (prompts user for input at key points)")
+                        help=(
+                            "Enable interactive mode. When combined with --resume_from_previous, "
+                            "presents a numbered menu to select the source experiment and run "
+                            "instead of requiring --resume_run_id explicitly. Also lets you choose "
+                            "a different target experiment for the resumed run."
+                        ))
     parser.add_argument("--resume_from_previous", "--resume-from-previous", "-r", dest="resume_from_previous",
                         action="store_true", default=False,
-                        help="Resume from a previous run. With --interactive (-i), prompts to select experiment and run.")
+                        help=(
+                            "Resume training from the latest checkpoint of a previous run. "
+                            "Requires either --resume_run_id <RUN_ID> or --interactive (-i) "
+                            "to select the run interactively."
+                        ))
 
     parser.add_argument("--dryrun", "--dry-run", "--dry_run", "--dry", dest="dry_run", action="store_true", default=False)
 
@@ -489,7 +498,7 @@ if __name__ == "__main__":
         if args.domain_config_overrides:
             apply_domain_overrides(domain_cfg, args.domain_config_overrides)
 
-        assert all([k in default_cfg_per_domain for k in domains])
+        assert all([k in default_cfg_per_domain for k in domains]), f"{[k for k in domains if k not in default_cfg_per_domain]}"
         assert len(args.attention_scheme) in {1, args.n_layer}, \
             f"len of --attention_scheme should be 1 or n_layer (={args.n_layer})"
 

@@ -225,15 +225,23 @@ python train.py --dry \
   --experiment_name my_experiment
 ```
 
-### Resuming a run (`--resume_run_id`)
+### Resuming a run (`--resume_run_id` / `--interactive`)
 
 Training can be resumed from the latest checkpoint of a previous MLflow run:
 
 ```bash
-python train.py --resume_run_id <RUN_ID>
+python train.py --resume_from_previous --resume_run_id <RUN_ID>
 ```
 
 The model architecture, domain config, attention scheme and optimizer state are restored from the checkpoint. If `--lr` is also passed, the learning rate is overridden and the scheduler is reset from that value.
+
+Instead of providing the run ID explicitly, you can use `--interactive` (`-i`) to select it from a menu:
+
+```bash
+python train.py --resume_from_previous --interactive
+```
+
+This presents a numbered list of experiments and (up to 20) recent runs to choose from, and also lets you redirect the resumed run into a different target experiment.
 
 ### Mixed precision (`--use_amp`)
 

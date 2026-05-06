@@ -2,6 +2,7 @@ diseases:
   projector: embed
   path: diseases
   predict: true
+  no_repeat: true
 
 sex:
   projector: embed
