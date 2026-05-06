@@ -105,6 +105,47 @@ For each domain, create a folder under `data/transforms/tokens/<domain_name>/` w
 - `tokens.csv`: columns `subject_id`, `age` (in days), `token_id` — one row per token event, all subjects together.
 - `tokenizer.yaml`: list of token names in order; position determines `token_id` (zero-based).
 
+#### Pretrained token embeddings (`projector: pretrained`)
+
+When external token embeddings are available (e.g. ESM2 protein embeddings for HLA alleles), the domain can be configured to use them instead of learning embeddings from scratch:
+
+```yaml
+hla_a:
+  projector: pretrained
+  pretrained_path: /path/to/hla_a_embeddings.pt
+  freeze: false          # true = keep pretrained weights fixed; false = fine-tune
+  path: hla_alleles      # still needed for tokenizer.yaml and tokens.csv
+  at_birth: true
+  subdomain: hla_a
+  subdomain_column: locus
+```
+
+**How it works:** the `.pt` file must be a `torch.Tensor` of shape `[vocab_size, d_ext]`, where `vocab_size` matches the number of entries in `tokenizer.yaml` and `d_ext` is the external embedding dimension. At runtime a learned linear layer projects each `d_ext`-dimensional vector to `n_embd`, so the external dimension does not need to match the model's embedding size.
+
+The domain still uses the shared `tokenizer.yaml` and `tokens.csv` under `path`. The pretrained weights replace the random initialization of the embedding table; the linear projection on top is always trained from scratch.
+
+**`freeze: true`** locks the pretrained embedding weights and only trains the projection layer. **`freeze: false`** (default) fine-tunes both. Fine-tuning is usually beneficial when the model is large enough and the downstream task differs from the pretraining objective.
+
+**Combining with subdomain hierarchy:** a common pattern is to define an abstract parent with the shared `path` / `at_birth` / `subdomain_column` settings, then override `projector` and `pretrained_path` in each child:
+
+```yaml
+hla_alleles:
+  abstract: true
+  projector: embed          # default for children that don't override it
+  path: hla_alleles
+  at_birth: true
+  subdomain_column: locus
+
+hla_a:
+  parent: hla_alleles       # inherits path, at_birth, subdomain_column
+  subdomain: hla_a
+  projector: pretrained     # overrides the parent's projector
+  pretrained_path: /path/to/hla_a_esm2.pt
+  freeze: false
+```
+
+Children that do not override `projector` fall back to the parent's value (`embed` in the example above), so you can mix pretrained and learned embeddings across loci in the same config.
+
 ### Specifying the attention scheme
 
 The attention scheme within and across domains is specified via `--attention_scheme`. You can either pass a scheme string directly or use a named alias defined in `config/attention_schemes.yaml`:
