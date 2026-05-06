@@ -24,7 +24,7 @@ It focuses on:
     - [Exemplar command](#exemplar-command)
     - [Batch size schedule (`--batch_size_schedule`)](#batch-size-schedule---batch_size_schedule)
     - [Dry run (`--dryrun` / `--dry`)](#dry-run---dryrun----dry)
-    - [Resuming a run (`--resume_run_id`)](#resuming-a-run---resume_run_id)
+    - [Resuming a run (`--resume_run_id` / `--interactive`)](#resuming-a-run---resume_run_id----interactive)
     - [Mixed precision (`--use_amp`)](#mixed-precision---use_amp)
     - [AUC computation (`--compute_aucs` / `--auc`)](#auc-computation---compute_aucs----auc)
     - [Model tracking with MLflow](#model-tracking-with-mlflow)
@@ -335,11 +335,71 @@ This section will contain details on how to perform SHAP calculation using Nextf
 
 ## Submitting a hyperparameter search as Slurm job array
 
-_To be completed_
+The workflow is based on `sarray_params`, a shell function that turns a TSV/CSV parameter table into a Slurm job array. Each row in the table becomes one job; each column header becomes a `--<column>` CLI argument passed to the target script.
 
-This section will provide tips to explore different combinations of hyperparameters by using Slurm's job array feature.
-It requires generating a tabular file, where columns are command-line arguments of the `train.py` script, and the cells contain their values. Each row is a different run.
-Then a Slurm scripts reads this file line by line, building the command based on the configuration given by the row, and submitting it to a different GPU node.
+### Setup
+
+`sarray_params` is defined in `~/repos/codon_helpers/slurm_functions.sh`. Source that file before using it (the line is already present in `~/.bashrc`):
+
+```bash
+source $HOME/repos/codon_helpers/slurm_functions.sh
+```
+
+### Preparing the parameter table
+
+Each column name must match a CLI argument of `train.py` (without the `--` prefix). Each row is one training run. Boolean flags work as follows: `True`/`true` adds the flag, `False`/`false` skips it.
+
+**Option A — Experiment Builder app (recommended)**
+
+```bash
+streamlit run apps/experiment_builder.py
+```
+
+The app lets you define a grid of hyperparameters visually, preview the expanded parameter table, edit individual cells, and download or save the TSV directly on the server. It also shows the submission command ready to copy.
+
+**Option B — Google Sheets**
+
+Build the table in Google Sheets (one header row, one run per subsequent row), then export via *File → Download → Tab-separated values (.tsv)*. Move the file into `train_scripts/params/`.
+
+### Submitting
+
+```bash
+sarray_params train.py train_scripts/params/my_experiment.tsv \
+    --gpus=1 --gpu-type=a100 \
+    --mem=64G --cpus=8 \
+    --time=09:00:00 \
+    --max-parallel=8
+```
+
+Arguments are split into two groups:
+
+- **TSV columns** — per-job arguments (vary across rows).
+- **Extra args after the TSV path** — fixed arguments appended to every job (e.g. `--mem`, `--time`, or any `train.py` flag you want constant across the grid).
+
+Key options:
+
+| Option | Description |
+|--------|-------------|
+| `--gpus=N` | Number of GPUs per job |
+| `--gpu-type=TYPE` | GPU model (e.g. `a100`, `l40s`, `h200`) |
+| `--mem=XXG` | Memory per job (default: `64G`) |
+| `--cpus=N` | CPU cores per job (default: `8`) |
+| `--time=HH:MM:SS` | Wall time per job (default: `09:00:00`) |
+| `--max-parallel=N` | Cap concurrent running jobs |
+| `--lines=SPEC` | Run only selected rows (1-based; e.g. `3`, `1-5`, `1-3,7,10-12`) |
+| `--sep=SEP` | Column separator (auto-detected: `.csv` → `,`, otherwise tab) |
+| `--dry-run` | Print the commands that would be submitted, without submitting |
+
+### Dry run
+
+Always preview before submitting:
+
+```bash
+sarray_params train.py train_scripts/params/my_experiment.tsv \
+    --gpus=1 --gpu-type=a100 --mem=64G --time=09:00:00 --dry-run
+```
+
+This prints the exact `python train.py ...` command for each row without calling `sbatch`.
 
 ## Tips for querying MLflow runs
 
