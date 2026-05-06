@@ -602,8 +602,19 @@ class Trainer(BaseTrainer):
             f_domain_ids = target_domain_ids[predict_mask]       # [N_pred]
             f_ages       = target_ages[predict_mask]             # [N_pred]
 
+            # Remap global IDs → indices within logits_cat.
+            # logits_cat = concat([logits_dict[dname] for dname in predicted_domains]),
+            # so each domain's slice starts at cumulative vocab offset, not global offset.
+            f_targets = f_global_ids.clone()
+            cum = 0
+            for dname in model.predicted_domains:
+                d_int = model.domain_to_int[dname]
+                mask = f_domain_ids == d_int
+                f_targets[mask] = f_global_ids[mask] - model.domain_offsets[d_int] + cum
+                cum += logits_dict[dname].shape[-1]
+
             # ── Cross-entropy loss ────────────────────────────────────────
-            loss_ce = model.cross_entropy_loss(f_logits, f_global_ids)
+            loss_ce = model.cross_entropy_loss(f_logits, f_targets)
 
             # ── Time-to-event loss ────────────────────────────────────────
             age_diff = (target_ages - input_ages)[predict_mask]
@@ -620,12 +631,12 @@ class Trainer(BaseTrainer):
 
         if self.log_loss_per_disease and stage == "validation":
             loss[f'{prefix}ce_loss_per_disease'] = model.cross_entropy_loss(
-                f_logits.float(), f_global_ids, agg="per_disease"
-            )  # pd.Series indexed by token_id
+                f_logits.float(), f_targets, agg="per_disease"
+            )  # pd.Series indexed by local token_id within logits_cat
 
         if self.baseline_cce_calc is not None and stage == "validation":
             self._accumulate_baseline_records(
-                model, batch, f_logits, f_global_ids, f_domain_ids, f_ages
+                model, batch, f_logits, f_targets, f_domain_ids, f_ages
             )
 
         if return_att and return_logits: return loss, logits_cat, att
@@ -634,7 +645,7 @@ class Trainer(BaseTrainer):
         else:                            return loss
 
 
-    def _accumulate_baseline_records(self, model, batch, f_logits, f_global_ids, f_domain_ids, f_ages):
+    def _accumulate_baseline_records(self, model, batch, f_logits, f_targets, f_domain_ids, f_ages):
         """Collect per-token (model NLL, baseline NLL, sex, age_bin) for disease predictions."""
         import numpy as np
 
@@ -642,8 +653,7 @@ class Trainer(BaseTrainer):
         if not disease_mask.any():
             return
 
-        f_d_global  = f_global_ids[disease_mask]
-        f_d_local   = f_d_global - self._disease_domain_offset
+        f_d_local = f_targets[disease_mask]  # already local (logits_cat) IDs
         f_d_ages    = f_ages[disease_mask]
 
         # Extract sex per subject from the batch, then broadcast to disease positions
@@ -669,7 +679,7 @@ class Trainer(BaseTrainer):
             f_d_local, f_d_ages, f_d_sex
         )
         model_log_p = model.cross_entropy_loss(
-            f_logits[disease_mask].float(), f_d_global, agg="per_token"
+            f_logits[disease_mask].float(), f_d_local, agg="per_token"
         )
         model_nll = -model_log_p  # positive NLL
 

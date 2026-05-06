@@ -193,13 +193,15 @@ def reconstruct_model(run_id: str):
         infer_delphi_config_from_state_dict,
         migrate_legacy_state_dict,
         migrate_domain_embed_to_global_embed,
+        strip_compiled_prefix,
     )
 
     params = load_run_params(run_id)
     attn_scheme = params["attention_scheme"]
 
     ckpt, ckpt_path = load_checkpoint(run_id)
-    weights = migrate_legacy_state_dict(ckpt["state_dict"])
+    weights = strip_compiled_prefix(ckpt["state_dict"])
+    weights = migrate_legacy_state_dict(weights)
     test_ids = ckpt["metadata"]["test_ids"]
 
     cfg = infer_delphi_config_from_state_dict(weights)
