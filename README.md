@@ -339,7 +339,7 @@ The workflow is based on `sarray_params`, a shell function that turns a TSV/CSV 
 
 ### Setup
 
-`sarray_params` is defined in `~/repos/codon_helpers/slurm_functions.sh`. Source that file before using it (the line is already present in `~/.bashrc`):
+`sarray_params` is a shell function defined in [`codon_helpers`](https://github.com/rbonazzola/codon_helpers). Clone the repo and source `slurm_functions.sh` before using it (the line is already present in `~/.bashrc`):
 
 ```bash
 source $HOME/repos/codon_helpers/slurm_functions.sh
