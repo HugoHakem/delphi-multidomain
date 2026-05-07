@@ -1,3 +1,4 @@
+import copy
 import time
 import pandas as pd
 from typing import List, Dict, Union
@@ -314,6 +315,7 @@ class Trainer(BaseTrainer):
 
         self.current_epoch = start_epoch
         self._validation_counter = 0
+        self._best_state_dict = None
         self.n_validations_per_epoch = n_validations_per_epoch
 
         self.logger = logger
@@ -511,6 +513,7 @@ class Trainer(BaseTrainer):
                 } | self.get_subject_ids_per_partition()
 
                 if improved:
+                    self._best_state_dict = copy.deepcopy(self.model.state_dict())
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     ckpt_filepath = f"epoch{epoch}__valloss_{val_loss_val:.4f}__{timestamp}.pt"
                     ckpt_uri = self.logger.save_model(
@@ -554,6 +557,10 @@ class Trainer(BaseTrainer):
                     break
 
                 self.epoch_end()
+
+        if self._best_state_dict is not None:
+            self.model.load_state_dict(self._best_state_dict)
+            _print("Restored best model weights into model.")
 
 
     def shared_step(self,
