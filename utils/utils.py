@@ -51,7 +51,6 @@ def load_domain_config(cfg_path, tokens_path):
     cfg = {}
     for domain, params in raw_configs.items():
         p = dict(params)
-        p.pop("parent", None)
         if p.pop("abstract", False):
             continue
         if "path" in p:

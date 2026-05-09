@@ -285,7 +285,7 @@ def compute_delta_for_run(
 ):
     """
     Returns (delta, ages, sexes) as 1-D tensors, one entry per disease event.
-    sex_filter=None means no sex filtering (equivalent to custom_hla_shap2.py behaviour).
+    sex_filter=None means no sex filtering
     """
     hla = tokens_df.query('domain == "hla_alleles"')[["subject_id", "token_id"]].drop_duplicates()
     all_subjects = pd.Index(hla["subject_id"].unique())

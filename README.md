@@ -311,6 +311,15 @@ python train.py --run_name_prefix fold1 --run_name_suffix _baseline
 
 Both flags are optional and can be used independently. The final run name is their concatenation.
 
+`--run_name` (alias for `--run_name_prefix`) supports `{arg}` placeholders that are replaced at runtime with the value of the corresponding CLI argument:
+
+```bash
+python train.py --run_name "fold{test_fold}__bs{batch_size}" --test_fold 3 --batch_size 64
+# results in run name: "fold3__bs64"
+```
+
+This is especially useful when submitting job arrays with `sarray_params`, where each job has different parameter values.
+
 #### Logging extra params and tags
 
 Arbitrary key-value pairs can be attached to any run:

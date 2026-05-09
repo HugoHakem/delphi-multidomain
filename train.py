@@ -207,7 +207,7 @@ def get_cli_args():
     parser.add_argument("--n_layer", "--n-layer",       dest="n_layer", default=12,  type=int)
     parser.add_argument("--n_head",  "--n-head",        dest="n_head",  default=6,   type=int)
     parser.add_argument("--n_embd",  "--n-embd",        dest="n_embd",  default=120, type=int)
-    parser.add_argument("--block_size", "--block-size", dest="block_size", default="auto",
+    parser.add_argument("--block_size", "--block-size", "--blocksize", dest="block_size", default="auto",
                         type=lambda v: v if v == "auto" else int(v),
                         help="Max tokens per subject in the cache. 'auto' (default) uses a "
                              "generous upper bound; the effective per-batch length is always "
@@ -291,7 +291,11 @@ def get_cli_args():
                             "instead of requiring --resume_run_id explicitly. Also lets you choose "
                             "a different target experiment for the resumed run."
                         ))
-    parser.add_argument("--resume_from_previous", "--resume-from-previous", "-r", dest="resume_from_previous",
+    parser.add_argument("--resume_from_previous", "--resume-from-previous",
+                        "--resume_from_run", "--resume-from-run",
+                        "--resume_from_runid", "--resume-from-runid",
+                        "--resume_from_run_id", "--resume-from-run-id",
+                        "-r", dest="resume_from_previous",
                         action="store_true", default=False,
                         help=(
                             "Resume training from the latest checkpoint of a previous run. "
@@ -310,7 +314,14 @@ def get_cli_args():
         parser.error("--experiment_name / -x is required unless --resume_run_id or --resume_from_previous is set.")
 
     prefix = args.run_name_prefix or ""
-    args.run_name = (prefix + args.run_name_suffix) or None
+    raw_run_name = (prefix + args.run_name_suffix) or None
+    if raw_run_name:
+        try:
+            args.run_name = raw_run_name.format_map(vars(args))
+        except (KeyError, ValueError):
+            args.run_name = raw_run_name
+    else:
+        args.run_name = None
 
     if args.extra_params:
         args.extra_params = _parse_kv_list(args.extra_params, "--param")

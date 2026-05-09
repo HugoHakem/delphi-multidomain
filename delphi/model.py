@@ -189,10 +189,11 @@ class DelphiConfig:
 
 class AttentionMaskBuilder(nn.Module):
 
-    def __init__(self, scheme_str: str, domain2id: dict):
+    def __init__(self, scheme_str: str, domain2id: dict, group_to_ints: Dict[str, List[int]] = None):
         super().__init__()
         self.scheme = AttentionMaskBuilder._parse_scheme(scheme_str)
         self.domain2id = domain2id
+        self.group_to_ints = group_to_ints or {}
 
     @staticmethod
     def _split_top_level(s: str, sep: str = ","):
@@ -249,7 +250,13 @@ class AttentionMaskBuilder(nn.Module):
             if dom_names == ("all",):
                 dom_ids = all_domain_ids
             else:
-                dom_ids = torch.tensor([self.domain2id[d] for d in dom_names], **dd)
+                ids = []
+                for d in dom_names:
+                    if d in self.group_to_ints:
+                        ids.extend(self.group_to_ints[d])
+                    else:
+                        ids.append(self.domain2id[d])
+                dom_ids = torch.tensor(ids, **dd)
             dom_mask = torch.isin(domains, dom_ids)
             pair_mask = dom_mask.unsqueeze(2) & dom_mask.unsqueeze(1)
 
@@ -454,9 +461,11 @@ class Delphi(nn.Module):
 
     @staticmethod
     def _resolve_vocab_size(cfg) -> int:
-        """Get vocab size, reading tokenizer.yaml if input_size is None."""
+        """Get vocab size from input_size, pretrained .pt shape, or tokenizer.yaml."""
         if cfg.input_size is not None:
             return cfg.input_size
+        if cfg.projector == "pretrained" and cfg.pretrained_path is not None:
+            return torch.load(cfg.pretrained_path, weights_only=True).shape[0]
         tokenizer_path = Path(cfg.path) / "tokenizer.yaml"
         with open(tokenizer_path, "r") as f:
             return len(yaml.safe_load(f))
@@ -512,12 +521,18 @@ class Delphi(nn.Module):
             domain_to_int=self.domain_to_int,
         )
 
+        group_to_ints: Dict[str, List[int]] = {}
+        for dname, dcfg in config.domains.items():
+            alias = dcfg.group or dcfg.parent
+            if alias:
+                group_to_ints.setdefault(alias, []).append(self.domain_to_int[dname])
+
         self.transformer = nn.ModuleDict(dict(
             age_embedding=AgeEncoding(n_embd=config.n_embd),
             drop=nn.Dropout(config.dropout),
             attn_mask_builder=nn.ModuleList([
                 nn.ModuleList([
-                    AttentionMaskBuilder(self._attention_schemes[i], self.domain_to_int)
+                    AttentionMaskBuilder(self._attention_schemes[i], self.domain_to_int, group_to_ints)
                     for i in range(config.n_layer)
                 ]) for j in range(config.n_head)
             ]),
