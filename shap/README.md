@@ -24,7 +24,7 @@ All analyses are restricted to white-ancestry subjects by default
 ### Run one allele × disease
 
 ```bash
-python shap/custom_hla_shap_v2.py \
+python shap/custom_hla_shap.py \
     --experiment_id 263078128312970150 \
     --disease_id <int> \
     --hla_allele "HLA-C*06" \
@@ -168,7 +168,7 @@ streamlit run delphi-analysis/app_auc_comparison_HLA.py
 ### Run a single pair manually
 
 ```bash
-python shap/custom_hla_shap_v2.py \
+python shap/custom_hla_shap.py \
     --experiment_id 263078128312970150 \
     --disease_id <int> \
     --allele_id <int_a> \
@@ -183,7 +183,7 @@ Otherwise, cases must carry **both** alleles (compound-het / cross-locus haploty
 
 ---
 
-## Advanced options (`custom_hla_shap_v2.py`)
+## Advanced options (`custom_hla_shap.py`)
 
 | Option | Description |
 |--------|-------------|
