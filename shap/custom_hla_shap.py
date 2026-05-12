@@ -1228,10 +1228,12 @@ def main():
         if args.allele_id_b is not None
         else str(allele_ids[0])
     )
-    output_file = _resolve_output_path(
-        args.output,
-        DELPHI_DIR / "shap" / "output_delta_logit" /
-        f"{disease_id}__{_allele_stem}__{sex_label}.pkl",
+    output_file = Path(
+        str(_resolve_output_path(
+            args.output,
+            DELPHI_DIR / "shap" / "output_delta_logit" /
+            f"{disease_id}__{_allele_stem}__{sex_label}.pkl",
+        )).format(disease_id=disease_id, allele_id=_allele_stem, sex=sex_label)
     )
 
     fold_results = list(tqdm(
