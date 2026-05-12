@@ -102,10 +102,22 @@ one entry per disease-preceding position across all CV folds).
 ### Aggregate results
 
 ```bash
-python shap/compute_pvalues_table.py
+python shap/compute_pvalues_table.py \
+    --pkl_dir shap/output_delta_logit \
+    --output  shap/output_delta_logit/summary_single.csv \
+    [--min_n 10] [--sex both_sexes]
 ```
 
-Reads pkls from `shap/delta_logits_OnlyWhite/` and writes `pvalues_table.csv`.
+Reads all `{disease_id}__{allele_id}__{sex}.pkl` files and writes `summary_single.csv`
+(default: `<pkl_dir>/summary_single.csv`).
+
+Output columns: `disease_id`, `disease_name`, `allele_id`, `allele_name`, `sex`,
+`n_subjects`, `mean_delta`, `median_delta`, `wilcoxon_stat`, `p_value`, plus per-age-bracket
+columns `n_{bracket}`, `mean_delta_{bracket}`, `p_{bracket}` for brackets
+`0_20`, `10_30`, `20_40`, `30_50`, `40_60`, `50_70`, `60_80`.
+
+- `--min_n INT` — minimum cases required to compute Wilcoxon (applies globally and per bracket; default: 10)
+- `--sex STR` — restrict to pkl files with this sex label (e.g. `both_sexes`)
 
 ---
 

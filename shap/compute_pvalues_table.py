@@ -1,83 +1,179 @@
 """
-Compute Wilcoxon signed-rank p-values from delta-logit pkl files produced by
-custom_hla_shap.py, and compile results into a table as a function of n_counterfactuals.
+Aggregate delta-logit .pkl files produced by individual sarray_params jobs
+(one per allele) into a single summary TSV.
 
-Output: shap/delta_logits_OnlyWhite/pvalues_table.csv
+Each pkl is named:
+    {disease_id}__{allele_id}__{sex_label}.pkl
+
+Usage:
+    python shap/compute_pvalues_table.py \\
+        --pkl_dir shap/output_delta_logit \\
+        --output  shap/output_delta_logit/summary_single.tsv \\
+        [--min_n 10] [--sex both_sexes]
+
+Arguments:
+    --pkl_dir   Directory containing the .pkl files (searched recursively).
+    --output    Output CSV path (default: <pkl_dir>/summary_single.csv).
+    --min_n     Minimum number of delta values to compute Wilcoxon (default: 10).
+    --sex       If given, restrict to pkl files with this sex label (e.g. both_sexes).
 """
 
+import argparse
 import pickle
-from pathlib import Path
 import re
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import yaml
 from scipy import stats
+from tqdm import tqdm
 
 DELPHI_DIR = Path("/nfs/research/birney/users/bonazzola/repos/delphis/delphi-refactor")
-BASE_DIR = DELPHI_DIR / "shap/delta_logits_OnlyWhite"
 
-hla_tokenizer = yaml.safe_load(
-    open(DELPHI_DIR / "data/transforms/tokens/hla_alleles/tokenizer.yaml")
-)
-disease_tokenizer = list(yaml.safe_load(
-    open(DELPHI_DIR / "data/transforms/tokens/diseases/tokenizer.yaml")
-))
+AGE_BRACKETS = ["0-20", "10-30", "20-40", "30-50", "40-60", "50-70", "60-80"]
 
-rows = []
-pkl_files = list(BASE_DIR.glob("n_counterfactuals_*/*.pkl"))
-print(f"Found {len(pkl_files)} pkl files")
+# Filename pattern: {disease_id}__{allele_id}__{sex_label}.pkl
+_PKL_RE = re.compile(r"^(\d+)__(\d+)__(.+)\.pkl$")
 
-for pkl_path in pkl_files:
-    # Parse n_counterfactuals from parent dir name
-    m_ncf = re.match(r"n_counterfactuals_(\d+)", pkl_path.parent.name)
-    if not m_ncf:
-        continue
-    n_cf = int(m_ncf.group(1))
 
-    # Parse disease_id and allele_id from filename
-    m_ids = re.match(r"(\d+)_(\d+)\.pkl", pkl_path.name)
-    if not m_ids:
-        continue
-    disease_id = int(m_ids.group(1))
-    allele_id  = int(m_ids.group(2))
+def load_tokenizer(path: Path) -> list:
+    return list(yaml.safe_load(open(path)))
+
+
+def process_pkl(
+    pkl_path: Path,
+    disease_tok: list,
+    hla_tok: list,
+    min_n: int,
+) -> dict | None:
+    m = _PKL_RE.match(pkl_path.name)
+    if not m:
+        return None
+
+    disease_id = int(m.group(1))
+    allele_id  = int(m.group(2))
+    sex_label  = m.group(3)
 
     try:
         with open(pkl_path, "rb") as f:
             data = pickle.load(f)
     except Exception as e:
-        print(f"  SKIP (load error): {pkl_path} — {e}")
-        continue
+        print(f"  SKIP (load error): {pkl_path} — {e}", file=sys.stderr)
+        return None
 
-    delta = np.asarray(data["delta"]).ravel()
+    delta        = np.asarray(data["delta"]).ravel()
+    age_brackets = np.asarray(data.get("age_brackets", []), dtype=object).ravel()
+    n = len(delta)
 
-    if len(delta) < 10:
-        stat, p = np.nan, np.nan
+    if n < min_n:
+        stat = float("nan")
+        p    = float("nan")
     else:
         try:
-            stat, p = stats.wilcoxon(delta)
+            res  = stats.wilcoxon(delta)
+            stat = float(res.statistic)
+            p    = float(res.pvalue)
         except Exception:
-            stat, p = np.nan, np.nan
+            stat = float("nan")
+            p    = float("nan")
 
-    disease_name = disease_tokenizer[disease_id] if disease_id < len(disease_tokenizer) else str(disease_id)
-    allele_name  = hla_tokenizer[allele_id]       if allele_id  < len(hla_tokenizer)  else str(allele_id)
+    disease_name = (
+        disease_tok[disease_id] if disease_id < len(disease_tok) else str(disease_id)
+    )
+    allele_name = (
+        hla_tok[allele_id] if allele_id < len(hla_tok) else str(allele_id)
+    )
 
-    rows.append({
-        "disease_id":       disease_id,
-        "disease_name":     disease_name,
-        "allele_id":        allele_id,
-        "allele_name":      allele_name,
-        "n_counterfactuals": n_cf,
-        "n_subjects":       len(delta),
-        "mean_delta":       float(np.mean(delta)),
-        "median_delta":     float(np.median(delta)),
-        "wilcoxon_stat":    float(stat) if not np.isnan(stat) else np.nan,
-        "p_value":          float(p)    if not np.isnan(p)    else np.nan,
-    })
+    row = {
+        "disease_id":    disease_id,
+        "disease_name":  disease_name,
+        "allele_id":     allele_id,
+        "allele_name":   allele_name,
+        "sex":           sex_label,
+        "n_subjects":    n,
+        "mean_delta":    float(np.mean(delta))   if n > 0 else float("nan"),
+        "median_delta":  float(np.median(delta)) if n > 0 else float("nan"),
+        "wilcoxon_stat": stat,
+        "p_value":       p,
+    }
 
-df = pd.DataFrame(rows)
-df = df.sort_values(["disease_id", "allele_id", "n_counterfactuals"]).reset_index(drop=True)
+    for bracket in AGE_BRACKETS:
+        mask = np.array([b == bracket for b in age_brackets])
+        sub  = delta[mask]
+        col  = bracket.replace("-", "_")
+        if len(sub) < min_n:
+            bp = float("nan")
+        else:
+            try:
+                bp = float(stats.wilcoxon(sub).pvalue)
+            except Exception:
+                bp = float("nan")
+        row[f"n_{col}"]          = int(mask.sum())
+        row[f"mean_delta_{col}"] = float(np.mean(sub)) if len(sub) else float("nan")
+        row[f"p_{col}"]          = bp
 
-out_path = BASE_DIR / "pvalues_table.csv"
-df.to_csv(out_path, index=False)
-print(f"Saved {len(df)} rows to {out_path}")
-print(df.head(20).to_string(index=False))
+    return row
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--pkl_dir", type=Path, required=True,
+                        help="Directory containing {disease_id}__{allele_id}__{sex}.pkl files.")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output CSV path (default: <pkl_dir>/summary_single.csv).")
+    parser.add_argument("--min_n", type=int, default=10,
+                        help="Minimum delta count for Wilcoxon test (default: 10).")
+    parser.add_argument("--sex", type=str, default=None,
+                        help="Restrict to this sex label (e.g. both_sexes).")
+    args = parser.parse_args()
+
+    disease_tok = load_tokenizer(
+        DELPHI_DIR / "data/transforms/tokens/diseases/tokenizer.yaml"
+    )
+    hla_tok = load_tokenizer(
+        DELPHI_DIR / "data/transforms/tokens/hla_alleles/tokenizer.yaml"
+    )
+
+    pkl_files = sorted(args.pkl_dir.rglob("*.pkl"))
+    pkl_files = [p for p in pkl_files if _PKL_RE.match(p.name)]
+    if args.sex:
+        pkl_files = [p for p in pkl_files if f"__{args.sex}.pkl" in p.name]
+
+    print(f"Found {len(pkl_files)} pkl files matching single-allele pattern.")
+    if not pkl_files:
+        print("No files to process. Exiting.")
+        return
+
+    rows = []
+    for pkl_path in tqdm(pkl_files, desc="Processing pkl files"):
+        row = process_pkl(pkl_path, disease_tok, hla_tok, args.min_n)
+        if row is not None:
+            rows.append(row)
+
+    if not rows:
+        print("No valid rows produced.")
+        return
+
+    df = (
+        pd.DataFrame(rows)
+        .sort_values(
+            ["disease_id", "sex", "mean_delta"],
+            ascending=[True, True, False],
+        )
+        .reset_index(drop=True)
+    )
+
+    output = args.output or args.pkl_dir / "summary_single.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output, index=False)
+    print(f"Saved {len(df)} rows → {output}")
+    print(df.head(20).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
