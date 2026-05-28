@@ -84,6 +84,41 @@ python train.py --domain_config_yaml config/domain_config_default.yaml --domains
 
 The `padding` domain is injected automatically — do not add it to the YAML or `--domains`.
 
+#### Domain groups (`group`)
+
+Each domain can declare a `group` name used for compact display in logs and run summaries. When multiple domains share a group, they appear as a single token in reports instead of listing each domain individually.
+
+`config/domain_config_default.yaml` sets the following defaults:
+
+| Group | Domains |
+|-------|---------|
+| `core` | diseases, death, lifestyle, sex |
+| `drugs` | cv_drugs, ns_drugs |
+| `hla` | hla_alleles |
+| *(none)* | rare_variants, genetic_pcs — shown by their own name |
+
+You can override or add groups via `--dcfg` or in a child config that extends the default.
+
+#### Extending a config (`extends`)
+
+A domain config YAML can inherit from another file using `extends:`:
+
+```yaml
+# config/my_experiment.yaml
+extends: domain_config_default.yaml
+
+diseases:
+  predict: false        # override one field; all other fields are inherited
+
+hla_a:
+  parent: hla_alleles   # within-file inheritance still works
+  subdomain: hla_a
+  predict: true
+  group: hla            # group is not inherited via parent; set it explicitly
+```
+
+The child file is deep-merged on top of the base: within each domain, only the fields declared in the child override those from the base; unmentioned fields are kept as-is. Chains are supported (A extends B extends C). Paths in `extends` are resolved relative to the file that declares them.
+
 #### Overriding domain config fields from the CLI
 
 Individual domain config fields can be overridden at runtime without editing the YAML, using `--dcfg` (alias for `--domain_config`):
@@ -145,6 +180,22 @@ hla_a:
 ```
 
 Children that do not override `projector` fall back to the parent's value (`embed` in the example above), so you can mix pretrained and learned embeddings across loci in the same config.
+
+#### Token collapsing (`token_value_column`)
+
+When a metadata column maps multiple fine-grained tokens to the same coarser group, `token_value_column` collapses them into a single token without splitting into child domains. This is an alternative to the subdomain hierarchy when you want a single domain with reduced granularity.
+
+```yaml
+hla_alleles:
+  projector: embed
+  path: hla_alleles
+  at_birth: true
+  token_value_column: allele_1field   # collapses 2-field alleles to 1-field groups
+```
+
+**How it works:** at load time, `TokenDomain` reads `token_metadata.csv`, groups all `token_id`s by their value in `token_value_column`, and assigns a new contiguous ID to each unique group value. The resulting vocabulary contains one entry per unique value in that column (e.g. `HLA-A*01`, `HLA-A*02`, …) instead of one per original token. Multiple original tokens that share the same group value are treated as the same token during training.
+
+`token_value_column` and `subdomain` are mutually exclusive — use one or the other.
 
 ### Specifying the attention scheme
 
