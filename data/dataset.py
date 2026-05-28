@@ -113,6 +113,7 @@ class TokenDomain:
         aggregation_strategy: Optional[Callable] = None,
         subdomain: Optional[str] = None,
         subdomain_column: str = "locus",
+        token_value_column: Optional[str] = None,
         metadata_file: str = "token_metadata.csv",
     ):
         self.name = name
@@ -160,6 +161,26 @@ class TokenDomain:
                 self._old_to_new[old_id]: full_tokenizer[old_id]
                 for old_id in old_ids
             }
+
+        elif token_value_column is not None:
+            metadata_path = self.path / metadata_file
+            assert metadata_path.exists(), (
+                f"token_value_column='{token_value_column}' requires {metadata_path} to exist."
+            )
+            meta_df = pd.read_csv(metadata_path)
+            assert token_value_column in meta_df.columns, (
+                f"Column '{token_value_column}' not found in {metadata_path}. "
+                f"Available: {meta_df.columns.tolist()}"
+            )
+
+            # Build old_id -> group_value mapping, then assign a new contiguous ID per unique value
+            id_to_value = meta_df.set_index("token_id")[token_value_column].to_dict()
+            unique_values = list(dict.fromkeys(id_to_value[i] for i in sorted(id_to_value)))
+            value_to_new = {v: i for i, v in enumerate(unique_values)}
+
+            self._old_to_new = {old: value_to_new[val] for old, val in id_to_value.items()}
+            self._new_to_old = None  # many-to-one; inverse is not well-defined
+            self.tokenizer = {i: v for i, v in enumerate(unique_values)}
 
         else:
             self._old_to_new = None
@@ -414,6 +435,7 @@ class DelphiDataset(Dataset):
                 at_birth=dinfo.at_birth,
                 subdomain=getattr(dinfo, "subdomain", None),
                 subdomain_column=getattr(dinfo, "subdomain_column", "locus"),
+                token_value_column=getattr(dinfo, "token_value_column", None),
             )
 
         # ── Resolve subject set ───────────────────────────────────────────

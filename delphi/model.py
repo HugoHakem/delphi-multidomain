@@ -87,6 +87,7 @@ class DomainConfig:
     n_latent_tokens: Optional[int] = None
     subdomain: Optional[str] = None        # filter tokens by metadata (e.g. "hla_a")
     subdomain_column: str = "locus"        # metadata column used for subdomain filtering
+    token_value_column: Optional[str] = None  # collapse tokens by this metadata column (e.g. "allele_1field")
     parent: Optional[str] = None          # inherit config from this domain (resolved at load time)
     abstract: bool = False                 # template-only domain; excluded from the active config
     group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
