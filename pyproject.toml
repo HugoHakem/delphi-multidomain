@@ -84,6 +84,12 @@ line-length = 120
 extend-include = ["*.ipynb"]
 target-version = "py311"
 
+[tool.ruff.lint]
+# UP006: replace List/Dict/Tuple/Set with built-in generics (list/dict/tuple/set) — Python 3.9+
+# UP007: replace Optional[x] with x | None and Union[x, y] with x | y — Python 3.10+
+# Run `ruff check --select UP006,UP007 --fix --exclude deprecated/` to auto-apply
+select = ["UP006", "UP007"]
+
 [tool.mypy]
 ignore_missing_imports = true
 explicit_package_bases = true
