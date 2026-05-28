@@ -507,9 +507,11 @@ class Delphi(nn.Module):
         if len(attention_scheme) == 1:
             attention_scheme = self.config.n_layer * attention_scheme
         if any("at_birth" in s for s in attention_scheme):
-            at_birth = ",".join(
-                name for name, cfg in self.config.domains.items() if cfg.at_birth
-            )
+            at_birth_names = [name for name, cfg in self.config.domains.items() if cfg.at_birth]
+            if len(at_birth_names) == 1:
+                at_birth = at_birth_names[0]
+            else:
+                at_birth = "[" + ",".join(at_birth_names) + "]"
             attention_scheme = [s.replace("at_birth", at_birth) for s in attention_scheme]
         return attention_scheme
 

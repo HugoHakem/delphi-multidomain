@@ -95,9 +95,7 @@ def _get_last_epoch_checkpoint(run_dir: str) -> tuple[Path, int]:
 
 
 def load_checkpoint(run_id: str) -> tuple[dict, Path]:
-    """Load checkpoint from the last-epoch file for a run."""
-    mlflow_uri = Path(unquote(urlparse(mlflow.get_tracking_uri()).path))
-    experiment_id = _get_experiment_id_from_runid(run_id)
-    ckpt_path, _ = _get_last_epoch_checkpoint(mlflow_uri / experiment_id / run_id)
+    """Load best_model.pt, falling back to the highest-epoch checkpoint."""
+    ckpt_path = get_checkpoint_path(run_id)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     return ckpt, ckpt_path
