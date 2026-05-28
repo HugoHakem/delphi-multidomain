@@ -536,6 +536,18 @@ if __name__ == "__main__":
         domains = [d for d in args.domains.split(",") if d != "padding"]
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
         default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / 'tokens')
+
+        # Expand group aliases (e.g. "core" → ["diseases", "death", "lifestyle", "sex"])
+        group_to_domains = {}
+        for dname, dcfg in default_cfg_per_domain.items():
+            if dname == "padding" or dcfg.group is None:
+                continue
+            group_to_domains.setdefault(dcfg.group, []).append(dname)
+        expanded = []
+        for d in domains:
+            expanded.extend(group_to_domains[d] if d in group_to_domains and d not in default_cfg_per_domain else [d])
+        domains = list(dict.fromkeys(expanded))  # deduplicate, preserve order
+
         domain_cfg = {k: v for k, v in default_cfg_per_domain.items() if k in domains or k == "padding"}
 
         if args.domain_config_overrides:
@@ -612,13 +624,14 @@ if __name__ == "__main__":
             "test_fold": args.test_fold,
             "batch_size": args.batch_size,
             "batch_size_schedule": args.batch_size_schedule,
-            "learning_rate": args.lr,
+            "learning_rate": lr,
             "seed": args.seed,
             "optim_config": optim_config,
             "max_epochs": args.max_epochs,
             "min_epochs": args.min_epochs,
             "patience": args.patience,
             "attention_scheme_alias": attention_scheme_alias,
+            "domain_list": ",".join(domains),
         }
      
     else:
