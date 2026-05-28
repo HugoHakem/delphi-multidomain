@@ -36,6 +36,7 @@ def reconstruct_from_run(
     date_cutoff: str | None = None,
     birth_dates_file: str | None = None,
     device: str | None = None,
+    tokens_path: Union[str, Path, None] = None,
 ) -> tuple:
     """
     Reconstruct a trained Delphi model and dataloaders from an MLflow run.
@@ -83,6 +84,13 @@ def reconstruct_from_run(
             raise ValueError(f"Checkpoint metadata missing '{key}' (needed for split={s!r}).")
 
     domain_cfg = parse_domains_param(params["domains"])
+
+    if tokens_path is not None:
+        tokens_root = Path(tokens_path)
+        for dname, dcfg in domain_cfg.items():
+            if dname == "padding" or not getattr(dcfg, "path", None):
+                continue
+            dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
 
     stored_block_size = params.get("block_size", "96")
     if block_size is not None:
@@ -213,12 +221,14 @@ def reconstruct_model(run_id: str):
             continue
         dcfg.path = str(tokens_dir / Path(str(dcfg.path)).name)
 
+    block_size = int(params.get("block_size", cfg.get("block_size", 64)))
     delphi_cfg = DelphiConfig(
         n_embd=cfg["n_embd"],
         n_layer=cfg["n_layer"],
         token_dropout=0.1,
         domains=domain_cfg,
         attention_scheme=attn_scheme,
+        block_size=block_size,
     )
 
     model = Delphi(delphi_cfg)
