@@ -10,7 +10,7 @@ import os
 import re
 from dataclasses import fields as dc_fields
 from pathlib import Path
-from typing import Union
+from typing import Union, TypedDict, List, Dict, Any
 
 import torch
 from torch.utils.data import DataLoader
@@ -305,7 +305,7 @@ def config_from_runid(runid: str):
         if cfg.type == "continuous"
     }
 
-    _ds_kwargs = dict(
+    _ds_kwargs: Dict[str, Any]= dict(
         root=str(root_path),
         domains_cfg=delphi_cfg.domains,
         domain_to_int=model.domain_to_int,
@@ -318,9 +318,9 @@ def config_from_runid(runid: str):
         age_domains=["diseases", "death"],
     )
 
-    train_dataset = DelphiDataset(subjects=ckpt["metadata"]["train_ids"], **_ds_kwargs)  # type: ignore[arg-type]
-    valid_dataset = DelphiDataset(subjects=ckpt["metadata"]["valid_ids"], **_ds_kwargs)  # type: ignore[arg-type]
-    test_dataset  = DelphiDataset(subjects=ckpt["metadata"]["test_ids"],  **_ds_kwargs)  # type: ignore[arg-type]
+    train_dataset = DelphiDataset(subjects=ckpt["metadata"]["train_ids"], **_ds_kwargs)  
+    valid_dataset = DelphiDataset(subjects=ckpt["metadata"]["valid_ids"], **_ds_kwargs)  
+    test_dataset  = DelphiDataset(subjects=ckpt["metadata"]["test_ids"],  **_ds_kwargs)  
 
     age_sampler = AgeSampler(
         insertion_mode=delphi_cfg.no_event_token_insertion_mode,

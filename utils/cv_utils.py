@@ -61,8 +61,8 @@ def get_data_partitions(folder, fold):
     splits = generate_splits(fold_ids, n_train_folds=7, n_val_folds=1, n_test_folds=2)  
     split_idx = fold - 1
     
-    train_ids = [ int(x) for x in splits[split_idx]["train"]]
-    val_ids   = [ int(x) for x in splits[split_idx]["valid"]]
-    test_ids  = [ int(x) for x in splits[split_idx]["test"]]
+    train_ids = [ str(x) for x in splits[split_idx]["train"]]
+    val_ids   = [ str(x) for x in splits[split_idx]["valid"]]
+    test_ids  = [ str(x) for x in splits[split_idx]["test"]]
 
     return train_ids, val_ids, test_ids

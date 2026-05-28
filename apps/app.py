@@ -8,6 +8,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.stats import norm
+from typing import List, Literal
 
 import os
 
@@ -148,7 +149,7 @@ def test_interaction_by_age(df):
 
 
 @st.cache_data
-def load_runs(experiment_ids: str, val_loss_threshold: float = 1.0):
+def load_runs(experiment_ids: str|List[str], val_loss_threshold: float = 1.0):
 
     client = MlflowClient()
     filter_str = f"metrics.val_loss < {val_loss_threshold} and metrics.val_loss > 11.8"
@@ -156,7 +157,7 @@ def load_runs(experiment_ids: str, val_loss_threshold: float = 1.0):
 
     try:
         runs = client.search_runs(
-            experiment_ids if type(experiment_ids) == list else [experiment_ids],
+            experiment_ids if isinstance(experiment_ids, list) else [experiment_ids],
             run_view_type=ViewType.ACTIVE_ONLY,
             filter_string=filter_str,
         )
@@ -274,7 +275,7 @@ if st.session_state.runs_loaded:
         digit_option = st.radio("Select HLA specification", ["4-digit", "2-digit"])
         if digit_option == "4-digit":
             experiments_hla = { e.name: e.experiment_id for e in experiments if "no" not in e.name and "2digit" not in e.name }
-        if digit_option == "2-digit":
+        else:
             experiments_hla = { e.name: e.experiment_id for e in experiments if "no" not in e.name and "2digit" in e.name }
 
         experiments_nohla = { e.name: e.experiment_id for e in experiments if "no" in e.name } 
@@ -325,7 +326,7 @@ if st.session_state.runs_loaded:
             # selected_run_hla = st.select_slider("### Select run w/HLA", runs_hla)
             if not only_white:
                 selected_run_hla = st.selectbox("### Select run w/HLA", runs_hla)
-            if only_white:
+            else:
                 selected_run_hla = "52ee455f05e34d25812eedb4c87dd71c"
                 st.write("Run 52ee55... (with 2-digit) has been chosen")
 
@@ -470,26 +471,29 @@ if st.session_state.runs_loaded:
     with tab5:        
 
         @st.cache_data
-        def load_5fold_cv_auc():
+        def load_5fold_cv_auc() -> tuple[pd.DataFrame, pd.DataFrame]:
 
             EXP_NOHLA = "437945341875567335"
             EXP_HLA   = "278131880607437980"
 
             runs_hla_df = mlflow.search_runs(experiment_ids=[EXP_HLA])
             runs_nohla_df = mlflow.search_runs(experiment_ids=[EXP_NOHLA])
+            assert isinstance(runs_hla_df, pd.DataFrame)
+            assert isinstance(runs_nohla_df, pd.DataFrame)
             
-            unpooled_auc_mergeds, both_auc_mergeds = [], []
+            unpooled_auc_list: list[pd.DataFrame] = []
+            both_auc_list: list[pd.DataFrame] = []
             
-            for fold_i in range(1, 6):
-                fold_i = str(fold_i)
+            for _fold_i in range(1, 6):
+                fold_i = str(_fold_i)
                 run_nohla_id = runs_nohla_df.query("`params.fold` == @fold_i").run_id.iloc[0]
                 run_hla_id = runs_hla_df.query("`params.fold` == @fold_i").run_id.iloc[0]
                 run_nohla  = client.get_run(run_nohla_id)
                 run_hla  = client.get_run(run_hla_id)
                 unpooled_auc_nohla, both_auc_nohla = get_auc_dfs(run_nohla, suffix="_onlywhite")
-                unpooled_auc_hla, both_auc_nohla = get_auc_dfs(run_hla, suffix="_onlywhite")
+                unpooled_auc_hla, both_auc_hla = get_auc_dfs(run_hla, suffix="_onlywhite")
 
-                unpooled_auc_merged = pd.merge(unpooled_auc_hla, unpooled_auc_nohla, on=['age', 'name', 'sex'], suffixes=['_hla', '_nohla']).\
+                unpooled_auc_merged = pd.merge(unpooled_auc_hla, unpooled_auc_nohla, on=['age', 'name', 'sex'], suffixes=('_hla', '_nohla')).\
                     drop(["n_healthy_hla", "n_healthy_nohla"], axis=1).\
                     assign(diff=lambda x: x.auc_delong_hla - x.auc_delong_nohla).\
                     sort_values("diff", ascending=False).\
@@ -503,26 +507,23 @@ if st.session_state.runs_loaded:
                     # 'n_samples_nohla', 'n_diseased_nohla', 'n_healthy_nohla', 'index_nohla', 'count_nohla', 'token_nohla'
                 ]
 
-                both_auc_merged = pd.merge(both_auc_hla, both_auc_nohla, on=['name', 'ICD-10 Chapter', 'ICD-10 Chapter (short)', 'color'], suffixes=['_hla', '_nohla']).\
+                both_auc_merged = pd.merge(both_auc_hla, both_auc_nohla, on=['name', 'ICD-10 Chapter', 'ICD-10 Chapter (short)', 'color'], suffixes=('_hla', '_nohla')).\
                     assign(diff=lambda x: x.auc_hla - x.auc_nohla).\
                     sort_values("diff", ascending=False).\
                     merge(pd.read_csv(HLA_SCORE_CSV), left_on="index_nohla", right_on="index").\
                     drop(cols_to_discard, axis=1)
 
-                unpooled_auc_mergeds.append(unpooled_auc_merged.assign(fold=fold_i))
-                both_auc_mergeds.append(both_auc_merged.assign(fold=fold_i)) 
-            
-            unpooled_auc_mergeds = pd.concat(unpooled_auc_mergeds)
-            both_auc_mergeds = pd.concat(both_auc_mergeds)
+                unpooled_auc_list.append(unpooled_auc_merged.assign(fold=fold_i))
+                both_auc_list.append(both_auc_merged.assign(fold=fold_i))
 
-            return unpooled_auc_mergeds, both_auc_mergeds
+            return pd.concat(unpooled_auc_list), pd.concat(both_auc_list)
         
         diseases = st.multiselect("Choose diseases", options=sorted(unpooled_auc_merged.name.unique()), key=3)
 
-        unpooled_auc_mergeds, both_auc_mergeds = load_5fold_cv_auc()
+        unpooled_auc_mergeds, both_auc_mergeds = load_5fold_cv_auc() 
 
-        fold_index = st.slider(label="fold", min_value=1, max_value=5)
-        fold_index = str(fold_index)
+        _fold_index = st.slider(label="fold", min_value=1, max_value=5)
+        fold_index = str(_fold_index)
 
         unpooled_auc_merged = unpooled_auc_mergeds.query("fold == @fold_index")
 

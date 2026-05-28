@@ -24,7 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 from types import SimpleNamespace
 import yaml
-
+from typing import Any, Dict, Optional
 # ── Setup path ────────────────────────────────────────────────────────────
 
 DELPHI_DIR = Path(__file__).resolve().parent.parent
@@ -124,7 +124,7 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
     train_ids = train_ids[:100]
 
     # Dataset
-    dataset_kwargs = dict(
+    dataset_kwargs: Dict[str, Any] = dict(
         root=root_path,
         domains_cfg=domain_cfg,
         domain_to_int=domain_to_int,
@@ -676,10 +676,10 @@ def main():
     # ── Build the batch (needed for both views) ──────────────────────
     if mode.startswith("Raw"):
         df = raw_subject_to_df(data, subject_idx)
-        batch = None
+        batch: Optional[DelphiBatch] = None
     else:
         item = data.dataset[subject_idx]
-        batch: DelphiBatch = make_live_collate(training=bool(dropout_config))([item])
+        batch = make_live_collate(training=bool(dropout_config))([item])
         df = batch_subject_to_df(data, batch, 0)
 
         if dropout_config:

@@ -1,9 +1,10 @@
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
 from scipy.stats import mannwhitneyu
 import torch
 
-
-def compute_midrank(x):
+def compute_midrank(x: np.ndarray) -> np.ndarray:
     """Computes midranks.
     Args:
        x - a 1D numpy array
@@ -27,7 +28,7 @@ def compute_midrank(x):
     return T2
 
 
-def fastDeLong(predictions_sorted_transposed, label_1_count):
+def fastDeLong(predictions_sorted_transposed: np.ndarray, label_1_count: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Fast implementation of DeLong's algorithm for computing
     covariance of AUC.
@@ -61,7 +62,7 @@ def fastDeLong(predictions_sorted_transposed, label_1_count):
     return aucs, delongcov
 
 
-def delong_auc(case, ctrl):
+def delong_auc(case: np.ndarray, ctrl: np.ndarray) -> Tuple[Optional[float], Optional[np.ndarray]]:
     """Compute AUC + variance using DeLong."""
     if len(case) == 0 or len(ctrl) == 0:
         return None, None
@@ -79,7 +80,15 @@ def delong_auc(case, ctrl):
     return auc[0], cov
 
 
-def compute_all_stats(case, ctrl, do_bootstrap=False, n_bootstrap=200):
+def compute_all_stats(case: Any, ctrl: Any, do_bootstrap: bool = False, n_bootstrap: int = 200) -> Dict[str, float | np.ndarray | None]:
+    """Compute AUC and Mann-Whitney stats for case/control logit arrays.
+
+    Args:
+        case: array-like of logit scores for positive cases
+        ctrl: array-like of logit scores for controls
+        do_bootstrap: whether to compute bootstrapped AUC (requires CUDA)
+        n_bootstrap: number of bootstrap replicates
+    """
     case = np.asarray(case, float)
     ctrl = np.asarray(ctrl, float)
 

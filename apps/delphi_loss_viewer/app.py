@@ -135,10 +135,10 @@ style_choices = st.sidebar.multiselect(
     max_selections=3
 )
 
-while len(style_choices) < 3:
-    style_choices.append(None)
-
-attr_color, attr_marker, attr_linestyle = style_choices
+style_choices_padded: list[str | None] = list(style_choices)
+while len(style_choices_padded) < 3:
+    style_choices_padded.append(None)
+attr_color, attr_marker, attr_linestyle = style_choices_padded
 
 color_palette = sns.color_palette("tab10")
 marker_palette = ['o', 's', 'D', '^', 'v', 'P', 'X', '*', '+', '1']

@@ -72,7 +72,7 @@ class MLPProjector(nn.Module):
         E = n_latent_tokens * n_embd
         sizes = [input_size] + [n_hidden] * (n_layers - 1) + [E]
 
-        layers = []
+        layers: List[nn.Module]= []
         for i in range(n_layers):
             layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=False))
             if i < n_layers - 1:
@@ -173,8 +173,8 @@ class MultiDomainEmbedding(nn.Module):
         self.global_embed = nn.Embedding(global_vocab_size, config.n_embd)
 
         # Zero out placeholder rows for projected domains
-        self._projected_domain_names = []
-        self._projected_offsets = {}  # domain_name -> (offset, n_slots)
+        self._projected_domain_names: List[str] = []
+        self._projected_offsets: Dict[str, Tuple[int, int]] = {}  # domain_name -> (offset, n_slots)
         self._init_projectors(config)
 
         # ── Token dropout ─────────────────────────────────────────────────

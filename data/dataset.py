@@ -23,7 +23,7 @@ import logging
 from pathlib import Path
 from copy import deepcopy
 from typing import (
-    Any, Callable, Dict, List, Optional, Set, Tuple, Union,
+    Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypedDict, NotRequired
 )
 from collections import defaultdict
 from dataclasses import dataclass
@@ -120,6 +120,7 @@ class TokenDomain:
         self.at_birth = at_birth
         self.type = type
         self.subdomain = subdomain
+        self._old_to_new: Optional[Dict[int, int]]
 
         assert type in ("categorical", "continuous"), (
             f"Domain type must be 'categorical' or 'continuous', got {type}"
@@ -232,7 +233,7 @@ class TokenDomain:
     # ---- filtering -----------------------------------------------------------
 
     def filter_subjects(self, subjects: set) -> "TokenDomain":
-        isin = self._as_dataframe.subject_id.isin(subjects).values
+        isin = self._as_dataframe.subject_id.isin(subjects).to_numpy(dtype=bool)
         self.tokens = self.tokens[isin]
         self._as_dataframe = self._as_dataframe[isin]
         return self
@@ -346,6 +347,20 @@ class AgeSampler:
 #  DelphiDataset
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class DelphiDatasetItem(TypedDict):
+    """
+    Uncollated cached tensors for a single subject.
+    Produced by the Dataset, consumed by DelphiCollateFn.
+    """
+    domain_ids: torch.Tensor
+    local_token_ids: torch.Tensor
+    ages: torch.Tensor
+    real_count: torch.Tensor
+    max_age: torch.Tensor
+    subject_id: torch.Tensor
+    continuous: Dict[str, torch.Tensor]
+    eval_mask: NotRequired[torch.Tensor]  # Marks this key as optional
+
 class DelphiDataset(Dataset):
     """
     Caches all data as CPU tensors of shape [N_subjects, block_size].
@@ -375,7 +390,7 @@ class DelphiDataset(Dataset):
         domains_cfg: dict,
         domain_to_int: Dict[str, int],
         block_size: int,
-        subjects: Union[str, List[str]] = None,
+        subjects: Optional[Union[str, List[str]]] = None,
         exclusions: List[str] = [],
         n_samples: Optional[int] = None,
         required_domains: List[str] = ["sex", "diseases"],
@@ -467,12 +482,11 @@ class DelphiDataset(Dataset):
         self._build_cache(subject_set, block_size, no_event_token_rate)
 
         # ── Date cutoff (longitudinal eval mask) ──────────────────────────
+        self._eval_mask: Optional[torch.Tensor] = None
+        self._cutoff_ages: Optional[torch.Tensor] = None
+        self._cutoff_date: Optional[pd.Timestamp] = None
         if date_cutoff is not None and birth_dates_file is not None:
             self._build_eval_mask(date_cutoff, birth_dates_file)
-        else:
-            self._eval_mask = None
-            self._cutoff_ages = None
-            self._cutoff_date = None
 
         print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, "
               f"domains={list(self.domains.keys())}")
@@ -867,7 +881,7 @@ class DelphiDataset(Dataset):
         birth_info = birth_df.reindex(sids)[["year", "month"]]
 
         # Vectorised computation of per-subject cutoff age in days
-        valid = birth_info["year"].notna().values
+        valid = birth_info["year"].notna().to_numpy(dtype=bool)
         cutoff_ages = np.full(len(sids), np.inf, dtype=np.float32)
 
         if valid.any():
@@ -906,12 +920,12 @@ class DelphiDataset(Dataset):
     def __len__(self):
         return self._subject_ids.shape[0]
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, index: int) -> DelphiDatasetItem:
         """
         Returns copies of the cached tensors for one subject.
         Safe for multi-worker DataLoader.
         """
-        item = {
+        item: DelphiDatasetItem = {
             "domain_ids": self._domain_ids[index].clone(),
             "local_token_ids": self._local_token_ids[index].clone(),
             "ages": self._ages[index].clone(),
@@ -992,7 +1006,7 @@ class DelphiCollateFn:
         self.training = False
         return self
 
-    def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, batch: List[DelphiDatasetItem]) -> DelphiBatch:
 
         B = len(batch)
 

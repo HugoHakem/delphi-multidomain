@@ -24,7 +24,7 @@ import inspect
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field, fields, is_dataclass, asdict
-from typing import Optional, List, Tuple, Dict, Union, Mapping
+from typing import Optional, List, Tuple, Dict, Union, Mapping, Literal, TypedDict, Iterable
 
 import yaml
 import numpy as np
@@ -34,6 +34,7 @@ from torch.nn import functional as F
 from easydict import EasyDict
 
 from delphi.embedding import MultiDomainEmbedding
+from data.dataset import DelphiBatch
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,10 @@ class DelphiConfig:
 #  Attention Mask Builder  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class AttentionRule(TypedDict):
+    type: Literal["causal", "bidirectional"]
+    mask_ties: bool
+
 class AttentionMaskBuilder(nn.Module):
 
     def __init__(self, scheme_str: str, domain2id: dict):
@@ -136,15 +141,17 @@ class AttentionMaskBuilder(nn.Module):
         self.domain2id = domain2id
 
     @staticmethod
-    def _split_top_level(s: str, sep: str = ","):
-        parts, buf, depth_brack, depth_paren = [], "", 0, 0
+    def _split_top_level(s: str, sep: str = ",") -> List[str]:
+        parts: List[str] = []
+        buf, depth_brack, depth_paren = "", 0, 0
         for ch in s:
             if ch == "[":   depth_brack += 1
             elif ch == "]": depth_brack -= 1
             elif ch == "(": depth_paren += 1
             elif ch == ")": depth_paren -= 1
             if ch == sep and depth_brack == 0 and depth_paren == 0:
-                parts.append(buf.strip())
+                if buf.strip():
+                    parts.append(buf.strip())
                 buf = ""
             else:
                 buf += ch
@@ -153,8 +160,11 @@ class AttentionMaskBuilder(nn.Module):
         return parts
 
     @staticmethod
-    def _parse_scheme(scheme_str: str) -> Dict[Tuple[str, ...], Dict[str, bool | str]]:
-        scheme = {}
+    def _parse_scheme(scheme_str: str) -> Dict[Tuple[str, ...], AttentionRule]:
+        rule_type: Literal["causal", "bidirectional"]
+        mask_ties: bool
+
+        scheme: Dict[Tuple[str, ...], AttentionRule] = {}
         parts = AttentionMaskBuilder._split_top_level(scheme_str)
         for part in parts:
             if ":" not in part:
@@ -165,6 +175,7 @@ class AttentionMaskBuilder(nn.Module):
                 domains = [d.strip() for d in domain_part[1:-1].split(",")]
             else:
                 domains = [domain_part]
+            
             if rule_part.startswith("causal"):
                 rule_type = "causal"
                 mask_ties = "mask_ties=True" in rule_part
@@ -178,19 +189,19 @@ class AttentionMaskBuilder(nn.Module):
 
     def build(self, domains: torch.Tensor, local_token_ids: torch.Tensor, ages: torch.Tensor):
         B, L = ages.shape
-        dd = {'device': ages.device}
-        mask = torch.zeros(B, L, L, **dd)
+        device = ages.device
+        mask = torch.zeros(B, L, L, device=device)
         age_row = ages.unsqueeze(2)
         age_col = ages.unsqueeze(1)
 
-        all_domain_ids = torch.tensor(list(self.domain2id.values()), **dd)
+        all_domain_ids = torch.tensor(list(self.domain2id.values()), device=device)
 
         for dom_names, cfg in self.scheme.items():
             # Resolve "all" to every domain
             if dom_names == ("all",):
                 dom_ids = all_domain_ids
             else:
-                dom_ids = torch.tensor([self.domain2id[d] for d in dom_names], **dd)
+                dom_ids = torch.tensor([self.domain2id[d] for d in dom_names], device=device)
             dom_mask = torch.isin(domains, dom_ids)
             pair_mask = dom_mask.unsqueeze(2) & dom_mask.unsqueeze(1)
 
@@ -639,30 +650,30 @@ class Delphi(nn.Module):
 
     # ── Inference convenience ─────────────────────────────────────────────
 
-    def run_inference(self, dataloader, block_size=None, return_token_df=False):
+    def run_inference(self, dataloader: Iterable[DelphiBatch], block_size=None, return_token_df=False):
         """
         Run inference over an entire dataloader.
         The dataloader should use DelphiCollateFn.
         """
         if return_token_df:
             raise NotImplementedError
-
+        
+        old_block_size = self.block_size
         if block_size is not None:
             logger.warning(f"Temporarily changing block_size from {self.block_size} to {block_size}")
-            old_block_size = self.block_size
             self.set_block_size(block_size)
 
-        all_logits = []
+        all_logits: List[torch.Tensor] = []
         for batch in dataloader:
             batch = batch.to(self.device)
             with torch.no_grad():
-                logits_dict, _ = self(batch)
+                logits_dict = self.forward(batch, return_embeddings=False)[0]
 
-            logits_all_domains = []
+            _logits_all_domains: List[torch.Tensor] = []
             for dom in self.predicted_domains:
                 assert dom in logits_dict
-                logits_all_domains.append(logits_dict[dom])
-            logits_all_domains = torch.cat(logits_all_domains, dim=-1)
+                _logits_all_domains.append(logits_dict[dom])
+            logits_all_domains = torch.cat(_logits_all_domains, dim=-1)
             all_logits.append(logits_all_domains)
 
         logits = torch.cat(all_logits, dim=0)

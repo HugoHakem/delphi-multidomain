@@ -28,8 +28,8 @@ def create_friendly_view(
 
             domain_name = model.int_to_domain_name.get(domain_id, f"unknown_{domain_id}")
             tokenizer   = dataset.domains.get(
-                domain_name, EasyDict({"tokenizer": {}})
-            ).tokenizer
+                domain_name, {"tokenizer": {}}
+            )["tokenizer"]
 
             rows.append({
                 "subject_id":  subject_id,

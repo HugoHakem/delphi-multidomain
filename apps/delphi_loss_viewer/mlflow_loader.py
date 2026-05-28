@@ -7,7 +7,8 @@ def load_runs(exp_ids):
     """
     Load MLflow runs for given experiment IDs and normalize artifact_uri.
     """
-    runs_df = mlflow.search_runs(experiment_ids=exp_ids)
+    runs_df = mlflow.search_runs(experiment_ids=exp_ids, output_format="pandas")
+    assert isinstance(runs_df, pd.DataFrame)
     runs_df = runs_df.query("experiment_id != '0'").copy()
 
     runs_df["artifact_uri"] = runs_df["artifact_uri"].str.replace(

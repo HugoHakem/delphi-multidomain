@@ -1,7 +1,8 @@
 import pandas as pd
-from typing import List, Dict, Union
+from typing import Optional, Tuple, Any, Sequence, List, Dict, Union, Literal
 import torch
 import mlflow
+import mlflow.artifacts
 from tqdm import tqdm
 import os, sys
 from pathlib import Path
@@ -17,6 +18,8 @@ if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
 from dataclasses import asdict
 from pathlib import Path
 import json
+from contextlib import nullcontext
+import torch.amp
 
 
 def lod2dol(lod):
@@ -41,7 +44,7 @@ def make_json_serializable(x):
     return x
 
 
-def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_run_name: str = None) -> str:
+def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_run_name: Optional[str] = None) -> str:
     """
     Clone an existing MLflow run into a NEW experiment (fresh run + copied artifacts).
     """
@@ -65,8 +68,8 @@ def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_r
     mlflow.set_tag("resumed_from", old_run_id)
 
     src_dir = mlflow.artifacts.download_artifacts(run_id=old_run_id)
-    dst_dir = Path(mlflow.get_artifact_uri()).as_posix().replace("file://", "")
-    dst_dir = Path(dst_dir)
+    _dst_dir = Path(mlflow.get_artifact_uri()).as_posix().replace("file://", "")
+    dst_dir = Path(_dst_dir)
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
     print(f"Cloned run {old_run_id} → {new_run_id} (experiment: {new_experiment_name})")
@@ -235,12 +238,11 @@ class MLFlowLogger:
 # ———————————————————————————————————————————————————————————————————————————————
 
 class BaseTrainer():
-    def shared_step(self):     pass
-    def train_epoch(self):     pass
+    def shared_step(self, *args: Any, **kwargs: Any) -> Any:     pass
+    def train_epoch(self) -> Any:     pass
     def train(self):           pass
     def val_epoch(self):       pass
-    def valid_epoch_end(self): pass
-
+    def valid_epoch_end(self, *args: Any, **kwargs: Any) -> Any: pass
 
 class Trainer(BaseTrainer):
 
@@ -248,8 +250,8 @@ class Trainer(BaseTrainer):
 
     def __init__(self, model, dataloaders,
           optimizer, scheduler, patience=3,
-          n_train_batches=None, n_val_batches=None, n_validations_per_epoch=1,
-          logger=NullLogger(), mlflow_params=dict(), start_epoch=0, log_loss_per_disease=False,
+          n_train_batches:Optional[int]=None, n_val_batches: Optional[int]=None, n_validations_per_epoch=1,
+          logger: Union[NullLogger,MLFlowLogger]=NullLogger(), mlflow_params=dict(), start_epoch=0, log_loss_per_disease=False,
           use_tqdm=True, use_amp=True, use_rich=True,
           checkpoint_every=None, optim_config=None,
         ):
@@ -268,19 +270,20 @@ class Trainer(BaseTrainer):
             self.train_loader, self.valid_loader, self.test_loader = dataloaders
         else:
             raise ValueError(f"{len(dataloaders)=} ")
+        
+        self.n_train_batches: Union[Literal['all'], int] = n_train_batches if n_train_batches is not None else 'all'
+        self.n_val_batches: Union[Literal['all'], int] = n_val_batches if n_val_batches is not None else 'all'
 
-        self.n_train_batches, self.n_val_batches = n_train_batches or 'all', n_val_batches or 'all'
-
-        self.train_outputs, \
-        self.valid_outputs, \
-        self.test_outputs = [], [], []
+        self.train_outputs: List[Dict[str, torch.Tensor]] = []
+        self.valid_outputs: List[Dict[str, torch.Tensor]] = []
+        self.test_outputs: List[Dict[str, torch.Tensor]] = []
 
         self.current_epoch = start_epoch
         self._validation_counter = 0
         self.n_validations_per_epoch = n_validations_per_epoch
 
         self.logger = logger
-        self.val_loss = None
+        self.val_loss: Optional[Dict[str, torch.Tensor]] = None
         self.ema_alpha = 0.02
 
         self.additional_mlflow_params = mlflow_params | { "ema_alpha": self.ema_alpha }
@@ -290,8 +293,8 @@ class Trainer(BaseTrainer):
         self.checkpoint_every = checkpoint_every   # None = only save on improvement
         self.optim_config = optim_config
 
-        self.ce_ema = None
-        self.time_ema = None
+        self.ce_ema: Optional[torch.Tensor] = None
+        self.time_ema: Optional[torch.Tensor] = None
         self.log_loss_per_disease = log_loss_per_disease
 
         # Precompute predicted domain IDs as a tensor for masking
@@ -303,7 +306,7 @@ class Trainer(BaseTrainer):
         self.use_amp = use_amp and torch.cuda.is_available()
         self.amp_dtype = torch.bfloat16
         # bfloat16 has the same exponent range as float32, so no gradient scaling needed
-        self.scaler = torch.amp.GradScaler("cuda", enabled=False)
+        self.scaler = torch.amp.grad_scaler.GradScaler("cuda", enabled=False)
 
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.allow_tf32 = True
@@ -321,12 +324,11 @@ class Trainer(BaseTrainer):
             "test_ids":  sorted(self.test_loader.dataset.subject_list),
         }
 
-    def _setup_display(self, epoch_rows: list):
+    def _setup_display(self, epoch_rows: List[Tuple[str,...]]):
         """
         Returns (progress, live_ctx, refresh_fn).
         When use_rich=False, everything is a no-op.
         """
-        from contextlib import nullcontext
         if not self.use_rich:
             return None, nullcontext(), lambda: None
 
@@ -377,9 +379,12 @@ class Trainer(BaseTrainer):
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
 
-        epoch_rows = []
+        epoch_rows: List[Tuple[str, ...]] = []
         progress, live_ctx, refresh_display = self._setup_display(epoch_rows)
-        _print = (lambda msg: live_ctx.console.print(msg)) if self.use_rich and progress else print
+        if self.use_rich and progress and not isinstance(live_ctx, nullcontext):
+            _print = live_ctx.console.print
+        else:
+            _print = print
 
         with live_ctx:
             for epoch in range(self.current_epoch, max_epochs):
@@ -392,16 +397,17 @@ class Trainer(BaseTrainer):
                 ) if progress else None
                 train_loss = self.train_epoch(eval_every=eval_every, _progress=progress, _task_id=train_task)
                 self.on_train_epoch_end(epoch)
-                if progress: progress.remove_task(train_task)
+                if progress and train_task: progress.remove_task(train_task)
 
                 n_val = len(self.valid_loader) if self.n_val_batches == 'all' else self.n_val_batches
                 val_task = progress.add_task(
                     f"[blue]Ep {epoch:>4d}  val  ", total=n_val
                 ) if progress else None
+
                 self.val_loss, self.mean_val_loss = self.valid_epoch(
                     n_batches=self.n_val_batches, _progress=progress, _task_id=val_task
                 )
-                if progress: progress.remove_task(val_task)
+                if progress and val_task: progress.remove_task(val_task)
 
                 metrics = {"train_loss": train_loss}
                 if self.val_loss is not None:
@@ -425,7 +431,7 @@ class Trainer(BaseTrainer):
                     "date_cutoff": None,
                 } | self.get_subject_ids_per_partition()
 
-                if improved:
+                if improved and not isinstance(self.logger, NullLogger):
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     ckpt_filepath = f"epoch{epoch}__valloss_{val_loss_val:.4f}__{timestamp}.pt"
                     ckpt_uri = self.logger.save_model(
@@ -436,7 +442,7 @@ class Trainer(BaseTrainer):
                     )
                     _print(f"New best model → {ckpt_uri}")
 
-                if self.checkpoint_every and (epoch % self.checkpoint_every == 0):
+                if self.checkpoint_every and (epoch % self.checkpoint_every == 0) and not isinstance(self.logger, NullLogger):
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     ckpt_filepath = f"epoch{epoch}__periodic__{timestamp}.pt"
                     ckpt_uri = self.logger.save_model(
@@ -482,7 +488,7 @@ class Trainer(BaseTrainer):
         # Move batch to device
         batch = batch.to(self.device)
 
-        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+        with torch.amp.autocast_mode.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
 
             # Forward pass
             logits_dict, att = model(batch, return_attention=return_att)
@@ -517,11 +523,11 @@ class Trainer(BaseTrainer):
         # ── Package losses (outside autocast, already float32 scalars) ──
         prefix = "" if add_prefix is None else add_prefix + "_"
 
-        loss = EasyDict({
+        loss: Dict[str, Any] = {
             f'{prefix}ce_loss':   loss_ce,
             f'{prefix}time_loss': time_loss,
             f'{prefix}total':     loss_ce + time_loss,
-        })
+        }
 
         if self.log_loss_per_disease and stage == "validation":
             loss[f'{prefix}ce_loss_per_disease'] = model.cross_entropy_loss(
@@ -556,8 +562,8 @@ class Trainer(BaseTrainer):
         return 1
 
 
-    def compute_mean(self, outputs: List[Dict]):
-        out = {}
+    def compute_mean(self, outputs: Sequence[Dict[str, Any]]):
+        out: Dict[str, torch.Tensor] = {}
         if not outputs:
             return out
         for k in outputs[0].keys():
@@ -575,7 +581,7 @@ class Trainer(BaseTrainer):
         return out
 
 
-    def train_epoch(self, n_batches='all', eval_every=None, _progress=None, _task_id=None):
+    def train_epoch(self, n_batches: Union[Literal['all'], int] ='all', eval_every=None, _progress=None, _task_id=None):
 
         self.val_step = 0
 
@@ -592,6 +598,7 @@ class Trainer(BaseTrainer):
                 batch, batch_idx=i, epoch=self.current_epoch,
                 stage="training", add_prefix="train"
             )
+            assert isinstance(loss, dict)
 
             self.scaler.scale(loss['train_total']).backward()
             if self.optim_config is not None and self.optim_config.grad_clip > 0:
@@ -610,7 +617,9 @@ class Trainer(BaseTrainer):
 
                 self.time_ema = time_val if self.time_ema is None else \
                     (1 - self.ema_alpha) * self.time_ema + self.ema_alpha * time_val
-
+            
+            assert isinstance(self.ce_ema, torch.Tensor)
+            assert isinstance(self.time_ema, torch.Tensor)
             self.train_outputs.append({
                 'train_ce_loss': ce_val,
                 'train_time_loss': time_val,
@@ -644,7 +653,7 @@ class Trainer(BaseTrainer):
         return self.compute_mean(self.train_outputs)
 
 
-    def valid_epoch(self, n_batches='all', _progress=None, _task_id=None):
+    def valid_epoch(self, n_batches: Union[Literal['all'], int]='all', _progress=None, _task_id=None):
 
         self.model.eval()
 
@@ -656,7 +665,7 @@ class Trainer(BaseTrainer):
 
         with torch.no_grad():
 
-            loss_outputs = []
+            loss_outputs: List[Dict[str, Any]] = []
             ce_sum, time_sum = 0.0, 0.0
 
             for i, batch in enumerate(self.valid_loader):
@@ -665,6 +674,7 @@ class Trainer(BaseTrainer):
                     batch, batch_idx=i, epoch=self.current_epoch,
                     stage="validation", add_prefix="val"
                 )
+                assert isinstance(loss, dict)
                 loss_outputs.append(loss)
 
                 ce_sum += loss['val_ce_loss'].item()
@@ -695,11 +705,12 @@ class Trainer(BaseTrainer):
             losses_per_epoch_file = self.LOSSES_PER_EPOCH_FILEPATTERN.format(
                 current_epoch=self.current_epoch, val_step=self.val_step
             )
-            self.logger.log_df_as_artifact(
-                df=self._val_ce_loss_per_disease_df,
-                filename=losses_per_epoch_file,
-                artifact_path="val_loss_per_disease"
-            )
+            if isinstance(self.logger, MLFlowLogger):
+                self.logger.log_df_as_artifact(
+                    df=self._val_ce_loss_per_disease_df,
+                    filename=losses_per_epoch_file,
+                    artifact_path="val_loss_per_disease"
+                )
 
         mean_val = self.compute_mean(loss_outputs)
 

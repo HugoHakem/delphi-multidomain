@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 import yaml
 from pathlib import Path
@@ -17,7 +19,13 @@ def infer_scheme(attn_scheme):
     return "No HLA"
 
 
-def exponential_moving_average(values, alpha=1):
+def exponential_moving_average(values: Any, alpha: float = 1.0) -> np.ndarray:
+    """Compute exponential moving average.
+
+    Args:
+        values: array-like of numeric values (list, np.ndarray, pd.Series, etc.)
+        alpha: smoothing factor in [0, 1]; 1.0 means no smoothing
+    """
     if len(values) == 0:
         return np.array([])
 

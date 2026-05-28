@@ -28,7 +28,8 @@ dependencies = [
 log = [
   "wandb>=0.25.1,<0.26",
   "mlflow<3.6", # superior to 3.6 introduce sqlite as the recommended/default backend. 
-  "loguru"
+  "loguru",
+  "rich"
 ]
 apps = [
   "streamlit",
@@ -39,7 +40,10 @@ apps = [
 [dependency-groups]
 lint = [
   "ruff",
-  "mypy"
+  "mypy",
+  "pyright",
+  "pandas-stubs",
+  "types-PyYAML"
 ]
 test = [
   "pytest",
@@ -78,7 +82,7 @@ explicit = true
 [tool.ruff]
 line-length = 120
 extend-include = ["*.ipynb"]
-target-version = "py310"
+target-version = "py311"
 
 [tool.mypy]
 ignore_missing_imports = true
@@ -86,10 +90,10 @@ explicit_package_bases = true
 check_untyped_defs = true
 warn_unreachable = true
 
+[tool.pyright]
+reportPrivateImportUsage = "none"
+
 [tool.hatch.build.targets.wheel]
 packages = ["delphi"]
-
-
-
 
 

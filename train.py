@@ -11,7 +11,7 @@ from auc.aucs import evaluate_aucs
 import torch
 from torch.utils.data import DataLoader
 import mlflow
-
+from typing import Dict, Any, List, Union, cast
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -47,7 +47,7 @@ from utils import load_domain_config, setup_mlflow, AUTO_BLOCK_SIZE # cache uppe
 setup_mlflow()
 
 root_path = DELPHI_DIR / "data" / "transforms"
-ATTENTION_SCHEMES = yaml.safe_load((DELPHI_DIR / "config" / "attention_schemes.yaml").read_text())
+ATTENTION_SCHEMES: Dict[str, Dict[str, str]] = yaml.safe_load((DELPHI_DIR / "config" / "attention_schemes.yaml").read_text())
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
@@ -91,16 +91,16 @@ def format_delphi_config(cfg) -> str:
     return "\n".join(lines)
 
 
-def parse_attention_scheme(attention_scheme, as_list=True):
+def parse_attention_scheme(attention_scheme: Union[List[str], str], as_list=True) -> Union[List[str], str]:
     
     if isinstance(attention_scheme, str):
         if attention_scheme in ATTENTION_SCHEMES.keys():
             attention_scheme = ATTENTION_SCHEMES[attention_scheme]["scheme"]
         if as_list:
             attention_scheme = [attention_scheme]
-        return attention_scheme
+        return attention_scheme 
     elif isinstance(attention_scheme, list):
-        return [parse_attention_scheme(scheme, as_list=False) for scheme in attention_scheme]
+        return [cast(str, parse_attention_scheme(scheme, as_list=False)) for scheme in attention_scheme]
 
 
 # ——————————————— CLI ———————————————————————————————————————————————————————————————
@@ -210,7 +210,7 @@ def get_dataloaders(
     # original value ("auto" or int) to decide per-batch trimming behaviour.
     cache_block_size = AUTO_BLOCK_SIZE if block_size == "auto" else block_size
 
-    dataset_kwargs = dict(
+    dataset_kwargs: Dict[str, Any] = dict(
         root=root_path,
         domains_cfg=domain_cfg,
         domain_to_int=model.domain_to_int,
@@ -242,7 +242,7 @@ def get_dataloaders(
         if cfg.dropout_mode is not None and cfg.dropout_rate > 0
     }
 
-    collate_kwargs = dict(
+    collate_kwargs: Dict[str, Any]= dict(
         age_sampler=age_sampler,
         block_size=block_size,      # "auto" or int
         domain_to_int=model.domain_to_int,
@@ -255,7 +255,7 @@ def get_dataloaders(
     train_collate = DelphiCollateFn(**collate_kwargs, training=True)
     eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
 
-    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    loader_kwargs: Dict[str, Any] = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
 
     train_loader = DataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **loader_kwargs)
     valid_loader = DataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
@@ -310,8 +310,7 @@ if __name__ == "__main__":
         model = Delphi(delphi_config).to(DEVICE)
         if not args.no_compile:
             logging.info("Compiling model with torch.compile (first batch will be slower)...")
-        model = torch.compile(model, disable=args.no_compile)
-
+        model = cast(Delphi, torch.compile(model, disable=args.no_compile))
         # ── Data ──────────────────────────────────────────────────────────
         dataloaders = get_dataloaders(
             domain_cfg,
@@ -340,7 +339,7 @@ if __name__ == "__main__":
         )
         logging.info("Optimizer configuration: \n%s", pformat(asdict(optim_config), sort_dicts=False))
         
-        optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)  
+        optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
         
         logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
     
@@ -367,8 +366,8 @@ if __name__ == "__main__":
         model = model.to(DEVICE)
         if not args.no_compile:
             logging.info("Compiling model with torch.compile (first batch will be slower)...")
-        model = torch.compile(model, disable=args.no_compile)
-        optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
+        model = cast(Delphi, torch.compile(model, disable=args.no_compile))
+        optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE) # type: ignore[assignment]
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
         if scheduler_state is not None:
@@ -389,9 +388,9 @@ if __name__ == "__main__":
     logged_params["n_params"] = n_params
 
     train_loader, val_loader, test_loader = dataloaders
-    logged_params["n_train"] = len(train_loader.dataset)
-    logged_params["n_val"]   = len(val_loader.dataset)
-    logged_params["n_test"]  = len(test_loader.dataset)
+    logged_params["n_train"] = len(train_loader.dataset)  # type: ignore[arg-type]
+    logged_params["n_val"]   = len(val_loader.dataset)    # type: ignore[arg-type]
+    logged_params["n_test"]  = len(test_loader.dataset)   # type: ignore[arg-type]
 
     if args.no_warnings:
         warnings.filterwarnings("ignore")
@@ -417,7 +416,8 @@ if __name__ == "__main__":
         model.eval()
         test_loader = dataloaders[2]    
         del dataloaders
-    
+
+        assert logger.active_run is not None
         auc_df = evaluate_aucs(
             model,
             test_loader,
@@ -427,3 +427,5 @@ if __name__ == "__main__":
             logger=logger,
         )
         logging.info("AUCs:\n%s", pformat(auc_df, sort_dicts=False))
+
+# %%
