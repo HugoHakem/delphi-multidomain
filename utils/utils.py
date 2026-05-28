@@ -25,8 +25,35 @@ def _normalize_domain_cfg(cfg: dict) -> dict:
     return cfg
 
 
+def _load_raw_yaml(cfg_path: Path) -> dict:
+    """Load a domain config YAML, recursively resolving ``extends:`` inheritance.
+
+    If the YAML contains ``extends: other.yaml``, the base file is loaded first
+    and the current file is deep-merged on top of it (field-level within each
+    domain, so child fields win without discarding unmentioned base fields).
+    Paths in ``extends`` are resolved relative to the file that declares them.
+    Chaining (A extends B extends C) is supported.
+    """
+    raw = yaml.safe_load(cfg_path.read_text()) or {}
+    extends = raw.pop("extends", None)
+    if extends is None:
+        return raw
+
+    base = _load_raw_yaml(cfg_path.parent / extends)
+
+    # Start from base, then overlay child fields domain by domain
+    merged = {k: dict(v) if v is not None else {} for k, v in base.items()}
+    for k, v in raw.items():
+        child_fields = dict(v) if v is not None else {}
+        if k in merged:
+            merged[k].update(child_fields)
+        else:
+            merged[k] = child_fields
+    return merged
+
+
 def load_domain_config(cfg_path, tokens_path):
-    raw = yaml.safe_load(Path(cfg_path).read_text())
+    raw = _load_raw_yaml(Path(cfg_path))
 
     # First pass: collect raw dicts (excluding padding)
     raw_configs = {k: dict(v) for k, v in raw.items() if k != "padding" and v is not None}
