@@ -9,6 +9,8 @@ import warnings
 import pandas as pd
 from auc.aucs import evaluate_aucs
 import torch
+import torch._inductor.config as _inductor_config
+_inductor_config.fx_graph_cache = True  # persist compiled Triton kernels across runs (set TORCHINDUCTOR_CACHE_DIR to a non-/tmp path)
 from data.dataset import FlexibleDataLoader, BatchSizeScheduler, DataModule
 from torch.utils.data import DataLoader
 import mlflow
@@ -379,6 +381,36 @@ def _interactive_select_run() -> tuple[str, str]:
 
 # ——————————————— Data loading ——————————————————————————————————————————————————————
 
+def _compile_model(model, disable=False):
+    """Wrap torch.compile with cache-aware logging.
+
+    Logs an uncertain message immediately, then a definitive one (hit/miss)
+    on each graph compilation during the first forward pass.
+    """
+    if disable:
+        return model
+    logging.info("torch.compile enabled — will compile or load from cache on first forward pass")
+    try:
+        from torch._inductor import codecache
+        from torch._inductor.utils import counters as _ic
+        _orig = codecache.FxGraphCache.load
+
+        def _logged_load(compile_fx_fn, gm, example_inputs, fx_kwargs):
+            h_before = _ic["inductor"]["fxgraph_cache_hit"]
+            m_before = _ic["inductor"]["fxgraph_cache_miss"]
+            result = _orig(compile_fx_fn, gm, example_inputs, fx_kwargs)
+            if _ic["inductor"]["fxgraph_cache_hit"] > h_before:
+                logging.info("torch.compile: graph loaded from cache")
+            elif _ic["inductor"]["fxgraph_cache_miss"] > m_before:
+                logging.info("torch.compile: graph compiled (cache miss)")
+            return result
+
+        codecache.FxGraphCache.load = staticmethod(_logged_load)
+    except Exception:
+        pass
+    return torch.compile(model)
+
+
 def get_continuous_domains(domain_cfg):
     return {
         dname: cfg.n_latent_tokens or 1
@@ -538,9 +570,7 @@ if __name__ == "__main__":
         if args.dry_run:
             sys.exit(0)
         model = Delphi(delphi_config).to(DEVICE)
-        if not args.no_compile:
-            logging.info("Compiling model with torch.compile (first batch will be slower)...")
-        model = torch.compile(model, disable=args.no_compile)
+        model = _compile_model(model, disable=args.no_compile)
 
         # ── Data ──────────────────────────────────────────────────────────
         bs_scheduler = args.batch_size_schedule
@@ -617,9 +647,7 @@ if __name__ == "__main__":
             optim_config.min_lr = args.min_lr if args.min_lr is not None else args.lr / 10
 
         model = model.to(DEVICE)
-        if not args.no_compile:
-            logging.info("Compiling model with torch.compile (first batch will be slower)...")
-        model = torch.compile(model, disable=args.no_compile)
+        model = _compile_model(model, disable=args.no_compile)
         optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
         if optimizer_state is not None:
             optimizer.load_state_dict(optimizer_state)
