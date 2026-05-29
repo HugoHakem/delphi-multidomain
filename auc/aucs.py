@@ -46,6 +46,7 @@ EMPTY = (np.array([], dtype=int), np.array([], dtype=int))
 #  Token DataFrame construction
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def batch_to_tokens_df(batch: DelphiBatch, int_to_domain: dict[int, str], domain_offsets: dict[int, int]):
     """
     Convert a DelphiBatch into a flat DataFrame of tokens.
@@ -68,27 +69,24 @@ def batch_to_tokens_df(batch: DelphiBatch, int_to_domain: dict[int, str], domain
 
     domains = [int_to_domain.get(d, f"unknown_{d}") for d in domain_ids]
 
-    df = pd.DataFrame({
-        "subject_idx": subject_idx.reshape(-1).cpu().numpy(),
-        "seq_idx": seq_idx.reshape(-1).cpu().numpy(),
-        "subject_id": subject_id.reshape(-1).cpu().numpy(),
-        "age": batch.ages.reshape(-1).cpu().numpy(),
-        "token_id": local_ids,
-        "global_token_id": global_ids,
-        "domain_id": domain_ids,
-        "domain": domains,
-    })
+    df = pd.DataFrame(
+        {
+            "subject_idx": subject_idx.reshape(-1).cpu().numpy(),
+            "seq_idx": seq_idx.reshape(-1).cpu().numpy(),
+            "subject_id": subject_id.reshape(-1).cpu().numpy(),
+            "age": batch.ages.reshape(-1).cpu().numpy(),
+            "token_id": local_ids,
+            "global_token_id": global_ids,
+            "domain_id": domain_ids,
+            "domain": domains,
+        }
+    )
 
     return df.sort_values(["subject_idx", "seq_idx"]).reset_index(drop=True)
 
 
 def get_subject_sex(df):
-    return (
-        df.query('domain == "sex"')
-        .groupby("subject_idx")["token_id"]
-        .first()
-        .to_dict()
-    )
+    return df.query('domain == "sex"').groupby("subject_idx")["token_id"].first().to_dict()
 
 
 def add_sex_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -143,9 +141,7 @@ def extract_case_ctrl_for_sex_age(
     local_ctrl: dict[CaseCtrlKey, pd.Series] = {}
 
     for dd in ctrl_subjects_sex:
-        local_ctrl[(sex, (a0, a1), *dd)] = (
-            subset.loc[ctrl_subjects_sex[dd]].dropna().global_idx
-        )
+        local_ctrl[(sex, (a0, a1), *dd)] = subset.loc[ctrl_subjects_sex[dd]].dropna().global_idx
 
         gidx_arr, age_arr = disease_idx_sex[dd]
         age_mask = (age_arr > a0 * DAYS_PER_YEAR) & (age_arr <= a1 * DAYS_PER_YEAR)
@@ -158,7 +154,10 @@ def extract_case_ctrl_for_sex_age(
 #  AUC computation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def compute_auc_from_indices(logits_for_token: Any, cases: Any, controls: Any, block_size: int) -> dict[str, float | np.ndarray | None]:
+
+def compute_auc_from_indices(
+    logits_for_token: Any, cases: Any, controls: Any, block_size: int
+) -> dict[str, float | np.ndarray | None]:
     """Slice subject logits by flat indices and compute AUC stats.
 
     Args:
@@ -182,15 +181,17 @@ def process_disease(logits_for_token, token_id, lookup_disease, block_size):
             case, ctrl = lookup_disease.get((sex, age_range), EMPTY)
 
             stats: dict[str, Any] = compute_auc_from_indices(logits_for_token, case, ctrl, block_size)
-            stats.update({
-                "domain": token_id[0],
-                "token_id": token_id[1],
-                "age_start": age_range[0],
-                "age_end": age_range[1],
-                "sex": sex,
-                "n_case": len(case),
-                "n_ctrl": len(ctrl),
-            })
+            stats.update(
+                {
+                    "domain": token_id[0],
+                    "token_id": token_id[1],
+                    "age_start": age_range[0],
+                    "age_end": age_range[1],
+                    "sex": sex,
+                    "n_case": len(case),
+                    "n_ctrl": len(ctrl),
+                }
+            )
             rows.append(stats)
 
     return rows
@@ -199,6 +200,7 @@ def process_disease(logits_for_token, token_id, lookup_disease, block_size):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Main evaluation function
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def evaluate_aucs(
     model: Delphi,
@@ -277,16 +279,14 @@ def evaluate_aucs(
 
     # Precompute age masks
     age_masks = {}
-    for (a0, a1) in AGE_RANGES:
+    for a0, a1 in AGE_RANGES:
         age_masks[(a0, a1)] = tokens_df.age.between(
             a0 * DAYS_PER_YEAR, a1 * DAYS_PER_YEAR, inclusive="right"
         ).to_numpy()
 
     # List all predicted (domain, token_id) pairs
     predicted_tokens = [
-        (dname, tid)
-        for dname in model.predicted_domains
-        for tid in range(model.embed._domain_vocab_sizes[dname])
+        (dname, tid) for dname in model.predicted_domains for tid in range(model.embed._domain_vocab_sizes[dname])
     ]
 
     # Group tokens by sex and disease
@@ -301,20 +301,15 @@ def evaluate_aucs(
 
         unique_subjects = tokens_sex.subject_id.unique()
 
-        for (domain_name, token_id) in predicted_tokens:
+        for domain_name, token_id in predicted_tokens:
             if (domain_name, token_id) not in _by_disease:
                 continue
             case_subjects[sex][domain_name, token_id] = _by_disease[(domain_name, token_id)].subject_id
             cases_ids = set(case_subjects[sex][(domain_name, token_id)])
-            ctrl_subjects[sex][(domain_name, token_id)] = unique_subjects[
-                ~pd.Series(unique_subjects).isin(cases_ids)
-            ]
+            ctrl_subjects[sex][(domain_name, token_id)] = unique_subjects[~pd.Series(unique_subjects).isin(cases_ids)]
 
     # Precompute arrays for parallel extraction
-    all_sids = {
-        sex_id: tokens_df.loc[tokens_df.sex == sex_id, "subject_id"].unique()
-        for sex_id in SEX_TOKENS.values()
-    }
+    all_sids = {sex_id: tokens_df.loc[tokens_df.sex == sex_id, "subject_id"].unique() for sex_id in SEX_TOKENS.values()}
 
     tok_subj = tokens_df["subject_id"].to_numpy()
     tok_sex = tokens_df["sex"].to_numpy()
@@ -332,18 +327,22 @@ def evaluate_aucs(
 
     # Parallel extraction
     print("Extracting case/control indices...")
-    tasks = [
-        (sex, sex_id, a0, a1)
-        for sex, sex_id in SEX_TOKENS.items()
-        for (a0, a1) in AGE_RANGES
-    ]
+    tasks = [(sex, sex_id, a0, a1) for sex, sex_id in SEX_TOKENS.items() for (a0, a1) in AGE_RANGES]
 
     _cc_args = (
-        (sex, sex_id, a0, a1,
-         all_sids, tok_subj, tok_sex, tok_gidx,
-         age_masks[(a0, a1)],
-         ctrl_subjects[sex],
-         disease_idx[sex_id])
+        (
+            sex,
+            sex_id,
+            a0,
+            a1,
+            all_sids,
+            tok_subj,
+            tok_sex,
+            tok_gidx,
+            age_masks[(a0, a1)],
+            ctrl_subjects[sex],
+            disease_idx[sex_id],
+        )
         for sex, sex_id, a0, a1 in tqdm(tasks, desc="Case/ctrl indices")
     )
     if n_jobs == 1:
@@ -361,14 +360,14 @@ def evaluate_aucs(
     del results
 
     # Build lookup: (domain_name, token_id) -> {(sex, age_range) -> (cases, controls)}
-    case_ctrl_lookup: defaultdict[tuple[str, int], dict[tuple[str, tuple[int, int]], tuple[np.ndarray, np.ndarray]]] = defaultdict(dict)
+    case_ctrl_lookup: defaultdict[tuple[str, int], dict[tuple[str, tuple[int, int]], tuple[np.ndarray, np.ndarray]]] = (
+        defaultdict(dict)
+    )
     for key, cases in case_indices.items():
         if key not in ctrl_indices or len(cases) == 0:
             continue
         sex, age_range, domain_name, token_id = key
-        case_ctrl_lookup[(domain_name, token_id)][(sex, age_range)] = (
-            cases, ctrl_indices[key].to_numpy(dtype=int)
-        )
+        case_ctrl_lookup[(domain_name, token_id)][(sex, age_range)] = (cases, ctrl_indices[key].to_numpy(dtype=int))
 
     del case_indices, ctrl_indices
     gc.collect()
@@ -378,10 +377,10 @@ def evaluate_aucs(
 
     _auc_args = (
         (
-            (
-                all_output_embeddings
-                @ model.embed._get_domain_weight(domain_name)[token_id].half()
-            ).detach().cpu().numpy(),
+            (all_output_embeddings @ model.embed._get_domain_weight(domain_name)[token_id].half())
+            .detach()
+            .cpu()
+            .numpy(),
             (domain_name, token_id),
             case_ctrl_lookup.get((domain_name, token_id), {}),
         )
@@ -406,11 +405,20 @@ def evaluate_aucs(
         auc_df = auc_df.assign(runid=run_id, block_size=block_size)
 
     columns_order = [
-        c for c in [
-            "runid", "domain", "token_id",
-            "sex", "age_start", "age_end",
-            "n_case", "n_ctrl",
-            "auc_delong", "auc_delong_var", "mann_u", "mann_p",
+        c
+        for c in [
+            "runid",
+            "domain",
+            "token_id",
+            "sex",
+            "age_start",
+            "age_end",
+            "n_case",
+            "n_ctrl",
+            "auc_delong",
+            "auc_delong_var",
+            "mann_u",
+            "mann_p",
             "block_size",
         ]
         if c in auc_df.columns
@@ -426,8 +434,10 @@ def evaluate_aucs(
         )
         print(f"AUC results logged as artifact: aucs/{output_file}")
 
-    print(f"AUC evaluation complete: {len(auc_df)} rows, "
-          f"{auc_df['domain'].nunique()} domains, "
-          f"{len(predicted_tokens)} tokens")
+    print(
+        f"AUC evaluation complete: {len(auc_df)} rows, "
+        f"{auc_df['domain'].nunique()} domains, "
+        f"{len(predicted_tokens)} tokens"
+    )
 
     return auc_df

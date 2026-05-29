@@ -2,6 +2,7 @@
 Utilities for reconstructing a trained Delphi model (and optional dataloaders)
 from an MLflow run ID.
 """
+
 from __future__ import annotations
 
 import ast
@@ -21,8 +22,8 @@ AUTO_BLOCK_SIZE = 512  # used when a run was trained with block_size="auto"
 
 _SPLIT_TO_METADATA_KEY = {
     "train": "train_ids",
-    "val":   "valid_ids",
-    "test":  "test_ids",
+    "val": "valid_ids",
+    "test": "test_ids",
 }
 
 
@@ -88,8 +89,7 @@ def reconstruct_from_run(
         bs = block_size
     elif stored_block_size == "auto":
         logging.warning(
-            "Run was trained with block_size='auto'; using AUTO_BLOCK_SIZE=%d "
-            "as the fixed block size.", AUTO_BLOCK_SIZE
+            "Run was trained with block_size='auto'; using AUTO_BLOCK_SIZE=%d as the fixed block size.", AUTO_BLOCK_SIZE
         )
         bs = AUTO_BLOCK_SIZE
     else:
@@ -124,9 +124,7 @@ def reconstruct_from_run(
     logging.info("Model loaded: %d parameters", sum(p.numel() for p in model.parameters()))
 
     continuous_domains = {
-        dname: cfg.n_latent_tokens or 1
-        for dname, cfg in domain_cfg.items()
-        if cfg.type == "continuous"
+        dname: cfg.n_latent_tokens or 1 for dname, cfg in domain_cfg.items() if cfg.type == "continuous"
     }
 
     root_path = DELPHI_DIR / "data" / "transforms"
@@ -247,14 +245,12 @@ def config_from_runid(runid: str):
     runinfo = mlflow.get_run(runid)
 
     batch_size = int(runinfo.data.params.pop("batch_size", 16))
-    test_fold  = runinfo.data.params.pop("test_fold", 0)
+    test_fold = runinfo.data.params.pop("test_fold", 0)
     runinfo.data.params.pop("learning_rate", None)
     runinfo.data.params.pop("ema_alpha", None)
 
     try:
-        runinfo.data.params["attention_scheme"] = ast.literal_eval(
-            runinfo.data.params["attention_scheme"]
-        )
+        runinfo.data.params["attention_scheme"] = ast.literal_eval(runinfo.data.params["attention_scheme"])
     except (ValueError, SyntaxError):
         runinfo.data.params["attention_scheme"] = [runinfo.data.params["attention_scheme"]]
 
@@ -296,17 +292,16 @@ def config_from_runid(runid: str):
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
 
     from utils.ckpt_utils import strip_compiled_prefix
+
     state_dict = strip_compiled_prefix(ckpt["state_dict"])
     model.load_state_dict(state_dict, strict=False)
 
     root_path = DELPHI_DIR / "data" / "transforms"
     continuous_domains = {
-        dname: cfg.n_latent_tokens or 1
-        for dname, cfg in delphi_cfg.domains.items()
-        if cfg.type == "continuous"
+        dname: cfg.n_latent_tokens or 1 for dname, cfg in delphi_cfg.domains.items() if cfg.type == "continuous"
     }
 
-    _ds_kwargs: dict[str, Any]= dict(
+    _ds_kwargs: dict[str, Any] = dict(
         root=str(root_path),
         domains_cfg=delphi_cfg.domains,
         domain_to_int=model.domain_to_int,
@@ -319,9 +314,9 @@ def config_from_runid(runid: str):
         age_domains=["diseases", "death"],
     )
 
-    train_dataset = DelphiDataset(subjects=ckpt["metadata"]["train_ids"], **_ds_kwargs)  
-    valid_dataset = DelphiDataset(subjects=ckpt["metadata"]["valid_ids"], **_ds_kwargs)  
-    test_dataset  = DelphiDataset(subjects=ckpt["metadata"]["test_ids"],  **_ds_kwargs)  
+    train_dataset = DelphiDataset(subjects=ckpt["metadata"]["train_ids"], **_ds_kwargs)
+    valid_dataset = DelphiDataset(subjects=ckpt["metadata"]["valid_ids"], **_ds_kwargs)
+    test_dataset = DelphiDataset(subjects=ckpt["metadata"]["test_ids"], **_ds_kwargs)
 
     age_sampler = AgeSampler(
         insertion_mode=delphi_cfg.no_event_token_insertion_mode,
@@ -340,9 +335,9 @@ def config_from_runid(runid: str):
     )
 
     dataloaders = [
-        DataLoader(train_dataset, batch_size=batch_size,     shuffle=True,  pin_memory=True, collate_fn=collate),
+        DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, collate_fn=collate),
         DataLoader(valid_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
-        DataLoader(test_dataset,  batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
+        DataLoader(test_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
     ]
 
     previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
@@ -352,7 +347,12 @@ def config_from_runid(runid: str):
     scheduler_state = ckpt.get("scheduler_state", None)
 
     return (
-        model, dataloaders, optim_config,
-        optimizer_state, scheduler_state,
-        start_epoch, logged_params, previous_run_name,
+        model,
+        dataloaders,
+        optim_config,
+        optimizer_state,
+        scheduler_state,
+        start_epoch,
+        logged_params,
+        previous_run_name,
     )

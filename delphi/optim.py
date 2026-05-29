@@ -22,9 +22,7 @@ class OptimConfig:
     schedule: str = "cosine"  # consine, constant
     warmup_iters: int = 2000  # how many steps to warm up for
     lr_decay_iters: int = 10000  # should be ~= max_iters per Chinchilla
-    min_lr: float = (
-        6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-    )
+    min_lr: float = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 
 # learning rate decay scheduler (cosine with warmup)
@@ -57,8 +55,10 @@ def configure_optimizers(
     weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
     We are then returning the PyTorch optimizer object.
     """
-   
-    assert cfg.lr_decay_iters > cfg.warmup_iters, f"lr_decay_iters must be greater than warmup_iters, but got ({cfg.lr_decay_iters=}) <= ({cfg.warmup_iters=})"
+
+    assert cfg.lr_decay_iters > cfg.warmup_iters, (
+        f"lr_decay_iters must be greater than warmup_iters, but got ({cfg.lr_decay_iters=}) <= ({cfg.warmup_iters=})"
+    )
     # separate out all parameters to those that will and won't experience regularizing weight decay
     decay = set()
     no_decay = set()
@@ -92,13 +92,9 @@ def configure_optimizers(
     param_dict = {pn: p for pn, p in model.named_parameters()}
     inter_params = decay & no_decay
     union_params = decay | no_decay
-    assert (
-        len(inter_params) == 0
-    ), "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
-    assert (
-        len(param_dict.keys() - union_params) == 0
-    ), "parameters %s were not separated into either decay/no_decay set!" % (
-        str(param_dict.keys() - union_params),
+    assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
+    assert len(param_dict.keys() - union_params) == 0, (
+        "parameters %s were not separated into either decay/no_decay set!" % (str(param_dict.keys() - union_params),)
     )
 
     trainable = set()
@@ -120,13 +116,9 @@ def configure_optimizers(
         },
     ]
     # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-    use_fused = (device_type == "cuda") and (
-        "fused" in inspect.signature(torch.optim.AdamW).parameters
-    )
+    use_fused = (device_type == "cuda") and ("fused" in inspect.signature(torch.optim.AdamW).parameters)
     extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(
-        optim_groups, lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), **extra_args
-    )
+    optimizer = torch.optim.AdamW(optim_groups, lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), **extra_args)
 
     if cfg.schedule == "cosine":
         lr_schedule_fn = partial(

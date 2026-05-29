@@ -24,6 +24,7 @@ import yaml
 
 _SCHEMES_YAML = Path(__file__).resolve().parent.parent / "config" / "attention_schemes.yaml"
 
+
 def _load_attention_schemes():
     if not _SCHEMES_YAML.exists():
         return {"Custom (edit below)": ""}
@@ -37,6 +38,7 @@ def _load_attention_schemes():
     schemes["Custom (edit below)"] = ""
     return schemes
 
+
 PREDEFINED_ATTENTION_SCHEMES = _load_attention_schemes()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -44,6 +46,7 @@ PREDEFINED_ATTENTION_SCHEMES = _load_attention_schemes()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+
 
 def _get_at_birth_domains(domain_config_path: str) -> list[str]:
     """Return domain names with at_birth: true from a domain config YAML."""
@@ -64,10 +67,22 @@ def resolve_at_birth(s: str, at_birth_domains: list[str]) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ALL_DOMAINS = [
-    "diseases", "death", "lifestyle", "sex",
-    "hla_alleles", "hla_a", "hla_b", "hla_c",
-    "hla_dpa", "hla_dpb", "hla_dqa", "hla_dqb", "hla_drb",
-    "genetic_pcs", "cv_drugs", "ns_drugs",
+    "diseases",
+    "death",
+    "lifestyle",
+    "sex",
+    "hla_alleles",
+    "hla_a",
+    "hla_b",
+    "hla_c",
+    "hla_dpa",
+    "hla_dpb",
+    "hla_dqa",
+    "hla_dqb",
+    "hla_drb",
+    "genetic_pcs",
+    "cv_drugs",
+    "ns_drugs",
     "rare_variants",
 ]
 
@@ -177,13 +192,15 @@ if "configs" not in st.session_state:
 
 
 def add_config():
-    st.session_state.configs.append({
-        "domains_preset": "Base (no HLA, no PCs)",
-        "domains_custom": "",
-        "attn_preset": "Full causal (mask ties)",
-        "attn_custom": "",
-        "suffix": f"_config{len(st.session_state.configs) + 1}",
-    })
+    st.session_state.configs.append(
+        {
+            "domains_preset": "Base (no HLA, no PCs)",
+            "domains_custom": "",
+            "attn_preset": "Full causal (mask ties)",
+            "attn_custom": "",
+            "suffix": f"_config{len(st.session_state.configs) + 1}",
+        }
+    )
 
 
 def remove_config(idx):
@@ -201,7 +218,8 @@ for i, cfg in enumerate(st.session_state.configs):
                 list(PREDEFINED_DOMAIN_SETS.keys()),
                 key=f"dom_preset_{i}",
                 index=list(PREDEFINED_DOMAIN_SETS.keys()).index(cfg["domains_preset"])
-                if cfg["domains_preset"] in PREDEFINED_DOMAIN_SETS else 0,
+                if cfg["domains_preset"] in PREDEFINED_DOMAIN_SETS
+                else 0,
             )
             cfg["domains_preset"] = domain_preset
 
@@ -222,7 +240,8 @@ for i, cfg in enumerate(st.session_state.configs):
                 list(PREDEFINED_ATTENTION_SCHEMES.keys()),
                 key=f"attn_preset_{i}",
                 index=list(PREDEFINED_ATTENTION_SCHEMES.keys()).index(cfg["attn_preset"])
-                if cfg["attn_preset"] in PREDEFINED_ATTENTION_SCHEMES else 0,
+                if cfg["attn_preset"] in PREDEFINED_ATTENTION_SCHEMES
+                else 0,
             )
             cfg["attn_preset"] = attn_preset
 

@@ -34,7 +34,7 @@ def fastDeLong(predictions_sorted_transposed: np.ndarray, label_1_count: int) ->
     Fast implementation of DeLong's algorithm for computing
     covariance of AUC.
 
-    predictions_sorted_transposed: 2D numpy array 
+    predictions_sorted_transposed: 2D numpy array
                                    [n_classifiers, n_examples]
                                    sorted s.t positives come first
     """
@@ -81,7 +81,9 @@ def delong_auc(case: np.ndarray, ctrl: np.ndarray) -> tuple[float | None, np.nda
     return auc[0], cov
 
 
-def compute_all_stats(case: Any, ctrl: Any, do_bootstrap: bool = False, n_bootstrap: int = 200) -> dict[str, float | np.ndarray | None]:
+def compute_all_stats(
+    case: Any, ctrl: Any, do_bootstrap: bool = False, n_bootstrap: int = 200
+) -> dict[str, float | np.ndarray | None]:
     """Compute AUC and Mann-Whitney stats for case/control logit arrays.
 
     Args:
@@ -95,9 +97,12 @@ def compute_all_stats(case: Any, ctrl: Any, do_bootstrap: bool = False, n_bootst
 
     if len(case) == 0 or len(ctrl) == 0:
         return {
-            "auc_delong": None, "auc_delong_var": None,
-            "mann_u": None, "mann_p": None,
-            "auc_bootstrap_mean": None, "auc_bootstrap_std": None,
+            "auc_delong": None,
+            "auc_delong_var": None,
+            "mann_u": None,
+            "mann_p": None,
+            "auc_bootstrap_mean": None,
+            "auc_bootstrap_std": None,
         }
 
     auc_d, auc_var = delong_auc(case, ctrl)
@@ -113,9 +118,12 @@ def compute_all_stats(case: Any, ctrl: Any, do_bootstrap: bool = False, n_bootst
         auc_b_std = None
 
     return {
-        "auc_delong": auc_d, "auc_delong_var": auc_var,
-        "mann_u": float(u),  "mann_p": float(p),
-        "auc_bootstrap_mean": auc_b_mean, "auc_bootstrap_std": auc_b_std,
+        "auc_delong": auc_d,
+        "auc_delong_var": auc_var,
+        "mann_u": float(u),
+        "mann_p": float(p),
+        "auc_bootstrap_mean": auc_b_mean,
+        "auc_bootstrap_std": auc_b_std,
     }
 
 
@@ -145,7 +153,7 @@ def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1):
     else:
         control = control.to("cuda", dtype=torch.float32)
 
-    total = ( n_case := case.size(0) ) + ( n_control := control.size(0) )
+    total = (n_case := case.size(0)) + (n_control := control.size(0))
 
     # Generate bootstrap samples
     boot_idx_case = torch.randint(0, n_case, (n_bootstrap, n_case), device="cuda")

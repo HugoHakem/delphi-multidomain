@@ -34,6 +34,7 @@ def load_run_params(run_id: str) -> dict:
 def parse_domains_param(domains_str: str) -> dict:
     """Parse the domains MLflow param (handles embedded PosixPath reprs)."""
     from delphi.model import DomainConfig
+
     s_clean = re.sub(r"PosixPath\(([^)]+)\)", r"\1", domains_str)
     domains_dict = ast.literal_eval(s_clean)
     return {k: DomainConfig(**v) for k, v in domains_dict.items()}
@@ -91,7 +92,6 @@ def _get_last_epoch_checkpoint(run_dir: Path | str) -> tuple[Path, int]:
         raise RuntimeError("No checkpoint contained an epoch number.")
 
     return best, best_epoch
-
 
 
 def load_checkpoint(run_id: str) -> tuple[dict, Path]:

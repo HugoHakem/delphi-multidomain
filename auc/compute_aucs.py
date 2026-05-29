@@ -38,11 +38,16 @@ torch.backends.cudnn.allow_tf32 = True
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def main():
     parser = argparse.ArgumentParser(description="Compute AUCs for a trained Delphi model")
     parser.add_argument("--runid", required=True, help="MLflow run ID")
-    parser.add_argument("--block_size", type=int, default=128,
-                        help="Fixed block size for AUC evaluation (must be an integer; 'auto' is not supported)")
+    parser.add_argument(
+        "--block_size",
+        type=int,
+        default=128,
+        help="Fixed block size for AUC evaluation (must be an integer; 'auto' is not supported)",
+    )
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--n_jobs", type=int, default=8, help="Parallel jobs for AUC computation")

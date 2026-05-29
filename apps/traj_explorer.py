@@ -44,25 +44,25 @@ DAYS_PER_YEAR = 365.25
 # ── Domain colors ─────────────────────────────────────────────────────────
 
 DOMAIN_COLORS = {
-    "diseases":      "#E63946",
-    "death":         "#457B9D",
-    "cv_drugs":      "#F4A261",
-    "ns_drugs":      "#2A9D8F",
-    "lifestyle":     "#9B5DE5",
-    "hla_alleles":   "#FFBE0B",
-    "sex":           "#00B4D8",
+    "diseases": "#E63946",
+    "death": "#457B9D",
+    "cv_drugs": "#F4A261",
+    "ns_drugs": "#2A9D8F",
+    "lifestyle": "#9B5DE5",
+    "hla_alleles": "#FFBE0B",
+    "sex": "#00B4D8",
     "rare_variants": "#FB5607",
-    "genetic_pcs":   "#06D6A0",
-    "padding":       "#ADB5BD",
+    "genetic_pcs": "#06D6A0",
+    "padding": "#ADB5BD",
     # per-locus HLA
-    "hla_a":         "#FFD166",
-    "hla_b":         "#EF8C8C",
-    "hla_c":         "#56CFE1",
-    "hla_dpa":       "#118AB2",
-    "hla_dpb":       "#073B4C",
-    "hla_dqa":       "#FF9F1C",
-    "hla_dqb":       "#80B918",
-    "hla_drb":       "#FF595E",
+    "hla_a": "#FFD166",
+    "hla_b": "#EF8C8C",
+    "hla_c": "#56CFE1",
+    "hla_dpa": "#118AB2",
+    "hla_dpb": "#073B4C",
+    "hla_dqa": "#FF9F1C",
+    "hla_dqb": "#80B918",
+    "hla_drb": "#FF595E",
 }
 
 DEFAULT_COLOR = "#CCCCCC"
@@ -80,20 +80,33 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown("""
+st.markdown(
+    """
 <style>
     .block-container { padding-top: 1rem; }
     .stDataFrame { font-size: 0.85rem; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Cached loading
 # ══════════════════════════════════════════════════════════════════════════
 
+
 @st.cache_resource
-def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_event_insertion_mode, seed, date_cutoff=None, birth_dates_file=None):
+def load_everything(
+    domains_str,
+    test_fold,
+    block_size,
+    no_event_token_rate,
+    no_event_insertion_mode,
+    seed,
+    date_cutoff=None,
+    birth_dates_file=None,
+):
 
     root_path = DELPHI_DIR / "data" / "transforms"
     domain_config_yaml = DELPHI_DIR / "config" / "domain_config_default.yaml"
@@ -107,15 +120,11 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
     domain_offsets, global_vocab_size = Delphi._build_domain_offsets(domain_to_int, domain_cfg)
 
     continuous_domains = {
-        dname: cfg.n_latent_tokens or 1
-        for dname, cfg in domain_cfg.items()
-        if cfg.type == "continuous"
+        dname: cfg.n_latent_tokens or 1 for dname, cfg in domain_cfg.items() if cfg.type == "continuous"
     }
 
     # Subject splits
-    train_ids, val_ids, test_ids = get_data_partitions(
-        "./data/transforms/subject_lists", fold=test_fold
-    )
+    train_ids, val_ids, test_ids = get_data_partitions("./data/transforms/subject_lists", fold=test_fold)
 
     train_ids = train_ids[:100]
 
@@ -173,6 +182,7 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
 #  Helper: raw dataset → DataFrame for one subject
 # ══════════════════════════════════════════════════════════════════════════
 
+
 def raw_subject_to_df(data, subject_idx):
     ds = data.dataset
     item = ds[subject_idx]
@@ -222,6 +232,7 @@ def raw_subject_to_df(data, subject_idx):
 #  Helper: batch → DataFrame
 # ══════════════════════════════════════════════════════════════════════════
 
+
 def batch_subject_to_df(data, batch, batch_subject_idx):
     subject_id = int(batch.subject_ids[batch_subject_idx])
     T = batch.seq_len
@@ -247,18 +258,20 @@ def batch_subject_to_df(data, batch, batch_subject_idx):
         else:
             token_type = "real"
 
-        rows.append({
-            "subject_id": subject_id,
-            "position": pos,
-            "age_years": round(age_days / DAYS_PER_YEAR, 2),
-            "age_days": age_days,
-            "domain": dname,
-            "domain_id": d_id,
-            "token_id": local_id,
-            "global_token_id": g_id,
-            "token_name": tokenizer.get(local_id, f"id_{local_id}"),
-            "token_type": token_type,
-        })
+        rows.append(
+            {
+                "subject_id": subject_id,
+                "position": pos,
+                "age_years": round(age_days / DAYS_PER_YEAR, 2),
+                "age_days": age_days,
+                "domain": dname,
+                "domain_id": d_id,
+                "token_id": local_id,
+                "global_token_id": g_id,
+                "token_name": tokenizer.get(local_id, f"id_{local_id}"),
+                "token_type": token_type,
+            }
+        )
 
     return pd.DataFrame(rows)
 
@@ -266,6 +279,7 @@ def batch_subject_to_df(data, batch, batch_subject_idx):
 # ══════════════════════════════════════════════════════════════════════════
 #  Plotting
 # ══════════════════════════════════════════════════════════════════════════
+
 
 def plot_timeline(df, title="Trajectory Timeline"):
     """
@@ -329,15 +343,18 @@ def add_cutoff_line(fig, cutoff_age_years):
 
 def style_table(df):
     """Color rows by domain."""
+
     def row_color(row):
         c = get_color(row.get("domain", ""))
         return [f"background-color: {c}22; color: #333"] * len(row)
+
     return df.style.apply(row_color, axis=1)
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Attention mask plotting
 # ══════════════════════════════════════════════════════════════════════════
+
 
 def build_attention_mask(batch, scheme_str, domain_to_int):
 
@@ -384,14 +401,16 @@ def plot_attention_mask(mask, df, title="Attention Mask"):
     labels = labels[:T]
 
     # Color: 1 = allowed (blue-ish), 0 = blocked (white)
-    fig = go.Figure(data=go.Heatmap(
-        z=mask_np,
-        x=labels,
-        y=labels,
-        colorscale=[[0, "#F5F5F5"], [1, "#2A6F97"]],
-        showscale=False,
-        hovertemplate="Query: %{y}<br>Key: %{x}<br>Attention: %{z}<extra></extra>",
-    ))
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=mask_np,
+            x=labels,
+            y=labels,
+            colorscale=[[0, "#F5F5F5"], [1, "#2A6F97"]],
+            showscale=False,
+            hovertemplate="Query: %{y}<br>Key: %{x}<br>Attention: %{z}<extra></extra>",
+        )
+    )
 
     fig.update_layout(
         title=title,
@@ -433,10 +452,11 @@ def plot_attention_mask_compact(mask, df, domain_colors):
     from plotly.subplots import make_subplots
 
     STRIP = 0.025
-    GAP   = 0.004
+    GAP = 0.004
 
     fig = make_subplots(
-        rows=2, cols=2,
+        rows=2,
+        cols=2,
         row_heights=[STRIP, 1 - STRIP],
         column_widths=[STRIP, 1 - STRIP],
         horizontal_spacing=GAP,
@@ -447,22 +467,23 @@ def plot_attention_mask_compact(mask, df, domain_colors):
 
     n_doms = len(unique_domains)
     dom_colorscale = [
-        [i / max(n_doms - 1, 1), domain_colors.get(d, DEFAULT_COLOR)]
-        for i, d in enumerate(unique_domains)
+        [i / max(n_doms - 1, 1), domain_colors.get(d, DEFAULT_COLOR)] for i, d in enumerate(unique_domains)
     ]
 
     fig.add_trace(
         go.Heatmap(z=[dom_strip], colorscale=dom_colorscale, showscale=False, hoverinfo="skip"),
-        row=1, col=2,
+        row=1,
+        col=2,
     )
     fig.add_trace(
         go.Heatmap(z=[[d] for d in dom_strip], colorscale=dom_colorscale, showscale=False, hoverinfo="skip"),
-        row=2, col=1,
+        row=2,
+        col=1,
     )
 
     labels = []
     for _, row in df.iterrows():
-        labels.append(f"{row.get('domain','?')}: {row.get('token_name','?')} ({row.get('age_years','?')}y)")
+        labels.append(f"{row.get('domain', '?')}: {row.get('token_name', '?')} ({row.get('age_years', '?')}y)")
     while len(labels) < T:
         labels.append("padding")
     labels = labels[:T]
@@ -474,16 +495,17 @@ def plot_attention_mask_compact(mask, df, domain_colors):
             showscale=False,
             hovertemplate="Q pos %{y} → K pos %{x}: %{z}<extra></extra>",
         ),
-        row=2, col=2,
+        row=2,
+        col=2,
     )
 
     # ── Legend in upper-right triangle (blank in causal attention) ─────
     plot_domains = [d for d in unique_domains if d != "padding"]
-    box_h  = max(2, T // 18)
-    box_w  = max(4, T // 10)
-    gap    = max(1, T // 40)
+    box_h = max(2, T // 18)
+    box_w = max(4, T // 10)
+    gap = max(1, T // 40)
     x_right = T - 2
-    x_left  = x_right - box_w
+    x_left = x_right - box_w
 
     for i, dname in enumerate(plot_domains):
         y_top = i * (box_h + gap)
@@ -494,20 +516,26 @@ def plot_attention_mask_compact(mask, df, domain_colors):
         color = domain_colors.get(dname, DEFAULT_COLOR)
         fig.add_shape(
             type="rect",
-            xref="x4", yref="y4",
-            x0=x_left, x1=x_right,
-            y0=y_top, y1=y_bot,
+            xref="x4",
+            yref="y4",
+            x0=x_left,
+            x1=x_right,
+            y0=y_top,
+            y1=y_bot,
             fillcolor=color,
             line=dict(width=0.5, color="#ffffff"),
             layer="above",
         )
         fig.add_annotation(
-            xref="x4", yref="y4",
-            x=x_left - 1, y=(y_top + y_bot) / 2,
+            xref="x4",
+            yref="y4",
+            x=x_left - 1,
+            y=(y_top + y_bot) / 2,
             text=dname,
             showarrow=False,
             font=dict(size=max(8, T // 12), color="#222"),
-            xanchor="right", yanchor="middle",
+            xanchor="right",
+            yanchor="middle",
             bgcolor="rgba(255,255,255,0.7)",
         )
 
@@ -532,6 +560,7 @@ def plot_attention_mask_compact(mask, df, domain_colors):
 # ══════════════════════════════════════════════════════════════════════════
 #  Main app
 # ══════════════════════════════════════════════════════════════════════════
+
 
 def main():
 
@@ -580,10 +609,7 @@ def main():
         st.header("Domain Dropout")
         st.caption("DataLoader batch mode only. Each rerun draws a new dropout sample.")
 
-        domain_names_for_dropout = [
-            d.strip() for d in domains_str.split(",")
-            if d.strip() not in ("padding", "")
-        ]
+        domain_names_for_dropout = [d.strip() for d in domains_str.split(",") if d.strip() not in ("padding", "")]
         raw_dropout = {}
         for dname in domain_names_for_dropout:
             enabled = st.checkbox(dname, key=f"do_enable_{dname}")
@@ -596,7 +622,11 @@ def main():
                     help="token: drop tokens individually · block: drop the entire domain for the subject",
                 )
                 rate = st.slider(
-                    "Rate", 0.0, 1.0, 0.1, 0.05,
+                    "Rate",
+                    0.0,
+                    1.0,
+                    0.1,
+                    0.05,
                     key=f"dr_{dname}",
                 )
                 raw_dropout[dname] = (mode, rate)
@@ -607,7 +637,12 @@ def main():
 
     # ── Load data ─────────────────────────────────────────────────────
     data = load_everything(
-        domains_str, test_fold, block_size, no_event_rate, insertion_mode, seed,
+        domains_str,
+        test_fold,
+        block_size,
+        no_event_rate,
+        insertion_mode,
+        seed,
         date_cutoff=date_cutoff_str,
         birth_dates_file=birth_dates_file_str,
     )
@@ -654,10 +689,12 @@ def main():
             value=0,
         )
     with col2:
-        st.markdown(f"**Subject ID:** `{subject_list[subject_idx]}`  |  "
-                     f"**Max age:** `{float(data.dataset._max_ages[subject_idx]):.0f}` days "
-                     f"(`{float(data.dataset._max_ages[subject_idx]) / DAYS_PER_YEAR:.1f}` years)  |  "
-                     f"**Real tokens:** `{int(data.dataset._real_counts[subject_idx])}`")
+        st.markdown(
+            f"**Subject ID:** `{subject_list[subject_idx]}`  |  "
+            f"**Max age:** `{float(data.dataset._max_ages[subject_idx]):.0f}` days "
+            f"(`{float(data.dataset._max_ages[subject_idx]) / DAYS_PER_YEAR:.1f}` years)  |  "
+            f"**Real tokens:** `{int(data.dataset._real_counts[subject_idx])}`"
+        )
 
     # ── Domain filter ─────────────────────────────────────────────────
     all_domains = [data.int_to_domain[i] for i in sorted(data.int_to_domain.keys())]
@@ -692,9 +729,7 @@ def main():
         df_filtered = df
 
     # ── Tabs ──────────────────────────────────────────────────────────
-    tab_timeline, tab_table, tab_attn = st.tabs([
-        "📈 Timeline", "📋 Token Table", "🎯 Attention Mask"
-    ])
+    tab_timeline, tab_table, tab_attn = st.tabs(["📈 Timeline", "📋 Token Table", "🎯 Attention Mask"])
 
     # ── Tab: Timeline ─────────────────────────────────────────────────
     with tab_timeline:
@@ -754,8 +789,10 @@ def main():
     # ── Tab: Attention Mask ───────────────────────────────────────────
     with tab_attn:
         if batch is None:
-            st.info("Switch to **DataLoader batch** mode to see the attention mask "
-                    "(the mask depends on no-event tokens and sorting).")
+            st.info(
+                "Switch to **DataLoader batch** mode to see the attention mask "
+                "(the mask depends on no-event tokens and sorting)."
+            )
         else:
             st.caption(f"Scheme: `{attention_scheme}`")
 
@@ -771,7 +808,9 @@ def main():
                 if mask_style.startswith("Compact"):
                     fig_mask = plot_attention_mask_compact(mask, df, DOMAIN_COLORS)
                 else:
-                    fig_mask = plot_attention_mask(mask, df, title=f"Attention Mask — Subject {subject_list[subject_idx]}")
+                    fig_mask = plot_attention_mask(
+                        mask, df, title=f"Attention Mask — Subject {subject_list[subject_idx]}"
+                    )
 
                 st.plotly_chart(fig_mask, use_container_width=True)
 
@@ -781,8 +820,8 @@ def main():
                 n_total = T * T
                 st.caption(
                     f"Mask: {T}×{T} = {n_total} pairs | "
-                    f"Allowed: {n_allowed} ({100*n_allowed/n_total:.1f}%) | "
-                    f"Blocked: {n_total - n_allowed} ({100*(n_total-n_allowed)/n_total:.1f}%)"
+                    f"Allowed: {n_allowed} ({100 * n_allowed / n_total:.1f}%) | "
+                    f"Blocked: {n_total - n_allowed} ({100 * (n_total - n_allowed) / n_total:.1f}%)"
                 )
 
             except Exception as e:

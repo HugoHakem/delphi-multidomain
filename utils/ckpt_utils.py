@@ -12,24 +12,16 @@ class InferredConfig(TypedDict):
 
 
 def infer_delphi_config_from_state_dict(sd: dict) -> InferredConfig:
-    layer_indices = [
-        int(m.group(1))
-        for key in sd
-        if (m := re.match(r"transformer\.h\.(\d+)\.", key))
-    ]
+    layer_indices = [int(m.group(1)) for key in sd if (m := re.match(r"transformer\.h\.(\d+)\.", key))]
     if not layer_indices:
         raise ValueError("No transformer layer keys found in state dict")
 
-    n_embd: int | None = next(
-        (val.shape[1] for key, val in sd.items() if "attn.c_attn.weight" in key), None
-    )
+    n_embd: int | None = next((val.shape[1] for key, val in sd.items() if "attn.c_attn.weight" in key), None)
     if n_embd is None:
         raise ValueError("Could not infer n_embd: no 'attn.c_attn.weight' key found")
 
     domains: list[str] = [
-        m.group(1)
-        for key in sd
-        if (m := re.match(r"transformer\.embed\.domain_embed\.(\w+)\.projector\.weight", key))
+        m.group(1) for key in sd if (m := re.match(r"transformer\.embed\.domain_embed\.(\w+)\.projector\.weight", key))
     ]
 
     vocab_sizes: dict[str, int] = {}
@@ -75,8 +67,7 @@ def migrate_domain_embed_to_global_embed(weights: dict, model) -> dict:
     Old: embed.domain_embed.{domain}.projector.weight
     New: embed.global_embed.weight
     """
-    old_keys = [k for k in weights
-                if k.startswith("embed.domain_embed.") and k.endswith(".projector.weight")]
+    old_keys = [k for k in weights if k.startswith("embed.domain_embed.") and k.endswith(".projector.weight")]
     if not old_keys:
         return weights
 
@@ -91,10 +82,9 @@ def migrate_domain_embed_to_global_embed(weights: dict, model) -> dict:
         offset = embed.domain_offsets[d_int]
         domain_weight = weights[key]
         vocab_size = domain_weight.shape[0]
-        global_weight[offset: offset + vocab_size] = domain_weight
+        global_weight[offset : offset + vocab_size] = domain_weight
 
-    new_weights = {k: v for k, v in weights.items()
-                   if not k.startswith("embed.domain_embed.")}
+    new_weights = {k: v for k, v in weights.items() if not k.startswith("embed.domain_embed.")}
     new_weights["embed.global_embed.weight"] = global_weight
     return new_weights
 

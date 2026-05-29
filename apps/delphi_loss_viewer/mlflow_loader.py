@@ -12,9 +12,7 @@ def load_runs(exp_ids):
     assert isinstance(runs_df, pd.DataFrame)
     runs_df = runs_df.query("experiment_id != '0'").copy()
 
-    runs_df["artifact_uri"] = runs_df["artifact_uri"].str.replace(
-        r".*mlruns", mlflow.get_tracking_uri(), regex=True
-    )
+    runs_df["artifact_uri"] = runs_df["artifact_uri"].str.replace(r".*mlruns", mlflow.get_tracking_uri(), regex=True)
     return runs_df
 
 
@@ -34,13 +32,12 @@ def filter_runs_with_loss_files(runs_df, min_files=10):
 
     # print("\n=== DEBUG: LOSS FILE COUNTS ===")
     # for run_id, n, path in counts:
-        # print(f"Run {run_id}: {n} files in {path}")
+    # print(f"Run {run_id}: {n} files in {path}")
     # print("================================\n")
 
     # original logic
     runs_df["n_loss_files"] = [n for _, n, _ in counts]
     return runs_df[runs_df["n_loss_files"] >= min_files].copy()
-
 
 
 def validate_loss_files(runs_df):

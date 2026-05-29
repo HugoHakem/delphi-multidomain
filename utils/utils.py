@@ -30,12 +30,4 @@ def read_ids(path, type=int):
     Handles files with or without header; uses first column only.
     """
     s = pd.read_csv(path, dtype=str, comment="#").iloc[:, 0]
-    return set(
-        s.str.strip()
-         .str.replace(r"\.0$", "", regex=True)
-         .dropna()
-         .astype(type)
-         .tolist()
-    )
-
-
+    return set(s.str.strip().str.replace(r"\.0$", "", regex=True).dropna().astype(type).tolist())

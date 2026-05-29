@@ -87,6 +87,7 @@ target-version = "py311"
 [tool.ruff.lint]
 select = [
     "E",    # pycodestyle errors (E722 bare except, E731 lambda assign, E741 ambiguous names…)
+    "W",    # pycodestyle warnings (W291 trailing whitespace, W605 invalid escape sequence…)
     "F",    # Pyflakes (unused imports F401, undefined names, unused variables…)
     "I",    # isort — consistent import ordering
     "UP",   # pyupgrade — modern Python syntax (UP006 built-in generics, UP007 x | None…)
@@ -94,6 +95,9 @@ select = [
     "SIM",  # flake8-simplify — simplify if/else, dict.keys() iteration…
     "RUF",  # Ruff-specific — list unpacking, quadratic sum, unused unpacked vars…
     "PTH",  # flake8-use-pathlib — replace os.path.* and open() with pathlib equivalents
+]
+ignore = [
+    "E501",  # line too long — formatter enforces line-length = 120, remaining cases are unfixable strings/comments
 ]
 
 [tool.mypy]

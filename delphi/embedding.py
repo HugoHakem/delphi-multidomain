@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 #  Projectors for non-simple domains
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class LinearProjector(nn.Module):
     """
     Projects a continuous input vector to (n_latent_tokens, n_embd).
@@ -70,7 +71,7 @@ class MLPProjector(nn.Module):
         E = n_latent_tokens * n_embd
         sizes = [input_size] + [n_hidden] * (n_layers - 1) + [E]
 
-        layers: list[nn.Module]= []
+        layers: list[nn.Module] = []
         for i in range(n_layers):
             layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=False))
             if i < n_layers - 1:
@@ -127,6 +128,7 @@ class PretrainedProjector(nn.Module):
 #  MultiDomainEmbedding
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class MultiDomainEmbedding(nn.Module):
     """
     Unified embedding layer for all domains.
@@ -179,10 +181,7 @@ class MultiDomainEmbedding(nn.Module):
         self.token_drop = nn.Dropout(config.token_dropout)
 
         # ── Cache predicted domain info ───────────────────────────────────
-        self._predicted_domains = [
-            dname for dname, dcfg in config.domains.items()
-            if dcfg.predict
-        ]
+        self._predicted_domains = [dname for dname, dcfg in config.domains.items() if dcfg.predict]
 
         # ── Cache vocab sizes (avoid reading YAML on every forward) ───────
         self._domain_vocab_sizes = self._compute_vocab_sizes(config.domains)
@@ -235,9 +234,7 @@ class MultiDomainEmbedding(nn.Module):
                         n_hidden=dcfg.n_hidden,
                     )
                 else:
-                    raise ValueError(
-                        f"Unknown projector '{dcfg.projector}' for continuous domain '{dname}'"
-                    )
+                    raise ValueError(f"Unknown projector '{dcfg.projector}' for continuous domain '{dname}'")
 
             elif dcfg.projector.lower() == "pretrained":
                 is_projected = True
@@ -261,7 +258,7 @@ class MultiDomainEmbedding(nn.Module):
     def _zero_placeholder_rows(self):
         """Set global embedding rows for projected domains to zero."""
         for dname, (offset, n_slots) in self._projected_offsets.items():
-            self.global_embed.weight[offset: offset + n_slots] = 0.0
+            self.global_embed.weight[offset : offset + n_slots] = 0.0
 
     # ── Properties ────────────────────────────────────────────────────────
 
@@ -277,7 +274,7 @@ class MultiDomainEmbedding(nn.Module):
         d_int = self.domain_to_int[dname]
         offset = self.domain_offsets[d_int]
         vocab_size = self._domain_vocab_sizes[dname]
-        return self.global_embed.weight[offset: offset + vocab_size]
+        return self.global_embed.weight[offset : offset + vocab_size]
 
     # ── Forward ───────────────────────────────────────────────────────────
 
@@ -300,9 +297,9 @@ class MultiDomainEmbedding(nn.Module):
             if dname not in batch.continuous_data:
                 continue
 
-            data = batch.continuous_data[dname]         # [B, dim] or [B, n_tokens]
+            data = batch.continuous_data[dname]  # [B, dim] or [B, n_tokens]
             positions = batch.continuous_positions[dname]  # [B, n_latent]
-            proj_emb = self.projectors[dname](data)     # [B, n_latent, n_embd]
+            proj_emb = self.projectors[dname](data)  # [B, n_latent, n_embd]
             proj_emb = proj_emb.to(emb.dtype)
 
             B, n_latent, E = proj_emb.shape
@@ -331,7 +328,7 @@ class MultiDomainEmbedding(nn.Module):
         logits = {}
         for dname in self._predicted_domains:
             W = self._get_domain_weight(dname)  # [vocab_size, n_embd]
-            logits[dname] = F.linear(h, W)      # [B, T, vocab_size]
+            logits[dname] = F.linear(h, W)  # [B, T, vocab_size]
         return logits
 
     # ── Add domain (between training runs) ────────────────────────────────
@@ -394,18 +391,18 @@ class MultiDomainEmbedding(nn.Module):
             self._zero_placeholder_rows()
 
         logger.info(
-            "Added domain '%s': domain_int=%d, offset=%d, vocab_size=%d, "
-            "new global_vocab_size=%d",
-            domain_name, domain_int, offset, vocab_size, new_vocab,
+            "Added domain '%s': domain_int=%d, offset=%d, vocab_size=%d, new global_vocab_size=%d",
+            domain_name,
+            domain_int,
+            offset,
+            vocab_size,
+            new_vocab,
         )
 
     # ── Utilities ─────────────────────────────────────────────────────────
 
     def __repr__(self):
-        simple = [
-            d for d in self.domain_configs
-            if d not in self._projected_domain_names and d != "padding"
-        ]
+        simple = [d for d in self.domain_configs if d not in self._projected_domain_names and d != "padding"]
         return (
             f"MultiDomainEmbedding(\n"
             f"  global_embed: Embedding({self.global_vocab_size}, {self.n_embd})\n"
