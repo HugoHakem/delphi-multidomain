@@ -1,10 +1,7 @@
-import mlflow
-import re
 import os
-from typing import List, Dict
 
 
-def load_fold_ids(fold_dir: str, num_folds: int = 10) -> List[List[str]]:
+def load_fold_ids(fold_dir: str, num_folds: int = 10) -> list[list[str]]:
     """
     Load subject IDs from predefined fold files.
     Each file must be named `fold_i_of_num.txt` (0-indexed).
@@ -19,11 +16,11 @@ def load_fold_ids(fold_dir: str, num_folds: int = 10) -> List[List[str]]:
 
 
 def generate_splits(
-    folds: List[List[str]],
+    folds: list[list[str]],
     n_train_folds: int,
     n_val_folds: int,
     n_test_folds: int,
-) -> List[Dict[str, List[str]]]:
+) -> list[dict[str, list[str]]]:
 
     num_folds = len(folds)
 

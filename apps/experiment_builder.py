@@ -10,13 +10,13 @@ Run:
 """
 
 import csv
-import itertools
 import io
+import itertools
 from pathlib import Path
 
 import pandas as pd
-import yaml
 import streamlit as st
+import yaml
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Load attention schemes from config/attention_schemes.yaml

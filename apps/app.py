@@ -1,19 +1,16 @@
-import streamlit as st
-import pandas as pd
-import mlflow
-from mlflow.tracking import MlflowClient
-from mlflow.entities import ViewType
-import plotly.express as px
-import seaborn as sns
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from scipy.stats import norm
-from typing import List, Literal
-
+import glob
 import os
 
-import re
-import glob
+import matplotlib.pyplot as plt
+import mlflow
+import pandas as pd
+import plotly.express as px
+import seaborn as sns
+import streamlit as st
+from mlflow.entities import ViewType
+from mlflow.tracking import MlflowClient
+from scipy.stats import norm
+from tqdm import tqdm
 
 st.set_page_config(layout="wide")
 st.title("MLflow Run Explorer")
@@ -149,7 +146,7 @@ def test_interaction_by_age(df):
 
 
 @st.cache_data
-def load_runs(experiment_ids: str|List[str], val_loss_threshold: float = 1.0):
+def load_runs(experiment_ids: str|list[str], val_loss_threshold: float = 1.0):
 
     client = MlflowClient()
     filter_str = f"metrics.val_loss < {val_loss_threshold} and metrics.val_loss > 11.8"
@@ -393,7 +390,6 @@ if st.session_state.runs_loaded:
      
         diseases = st.multiselect("Choose diseases", options=sorted(unpooled_auc_merged.name.unique()))
         # st.dataframe(both_auc_merged)
-        import re
         col1, col2 = st.columns([2, 1])
         
         if diseases == []:

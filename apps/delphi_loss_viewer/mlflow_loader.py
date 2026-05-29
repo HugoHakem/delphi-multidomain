@@ -1,6 +1,7 @@
 from pathlib import Path
-import pandas as pd
+
 import mlflow
+import pandas as pd
 
 
 def load_runs(exp_ids):
@@ -22,7 +23,6 @@ def filter_runs_with_loss_files(runs_df, min_files=10):
     DEBUG VERSION — prints what it finds.
     """
 
-    import os
     from pathlib import Path
 
     counts = []

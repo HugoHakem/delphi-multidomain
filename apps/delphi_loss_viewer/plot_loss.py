@@ -1,8 +1,8 @@
 import re
-import pandas as pd
 from pathlib import Path
-import plotly.graph_objs as go
 
+import pandas as pd
+import plotly.graph_objs as go
 from helpers import exponential_moving_average
 from styling import resolve_visuals
 

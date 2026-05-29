@@ -17,12 +17,11 @@ Or with MLflow logging:
 from __future__ import annotations
 
 import gc
-import os
 import sys
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, DefaultDict, cast
+from typing import Any, cast
 
 if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
@@ -32,6 +31,7 @@ import pandas as pd
 import torch
 from joblib import Parallel, delayed
 from tqdm import tqdm
+
 from delphi.model import Delphi, DelphiBatch
 
 warnings.filterwarnings("ignore")
@@ -46,7 +46,7 @@ EMPTY = (np.array([], dtype=int), np.array([], dtype=int))
 #  Token DataFrame construction
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def batch_to_tokens_df(batch: DelphiBatch, int_to_domain: Dict[int, str], domain_offsets: Dict[int, int]):
+def batch_to_tokens_df(batch: DelphiBatch, int_to_domain: dict[int, str], domain_offsets: dict[int, int]):
     """
     Convert a DelphiBatch into a flat DataFrame of tokens.
     Uses global_token_ids and recovers local IDs via offsets.
@@ -110,7 +110,7 @@ def add_age_bin(df: pd.DataFrame) -> pd.DataFrame:
 #  Case/Control extraction
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CaseCtrlKey = Tuple[str, Tuple[int, int], str, int]
+CaseCtrlKey = tuple[str, tuple[int, int], str, int]
 
 
 def extract_case_ctrl_for_sex_age(
@@ -118,14 +118,14 @@ def extract_case_ctrl_for_sex_age(
     sex_id: int,
     a0: int,
     a1: int,
-    all_sids: Dict[int, np.ndarray],
+    all_sids: dict[int, np.ndarray],
     tok_subj: np.ndarray,
     tok_sex: np.ndarray,
     tok_gidx: np.ndarray,
     age_masks_sa: Any,
-    ctrl_subjects_sex: Dict[Tuple[str, int], np.ndarray],
-    disease_idx_sex: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]],
-) -> Tuple[Dict[CaseCtrlKey, pd.Series], Dict[CaseCtrlKey, np.ndarray]]:
+    ctrl_subjects_sex: dict[tuple[str, int], np.ndarray],
+    disease_idx_sex: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]],
+) -> tuple[dict[CaseCtrlKey, pd.Series], dict[CaseCtrlKey, np.ndarray]]:
     mask = age_masks_sa & (tok_sex == sex_id)
     subj = tok_subj[mask]
     gidx = tok_gidx[mask]
@@ -139,10 +139,10 @@ def extract_case_ctrl_for_sex_age(
         .sort_index()
     )
 
-    local_case: Dict[CaseCtrlKey, np.ndarray] = {}
-    local_ctrl: Dict[CaseCtrlKey, pd.Series] = {}
+    local_case: dict[CaseCtrlKey, np.ndarray] = {}
+    local_ctrl: dict[CaseCtrlKey, pd.Series] = {}
 
-    for dd in ctrl_subjects_sex.keys():
+    for dd in ctrl_subjects_sex:
         local_ctrl[(sex, (a0, a1), *dd)] = (
             subset.loc[ctrl_subjects_sex[dd]].dropna().global_idx
         )
@@ -158,7 +158,7 @@ def extract_case_ctrl_for_sex_age(
 #  AUC computation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def compute_auc_from_indices(logits_for_token: Any, cases: Any, controls: Any, block_size: int) -> Dict[str, float | np.ndarray | None]:
+def compute_auc_from_indices(logits_for_token: Any, cases: Any, controls: Any, block_size: int) -> dict[str, float | np.ndarray | None]:
     """Slice subject logits by flat indices and compute AUC stats.
 
     Args:
@@ -181,7 +181,7 @@ def process_disease(logits_for_token, token_id, lookup_disease, block_size):
         for sex in ["female", "male"]:
             case, ctrl = lookup_disease.get((sex, age_range), EMPTY)
 
-            stats: Dict[str, Any] = compute_auc_from_indices(logits_for_token, case, ctrl, block_size)
+            stats: dict[str, Any] = compute_auc_from_indices(logits_for_token, case, ctrl, block_size)
             stats.update({
                 "domain": token_id[0],
                 "token_id": token_id[1],
@@ -203,9 +203,9 @@ def process_disease(logits_for_token, token_id, lookup_disease, block_size):
 def evaluate_aucs(
     model: Delphi,
     test_loader,
-    block_size: Optional[int] = None,
+    block_size: int | None = None,
     n_jobs: int = -1,
-    run_id: Optional[str] = None,
+    run_id: str | None = None,
     logger=None,
     output_file: str = "aucs.csv",
 ) -> pd.DataFrame:
@@ -241,8 +241,8 @@ def evaluate_aucs(
 
     # ── 1. Forward pass: collect embeddings and token info ────────────
     print("Extracting output embeddings...")
-    all_tokens_dfs: List[pd.DataFrame] = []
-    _all_output_embeddings: List[torch.Tensor] = []
+    all_tokens_dfs: list[pd.DataFrame] = []
+    _all_output_embeddings: list[torch.Tensor] = []
     batch_offset = 0
 
     model.eval()
@@ -290,13 +290,13 @@ def evaluate_aucs(
     ]
 
     # Group tokens by sex and disease
-    by_disease_dfs: Dict[int, Dict[Tuple[str, int], pd.DataFrame]] = {}
-    case_subjects: Dict[str, Dict[Tuple[str, int], pd.Series]] = dict(female={}, male={})
-    ctrl_subjects: Dict[str, Dict[Tuple[str, int], np.ndarray]] = dict(female={}, male={})
+    by_disease_dfs: dict[int, dict[tuple[str, int], pd.DataFrame]] = {}
+    case_subjects: dict[str, dict[tuple[str, int], pd.Series]] = dict(female={}, male={})
+    ctrl_subjects: dict[str, dict[tuple[str, int], np.ndarray]] = dict(female={}, male={})
 
     for sex, sex_id in SEX_TOKENS.items():
         tokens_sex = tokens_df.query("sex == @sex_id")
-        _by_disease = cast(Dict[Tuple[str, int], pd.DataFrame], dict(list(tokens_sex.groupby(["domain", "token_id"]))))
+        _by_disease = cast(dict[tuple[str, int], pd.DataFrame], dict(list(tokens_sex.groupby(["domain", "token_id"]))))
         by_disease_dfs[sex_id] = _by_disease
 
         unique_subjects = tokens_sex.subject_id.unique()
@@ -353,7 +353,7 @@ def evaluate_aucs(
             delayed(extract_case_ctrl_for_sex_age)(*a) for a in _cc_args
         )
 
-    cc_results = cast(List[Tuple[Dict[Any, Any], Dict[Any, Any]]], results)
+    cc_results = cast(list[tuple[dict[Any, Any], dict[Any, Any]]], results)
     ctrl_indices, case_indices = {}, {}
     for local_ctrl, local_case in cc_results:
         ctrl_indices.update(local_ctrl)
@@ -361,7 +361,7 @@ def evaluate_aucs(
     del results
 
     # Build lookup: (domain_name, token_id) -> {(sex, age_range) -> (cases, controls)}
-    case_ctrl_lookup: DefaultDict[Tuple[str, int], Dict[Tuple[str, Tuple[int, int]], Tuple[np.ndarray, np.ndarray]]] = defaultdict(dict)
+    case_ctrl_lookup: defaultdict[tuple[str, int], dict[tuple[str, tuple[int, int]], tuple[np.ndarray, np.ndarray]]] = defaultdict(dict)
     for key, cases in case_indices.items():
         if key not in ctrl_indices or len(cases) == 0:
             continue
@@ -395,7 +395,7 @@ def evaluate_aucs(
         )
 
     # ── 4. Assemble results ──────────────────────────────────────────
-    auc_results = cast(List[List[Dict[str, Any]]], results)
+    auc_results = cast(list[list[dict[str, Any]]], results)
     auc_data = [row for sublist in auc_results for row in sublist]
     auc_df = pd.DataFrame(auc_data)
 

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import mlflow
 import torch
-from typing import Union
 
 DELPHI_DIR = Path(__file__).resolve().parent.parent
 MLFLOW_TRACKING_URI = Path(os.getenv("MLFLOW_TRACKING_URI", DELPHI_DIR / "mlruns"))
@@ -69,7 +68,7 @@ def get_checkpoint_path(run_id: str) -> Path:
     return best_ckpt or ckpts[-1]
 
 
-def _get_last_epoch_checkpoint(run_dir: Union[Path,str]) -> tuple[Path, int]:
+def _get_last_epoch_checkpoint(run_dir: Path | str) -> tuple[Path, int]:
     """Return (path, epoch) of the highest-epoch checkpoint under run_dir/artifacts/checkpoints."""
     ckpt_dir = Path(run_dir) / "artifacts" / "checkpoints"
     if not ckpt_dir.exists():

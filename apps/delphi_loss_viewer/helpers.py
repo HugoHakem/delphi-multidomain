@@ -1,8 +1,8 @@
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import yaml
-from pathlib import Path
 
 
 def infer_scheme(attn_scheme):
@@ -44,7 +44,7 @@ def load_labels(path):
     if not path.exists():
         return []
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     if isinstance(data, dict):

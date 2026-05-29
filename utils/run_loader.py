@@ -10,7 +10,7 @@ import os
 import re
 from dataclasses import fields as dc_fields
 from pathlib import Path
-from typing import Union, TypedDict, List, Dict, Any
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
@@ -28,7 +28,7 @@ _SPLIT_TO_METADATA_KEY = {
 
 def reconstruct_from_run(
     run_id: str,
-    split: Union[str, list[str]] = "test",
+    split: str | list[str] = "test",
     block_size: int | None = None,
     batch_size: int = 512,
     num_workers: int = 4,
@@ -57,10 +57,10 @@ def reconstruct_from_run(
     loaders      : dict[str, DataLoader] — one entry per requested split.
     run_params   : dict — raw MLflow params.
     """
+    from data.dataset import AgeSampler, DelphiCollateFn, DelphiDataset
     from delphi.model import Delphi, DelphiConfig
-    from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
-    from utils.mlflow_utils import get_checkpoint_path, load_run_params, parse_domains_param
     from utils.ckpt_utils import strip_compiled_prefix
+    from utils.mlflow_utils import get_checkpoint_path, load_run_params, parse_domains_param
 
     if device is None:
         device = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -187,12 +187,12 @@ def reconstruct_model(run_id: str):
     Returns: model, test_ids, ckpt_path, params
     """
     from delphi.model import Delphi, DelphiConfig
-    from utils.mlflow_utils import load_run_params, load_checkpoint, parse_domains_param
     from utils.ckpt_utils import (
         infer_delphi_config_from_state_dict,
-        migrate_legacy_state_dict,
         migrate_domain_embed_to_global_embed,
+        migrate_legacy_state_dict,
     )
+    from utils.mlflow_utils import load_checkpoint, load_run_params, parse_domains_param
 
     params = load_run_params(run_id)
     attn_scheme = params["attention_scheme"]
@@ -236,9 +236,10 @@ def config_from_runid(runid: str):
              start_epoch, logged_params, previous_run_name
     """
     import mlflow
+
+    from data.dataset import AgeSampler, DelphiCollateFn, DelphiDataset
     from delphi.model import Delphi, DelphiConfig
     from delphi.optim import OptimConfig
-    from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
     from utils.mlflow_utils import get_checkpoint_path, parse_domains_param
 
     VAL_BATCH_SIZE = 256
@@ -305,7 +306,7 @@ def config_from_runid(runid: str):
         if cfg.type == "continuous"
     }
 
-    _ds_kwargs: Dict[str, Any]= dict(
+    _ds_kwargs: dict[str, Any]= dict(
         root=str(root_path),
         domains_cfg=delphi_cfg.domains,
         domain_to_int=model.domain_to_int,

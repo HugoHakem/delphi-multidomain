@@ -15,25 +15,22 @@ __all__ = [
     "load_domain_config", "read_ids",
 ]
 
-from utils.mlflow_utils import (
-    setup_mlflow,
-    load_run_params,
-    load_checkpoint,
-    get_checkpoint_path,
-    parse_domains_param,
-)
-
 from utils.ckpt_utils import (
     strip_compiled_prefix,
 )
-
+from utils.mlflow_utils import (
+    get_checkpoint_path,
+    load_checkpoint,
+    load_run_params,
+    parse_domains_param,
+    setup_mlflow,
+)
 from utils.run_loader import (
+    AUTO_BLOCK_SIZE,
+    config_from_runid,
     reconstruct_from_run,
     reconstruct_model,
-    config_from_runid,
-    AUTO_BLOCK_SIZE,
 )
-
 from utils.utils import (
     load_domain_config,
     read_ids,

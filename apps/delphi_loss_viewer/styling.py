@@ -1,7 +1,7 @@
-import matplotlib.pyplot as plt
-import seaborn as sns
-import matplotlib.colors as mcolors
 import ast
+
+import matplotlib.pyplot as plt
+
 
 def _normalize_value(attr, value):
     if attr == "params.attention_scheme":

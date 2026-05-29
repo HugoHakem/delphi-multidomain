@@ -18,23 +18,21 @@ Components kept unchanged:
 
 from __future__ import annotations
 
-import os, sys
-import math
 import inspect
 import logging
+import math
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from dataclasses import dataclass, field, fields, is_dataclass, asdict
-from typing import Optional, List, Tuple, Dict, Union, Mapping, Literal, TypedDict, Iterable
+from typing import Literal, TypedDict
 
-import yaml
-import numpy as np
 import torch
 import torch.nn as nn
+import yaml
 from torch.nn import functional as F
-from easydict import EasyDict
 
-from delphi.embedding import MultiDomainEmbedding
 from data.dataset import DelphiBatch
+from delphi.embedding import MultiDomainEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -47,20 +45,20 @@ DAYS_PER_YEAR = 365.25
 @dataclass
 class DomainConfig:
     projector:  str           = "embed"
-    n_layers:   Optional[int] = None
-    n_hidden:   Optional[int] = None
-    input_size: Optional[int] = None
-    pretrained_path: Optional[str] = None
+    n_layers:   int | None = None
+    n_hidden:   int | None = None
+    input_size: int | None = None
+    pretrained_path: str | None = None
     freeze: bool = False
-    path: Optional[str] = None
+    path: str | None = None
     predict: bool = False
     age_jitter: bool = False
     type: str = "categorical"
     at_birth: bool = False
-    n_latent_tokens: Optional[int] = None
-    subdomain: Optional[str] = None        # filter tokens by metadata (e.g. "hla_a")
-    group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
-    dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
+    n_latent_tokens: int | None = None
+    subdomain: str | None = None        # filter tokens by metadata (e.g. "hla_a")
+    group: str | None = None            # alias for attention mask (e.g. "hla_alleles")
+    dropout_mode: str | None = None    # "token" (random tokens) | "block" (entire domain per subject)
     dropout_rate: float = 0.0             # probability of dropping; 0 = disabled
 
     def set_freeze(self, freeze: bool):
@@ -81,7 +79,7 @@ class DelphiConfig:
     n_head: int = 12
     n_embd: int = 120
     domains: dict[str, DomainConfig] = field(default_factory=dict)
-    attention_scheme: Union[str, List] = "all:causal(mask_ties=True)"
+    attention_scheme: str | list = "all:causal(mask_ties=True)"
     dropout: float = 0.1
     resid_pdrop: float = 0.1
     embd_pdrop: float = 0.1
@@ -111,7 +109,7 @@ class DelphiConfig:
         self.block_size = block_size
         return self
 
-    def set_attention_scheme(self, attention_scheme: Union[str, List]):
+    def set_attention_scheme(self, attention_scheme: str | list):
         self.attention_scheme = attention_scheme
         return self
 
@@ -141,8 +139,8 @@ class AttentionMaskBuilder(nn.Module):
         self.domain2id = domain2id
 
     @staticmethod
-    def _split_top_level(s: str, sep: str = ",") -> List[str]:
-        parts: List[str] = []
+    def _split_top_level(s: str, sep: str = ",") -> list[str]:
+        parts: list[str] = []
         buf, depth_brack, depth_paren = "", 0, 0
         for ch in s:
             if ch == "[":   depth_brack += 1
@@ -160,11 +158,11 @@ class AttentionMaskBuilder(nn.Module):
         return parts
 
     @staticmethod
-    def _parse_scheme(scheme_str: str) -> Dict[Tuple[str, ...], AttentionRule]:
+    def _parse_scheme(scheme_str: str) -> dict[tuple[str, ...], AttentionRule]:
         rule_type: Literal["causal", "bidirectional"]
         mask_ties: bool
 
-        scheme: Dict[Tuple[str, ...], AttentionRule] = {}
+        scheme: dict[tuple[str, ...], AttentionRule] = {}
         parts = AttentionMaskBuilder._split_top_level(scheme_str)
         for part in parts:
             if ":" not in part:
@@ -399,7 +397,7 @@ class Delphi(nn.Module):
     # ── Domain metadata (static, reusable by dataset/collate) ─────────────
 
     @staticmethod
-    def _build_domain_to_int(domain_names: List[str]) -> Dict[str, int]:
+    def _build_domain_to_int(domain_names: list[str]) -> dict[str, int]:
         """Stable mapping: all domains except padding first, padding last."""
         ordered = [d for d in domain_names if d != "padding"] + ["padding"]
         return {name: i for i, name in enumerate(ordered)}
@@ -410,14 +408,14 @@ class Delphi(nn.Module):
         if cfg.input_size is not None:
             return cfg.input_size
         tokenizer_path = Path(cfg.path) / "tokenizer.yaml"
-        with open(tokenizer_path, "r") as f:
+        with open(tokenizer_path) as f:
             return len(yaml.safe_load(f))
 
     @staticmethod
     def _build_domain_offsets(
-        domain_to_int: Dict[str, int],
-        domain_cfg: Dict[str, "DomainConfig"],
-    ) -> tuple[Dict[int, int], int]:
+        domain_to_int: dict[str, int],
+        domain_cfg: dict[str, DomainConfig],
+    ) -> tuple[dict[int, int], int]:
         """Compute global embedding offsets. Returns (offsets, global_vocab_size)."""
         offsets = {}
         running = 0
@@ -628,7 +626,7 @@ class Delphi(nn.Module):
                 ignore_index=-1,
             )
         else:
-            raise ValueError(f"agg should be in [None, 'per_token', 'per_disease']")
+            raise ValueError("agg should be in [None, 'per_token', 'per_disease']")
         return loss_ce
 
     def time_to_event_loss(self, logits, time_to_next, t_min, agg=None):
@@ -663,13 +661,13 @@ class Delphi(nn.Module):
             logger.warning(f"Temporarily changing block_size from {self.block_size} to {block_size}")
             self.set_block_size(block_size)
 
-        all_logits: List[torch.Tensor] = []
+        all_logits: list[torch.Tensor] = []
         for batch in dataloader:
             batch = batch.to(self.device)
             with torch.no_grad():
                 logits_dict = self.forward(batch, return_embeddings=False)[0]
 
-            _logits_all_domains: List[torch.Tensor] = []
+            _logits_all_domains: list[torch.Tensor] = []
             for dom in self.predicted_domains:
                 assert dom in logits_dict
                 _logits_all_domains.append(logits_dict[dom])

@@ -8,15 +8,14 @@ Usage:
     python compute_aucs.py --runid <mlflow_run_id> [--block_size 128] [--batch_size 512] [--n_jobs 8]
 """
 
-import os
-import sys
 import argparse
 import logging
+import os
+import sys
 from pathlib import Path
 
-import torch
-import pandas as pd
 import mlflow
+import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -26,8 +25,8 @@ if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
 from auc.aucs import evaluate_aucs
-from utils.mlflow_utils import setup_mlflow, get_checkpoint_path, load_run_params, parse_domains_param
-from utils.run_loader import reconstruct_from_run, AUTO_BLOCK_SIZE
+from utils.mlflow_utils import setup_mlflow
+from utils.run_loader import reconstruct_from_run
 
 setup_mlflow()
 

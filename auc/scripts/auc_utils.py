@@ -1,8 +1,9 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import numpy as np
-from scipy.stats import mannwhitneyu
 import torch
+from scipy.stats import mannwhitneyu
+
 
 def compute_midrank(x: np.ndarray) -> np.ndarray:
     """Computes midranks.
@@ -28,7 +29,7 @@ def compute_midrank(x: np.ndarray) -> np.ndarray:
     return T2
 
 
-def fastDeLong(predictions_sorted_transposed: np.ndarray, label_1_count: int) -> Tuple[np.ndarray, np.ndarray]:
+def fastDeLong(predictions_sorted_transposed: np.ndarray, label_1_count: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Fast implementation of DeLong's algorithm for computing
     covariance of AUC.
@@ -62,7 +63,7 @@ def fastDeLong(predictions_sorted_transposed: np.ndarray, label_1_count: int) ->
     return aucs, delongcov
 
 
-def delong_auc(case: np.ndarray, ctrl: np.ndarray) -> Tuple[Optional[float], Optional[np.ndarray]]:
+def delong_auc(case: np.ndarray, ctrl: np.ndarray) -> tuple[float | None, np.ndarray | None]:
     """Compute AUC + variance using DeLong."""
     if len(case) == 0 or len(ctrl) == 0:
         return None, None
@@ -80,7 +81,7 @@ def delong_auc(case: np.ndarray, ctrl: np.ndarray) -> Tuple[Optional[float], Opt
     return auc[0], cov
 
 
-def compute_all_stats(case: Any, ctrl: Any, do_bootstrap: bool = False, n_bootstrap: int = 200) -> Dict[str, float | np.ndarray | None]:
+def compute_all_stats(case: Any, ctrl: Any, do_bootstrap: bool = False, n_bootstrap: int = 200) -> dict[str, float | np.ndarray | None]:
     """Compute AUC and Mann-Whitney stats for case/control logit arrays.
 
     Args:

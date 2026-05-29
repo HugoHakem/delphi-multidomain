@@ -12,36 +12,32 @@ Run:
 Expects to be run from the Delphi project root.
 """
 
-import os, sys
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import torch
-from torch.utils.data import DataLoader
-from types import SimpleNamespace
-import yaml
-from typing import Any, Dict, Optional
+import streamlit as st
+
 # ── Setup path ────────────────────────────────────────────────────────────
 
 DELPHI_DIR = Path(__file__).resolve().parent.parent
 if str(DELPHI_DIR) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
-from delphi.model import DomainConfig, DelphiConfig, Delphi, AttentionMaskBuilder
-from utils.cv_utils import get_data_partitions
-from utils import load_domain_config
-
 from data.dataset import (
-    DelphiDataset,
-    DelphiCollateFn,
-    DelphiBatch,
     AgeSampler,
-    create_friendly_view,
+    DelphiBatch,
+    DelphiCollateFn,
+    DelphiDataset,
 )
+from delphi.model import AttentionMaskBuilder, Delphi
+from utils import load_domain_config
+from utils.cv_utils import get_data_partitions
 
 DAYS_PER_YEAR = 365.25
 
@@ -124,7 +120,7 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
     train_ids = train_ids[:100]
 
     # Dataset
-    dataset_kwargs: Dict[str, Any] = dict(
+    dataset_kwargs: dict[str, Any] = dict(
         root=root_path,
         domains_cfg=domain_cfg,
         domain_to_int=domain_to_int,
@@ -676,7 +672,7 @@ def main():
     # ── Build the batch (needed for both views) ──────────────────────
     if mode.startswith("Raw"):
         df = raw_subject_to_df(data, subject_idx)
-        batch: Optional[DelphiBatch] = None
+        batch: DelphiBatch | None = None
     else:
         item = data.dataset[subject_idx]
         batch = make_live_collate(training=bool(dropout_config))([item])

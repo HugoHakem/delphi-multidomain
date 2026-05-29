@@ -12,15 +12,13 @@ Usage:
 
 from __future__ import annotations
 
-import math
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +70,7 @@ class MLPProjector(nn.Module):
         E = n_latent_tokens * n_embd
         sizes = [input_size] + [n_hidden] * (n_layers - 1) + [E]
 
-        layers: List[nn.Module]= []
+        layers: list[nn.Module]= []
         for i in range(n_layers):
             layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=False))
             if i < n_layers - 1:
@@ -156,9 +154,9 @@ class MultiDomainEmbedding(nn.Module):
     def __init__(
         self,
         config,
-        domain_offsets: Dict[int, int],
+        domain_offsets: dict[int, int],
         global_vocab_size: int,
-        domain_to_int: Dict[str, int],
+        domain_to_int: dict[str, int],
     ):
         super().__init__()
 
@@ -173,8 +171,8 @@ class MultiDomainEmbedding(nn.Module):
         self.global_embed = nn.Embedding(global_vocab_size, config.n_embd)
 
         # Zero out placeholder rows for projected domains
-        self._projected_domain_names: List[str] = []
-        self._projected_offsets: Dict[str, Tuple[int, int]] = {}  # domain_name -> (offset, n_slots)
+        self._projected_domain_names: list[str] = []
+        self._projected_offsets: dict[str, tuple[int, int]] = {}  # domain_name -> (offset, n_slots)
         self._init_projectors(config)
 
         # ── Token dropout ─────────────────────────────────────────────────
@@ -189,7 +187,7 @@ class MultiDomainEmbedding(nn.Module):
         # ── Cache vocab sizes (avoid reading YAML on every forward) ───────
         self._domain_vocab_sizes = self._compute_vocab_sizes(config.domains)
 
-    def _compute_vocab_sizes(self, domain_configs) -> Dict[str, int]:
+    def _compute_vocab_sizes(self, domain_configs) -> dict[str, int]:
         """Resolve and cache vocab size for every domain, once at init."""
         sizes = {}
         for dname, dcfg in domain_configs.items():
@@ -268,7 +266,7 @@ class MultiDomainEmbedding(nn.Module):
     # ── Properties ────────────────────────────────────────────────────────
 
     @property
-    def predicted_domains(self) -> List[str]:
+    def predicted_domains(self) -> list[str]:
         return self._predicted_domains
 
     def _get_domain_weight(self, dname: str) -> torch.Tensor:
@@ -317,7 +315,7 @@ class MultiDomainEmbedding(nn.Module):
 
     # ── Logits (tied weights) ─────────────────────────────────────────────
 
-    def to_logits(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def to_logits(self, h: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         Project hidden states back to token logits using tied weights.
         Only for predicted (simple categorical) domains.

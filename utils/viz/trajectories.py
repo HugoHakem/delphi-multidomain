@@ -1,5 +1,5 @@
 import pandas as pd
-from easydict import EasyDict
+
 from .styles import color_by_domain
 
 

@@ -1,24 +1,25 @@
-import pandas as pd
-from typing import Optional, Tuple, Any, Sequence, List, Dict, Union, Literal
-import torch
+import os
+import shutil
+import sys
+import tempfile
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlparse
+
 import mlflow
 import mlflow.artifacts
+import pandas as pd
+import torch
 from tqdm import tqdm
-import os, sys
-from pathlib import Path
-import tempfile
-import shutil
-from datetime import datetime
-from easydict import EasyDict
-from urllib.parse import urlparse
 
 if ( DELPHI_DIR := Path(__file__).resolve().parent.parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
-from dataclasses import asdict
-from pathlib import Path
-import json
 from contextlib import nullcontext
+from pathlib import Path
+
 import torch.amp
 
 
@@ -44,7 +45,7 @@ def make_json_serializable(x):
     return x
 
 
-def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_run_name: Optional[str] = None) -> str:
+def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_run_name: str | None = None) -> str:
     """
     Clone an existing MLflow run into a NEW experiment (fresh run + copied artifacts).
     """
@@ -189,7 +190,8 @@ class MLFlowLogger:
 
     def log_run_metadata(self, cwd=None):
         """Log git commit hash, dirty flag, hostname and SLURM job ID as MLflow tags."""
-        import subprocess, socket
+        import socket
+        import subprocess
         try:
             git_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=cwd
@@ -237,7 +239,7 @@ class MLFlowLogger:
 
 # ———————————————————————————————————————————————————————————————————————————————
 
-class BaseTrainer():
+class BaseTrainer:
     def shared_step(self, *args: Any, **kwargs: Any) -> Any:     pass
     def train_epoch(self) -> Any:     pass
     def train(self):           pass
@@ -250,8 +252,8 @@ class Trainer(BaseTrainer):
 
     def __init__(self, model, dataloaders,
           optimizer, scheduler, patience=3,
-          n_train_batches:Optional[int]=None, n_val_batches: Optional[int]=None, n_validations_per_epoch=1,
-          logger: Union[NullLogger,MLFlowLogger]=NullLogger(), mlflow_params=dict(), start_epoch=0, log_loss_per_disease=False,
+          n_train_batches:int | None=None, n_val_batches: int | None=None, n_validations_per_epoch=1,
+          logger: NullLogger | MLFlowLogger=NullLogger(), mlflow_params=dict(), start_epoch=0, log_loss_per_disease=False,
           use_tqdm=True, use_amp=True, use_rich=True,
           checkpoint_every=None, optim_config=None,
         ):
@@ -271,19 +273,19 @@ class Trainer(BaseTrainer):
         else:
             raise ValueError(f"{len(dataloaders)=} ")
         
-        self.n_train_batches: Union[Literal['all'], int] = n_train_batches if n_train_batches is not None else 'all'
-        self.n_val_batches: Union[Literal['all'], int] = n_val_batches if n_val_batches is not None else 'all'
+        self.n_train_batches: Literal['all'] | int = n_train_batches if n_train_batches is not None else 'all'
+        self.n_val_batches: Literal['all'] | int = n_val_batches if n_val_batches is not None else 'all'
 
-        self.train_outputs: List[Dict[str, torch.Tensor]] = []
-        self.valid_outputs: List[Dict[str, torch.Tensor]] = []
-        self.test_outputs: List[Dict[str, torch.Tensor]] = []
+        self.train_outputs: list[dict[str, torch.Tensor]] = []
+        self.valid_outputs: list[dict[str, torch.Tensor]] = []
+        self.test_outputs: list[dict[str, torch.Tensor]] = []
 
         self.current_epoch = start_epoch
         self._validation_counter = 0
         self.n_validations_per_epoch = n_validations_per_epoch
 
         self.logger = logger
-        self.val_loss: Optional[Dict[str, torch.Tensor]] = None
+        self.val_loss: dict[str, torch.Tensor] | None = None
         self.ema_alpha = 0.02
 
         self.additional_mlflow_params = mlflow_params | { "ema_alpha": self.ema_alpha }
@@ -293,8 +295,8 @@ class Trainer(BaseTrainer):
         self.checkpoint_every = checkpoint_every   # None = only save on improvement
         self.optim_config = optim_config
 
-        self.ce_ema: Optional[torch.Tensor] = None
-        self.time_ema: Optional[torch.Tensor] = None
+        self.ce_ema: torch.Tensor | None = None
+        self.time_ema: torch.Tensor | None = None
         self.log_loss_per_disease = log_loss_per_disease
 
         # Precompute predicted domain IDs as a tensor for masking
@@ -324,7 +326,7 @@ class Trainer(BaseTrainer):
             "test_ids":  sorted(self.test_loader.dataset.subject_list),
         }
 
-    def _setup_display(self, epoch_rows: List[Tuple[str,...]]):
+    def _setup_display(self, epoch_rows: list[tuple[str,...]]):
         """
         Returns (progress, live_ctx, refresh_fn).
         When use_rich=False, everything is a no-op.
@@ -333,11 +335,11 @@ class Trainer(BaseTrainer):
             return None, nullcontext(), lambda: None
 
         try:
-            from rich.live import Live
-            from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn, TimeElapsedColumn
-            from rich.table import Table
-            from rich.console import Group
             from rich import box
+            from rich.console import Group
+            from rich.live import Live
+            from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+            from rich.table import Table
         except ImportError:
             return None, nullcontext(), lambda: None
 
@@ -379,7 +381,7 @@ class Trainer(BaseTrainer):
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
 
-        epoch_rows: List[Tuple[str, ...]] = []
+        epoch_rows: list[tuple[str, ...]] = []
         progress, live_ctx, refresh_display = self._setup_display(epoch_rows)
         if self.use_rich and progress and not isinstance(live_ctx, nullcontext):
             _print = live_ctx.console.print
@@ -523,7 +525,7 @@ class Trainer(BaseTrainer):
         # ── Package losses (outside autocast, already float32 scalars) ──
         prefix = "" if add_prefix is None else add_prefix + "_"
 
-        loss: Dict[str, Any] = {
+        loss: dict[str, Any] = {
             f'{prefix}ce_loss':   loss_ce,
             f'{prefix}time_loss': time_loss,
             f'{prefix}total':     loss_ce + time_loss,
@@ -562,8 +564,8 @@ class Trainer(BaseTrainer):
         return 1
 
 
-    def compute_mean(self, outputs: Sequence[Dict[str, Any]]):
-        out: Dict[str, torch.Tensor] = {}
+    def compute_mean(self, outputs: Sequence[dict[str, Any]]):
+        out: dict[str, torch.Tensor] = {}
         if not outputs:
             return out
         for k in outputs[0].keys():
@@ -581,7 +583,7 @@ class Trainer(BaseTrainer):
         return out
 
 
-    def train_epoch(self, n_batches: Union[Literal['all'], int] ='all', eval_every=None, _progress=None, _task_id=None):
+    def train_epoch(self, n_batches: Literal['all'] | int ='all', eval_every=None, _progress=None, _task_id=None):
 
         self.val_step = 0
 
@@ -653,7 +655,7 @@ class Trainer(BaseTrainer):
         return self.compute_mean(self.train_outputs)
 
 
-    def valid_epoch(self, n_batches: Union[Literal['all'], int]='all', _progress=None, _task_id=None):
+    def valid_epoch(self, n_batches: Literal['all'] | int='all', _progress=None, _task_id=None):
 
         self.model.eval()
 
@@ -665,7 +667,7 @@ class Trainer(BaseTrainer):
 
         with torch.no_grad():
 
-            loss_outputs: List[Dict[str, Any]] = []
+            loss_outputs: list[dict[str, Any]] = []
             ce_sum, time_sum = 0.0, 0.0
 
             for i, batch in enumerate(self.valid_loader):

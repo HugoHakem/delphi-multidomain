@@ -6,7 +6,6 @@ from functools import partial
 import torch
 
 from delphi.model import LayerNorm
-from typing import Optional
 
 
 @dataclass
@@ -48,7 +47,7 @@ def get_constant_lr(it: int, cfg: OptimConfig) -> float:
 
 
 def configure_optimizers(
-    model: torch.nn.Module, cfg: OptimConfig, device_type: Optional[str] = None
+    model: torch.nn.Module, cfg: OptimConfig, device_type: str | None = None
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
     if device_type is None:
         device_type = next(model.parameters()).device.type

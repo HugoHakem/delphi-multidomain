@@ -1,18 +1,21 @@
 # %%
+import logging
 import os
 import sys
-from pathlib import Path
-import yaml
-from dataclasses import asdict
-from pprint import pformat
 import warnings
-import pandas as pd
-from auc.aucs import evaluate_aucs
-import torch
-from torch.utils.data import DataLoader
+from dataclasses import asdict
+from pathlib import Path
+from pprint import pformat
+from typing import Any, cast
+
 import mlflow
-from typing import Dict, Any, List, Union, cast
-import logging
+import pandas as pd
+import torch
+import yaml
+from torch.utils.data import DataLoader
+
+from auc.aucs import evaluate_aucs
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -20,34 +23,27 @@ if ( DELPHI_DIR := Path(__file__).resolve().parent ) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
 from data.dataset import (
-    DelphiDataset,
-    DelphiCollateFn,
     AgeSampler,
+    DelphiCollateFn,
+    DelphiDataset,
 )
-
-from delphi.optim import (
-    OptimConfig, 
-    configure_optimizers
-)
-
 from delphi.model import (
     Delphi,
     DelphiConfig,
 )
-
+from delphi.optim import OptimConfig, configure_optimizers
+from utils import AUTO_BLOCK_SIZE, load_domain_config, setup_mlflow  # cache upper bound when block_size="auto"
+from utils.cv_utils import get_data_partitions
 from utils.trainer import (
     MLFlowLogger,
     Trainer,
     clone_run_to_new_experiment,
 )
 
-from utils.cv_utils import get_data_partitions
-from utils import load_domain_config, setup_mlflow, AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
-
 setup_mlflow()
 
 root_path = DELPHI_DIR / "data" / "transforms"
-ATTENTION_SCHEMES: Dict[str, Dict[str, str]] = yaml.safe_load((DELPHI_DIR / "config" / "attention_schemes.yaml").read_text())
+ATTENTION_SCHEMES: dict[str, dict[str, str]] = yaml.safe_load((DELPHI_DIR / "config" / "attention_schemes.yaml").read_text())
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
@@ -91,10 +87,10 @@ def format_delphi_config(cfg) -> str:
     return "\n".join(lines)
 
 
-def parse_attention_scheme(attention_scheme: Union[List[str], str], as_list=True) -> Union[List[str], str]:
+def parse_attention_scheme(attention_scheme: list[str] | str, as_list=True) -> list[str] | str:
     
     if isinstance(attention_scheme, str):
-        if attention_scheme in ATTENTION_SCHEMES.keys():
+        if attention_scheme in ATTENTION_SCHEMES:
             attention_scheme = ATTENTION_SCHEMES[attention_scheme]["scheme"]
         if as_list:
             attention_scheme = [attention_scheme]
@@ -210,7 +206,7 @@ def get_dataloaders(
     # original value ("auto" or int) to decide per-batch trimming behaviour.
     cache_block_size = AUTO_BLOCK_SIZE if block_size == "auto" else block_size
 
-    dataset_kwargs: Dict[str, Any] = dict(
+    dataset_kwargs: dict[str, Any] = dict(
         root=root_path,
         domains_cfg=domain_cfg,
         domain_to_int=model.domain_to_int,
@@ -242,7 +238,7 @@ def get_dataloaders(
         if cfg.dropout_mode is not None and cfg.dropout_rate > 0
     }
 
-    collate_kwargs: Dict[str, Any]= dict(
+    collate_kwargs: dict[str, Any]= dict(
         age_sampler=age_sampler,
         block_size=block_size,      # "auto" or int
         domain_to_int=model.domain_to_int,
@@ -255,7 +251,7 @@ def get_dataloaders(
     train_collate = DelphiCollateFn(**collate_kwargs, training=True)
     eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
 
-    loader_kwargs: Dict[str, Any] = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    loader_kwargs: dict[str, Any] = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
 
     train_loader = DataLoader(train_dataset, shuffle=True,  collate_fn=train_collate, **loader_kwargs)
     valid_loader = DataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate,  **loader_kwargs)
